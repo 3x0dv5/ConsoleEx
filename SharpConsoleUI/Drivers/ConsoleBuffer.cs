@@ -364,9 +364,15 @@ namespace SharpConsoleUI.Drivers
 				}
 				else
 				{
-					// Out of bounds: write padding space with fallback background
+					// Out of bounds: write padding space with fallback background.
+					// In PreserveTerminalTransparency (no-colour) mode the padding must not
+					// paint an opaque white: pass Color.Transparent (A=0) so FormatCellAnsi
+					// emits terminal-default (;39), keeping a colour-free frame colour-free
+					// (for the no-colour vendoring consumer, T82.18).
 					var spaceRune = new Rune(' ');
-					string ansi = FormatCellAnsi(Color.White, fallbackBg);
+					Color paddingFg = _options.TerminalTransparencyMode == Configuration.TerminalTransparencyMode.PreserveTerminalTransparency
+						? Color.Transparent : Color.White;
+					string ansi = FormatCellAnsi(paddingFg, fallbackBg);
 					if (destCell.Character != spaceRune || destCell.AnsiEscape != ansi || destCell.IsWideContinuation || destCell.Combiners != null)
 					{
 						destCell.Character = spaceRune;
