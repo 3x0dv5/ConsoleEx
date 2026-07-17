@@ -97,8 +97,16 @@ namespace SharpConsoleUI.Drivers
 		/// </remarks>
 		public bool Lock { get; set; } = false;
 
-		// Cache for FormatCellAnsi to avoid repeated string allocations
-		private string _lastCellAnsi = string.Empty;
+		/* Cache for FormatCellAnsi to avoid repeated string allocations. _lastCellAnsi is null until the
+		   first real format: it must NOT start as string.Empty, because the other three fields start at
+		   default(Color) / TextDecoration.None, and default(Color) is byte-identical to Color.Transparent
+		   (a readonly struct of R,G,B,A all zero). That made the UNINITIALISED cache a legitimate colour
+		   combination: a first cell of Transparent-on-Transparent matched it and got string.Empty back (no
+		   SGR at all), and because the hit path returns before writing the cache, every later
+		   Transparent-on-Transparent cell got string.Empty too. It stays hidden whenever an opaque cell is
+		   formatted first (priming the cache), which is why an ordinary render never tripped it. The null
+		   sentinel cannot collide with any formatted value. */
+		private string? _lastCellAnsi;
 		private Color _lastCellFg;
 		private Color _lastCellBg;
 		private TextDecoration _lastCellDecorations;
@@ -110,7 +118,7 @@ namespace SharpConsoleUI.Drivers
 		/// </summary>
 		private string FormatCellAnsi(Color fg, Color bg, TextDecoration decorations = TextDecoration.None)
 		{
-			if (fg.Equals(_lastCellFg) && bg.Equals(_lastCellBg) && decorations == _lastCellDecorations)
+			if (_lastCellAnsi is not null && fg.Equals(_lastCellFg) && bg.Equals(_lastCellBg) && decorations == _lastCellDecorations)
 				return _lastCellAnsi;
 
 			var sb = _formatBuilder;
