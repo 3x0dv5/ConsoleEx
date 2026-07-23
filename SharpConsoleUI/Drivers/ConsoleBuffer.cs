@@ -128,8 +128,7 @@ namespace SharpConsoleUI.Drivers
 			   and Renderer.FillRect coerces an unspecified (null) foreground to White. Normalising at the
 			   emit boundary catches all of them at once, and (unlike changing what the buffer stores) it
 			   cannot disturb compositing or the alpha blend in SetNarrowCell, which read those same colours.
-			   Underline / Strikethrough / Invert DO paint a blank cell in its foreground, so they are exempt.
-			   (T82.18) */
+			   Underline / Strikethrough / Invert DO paint a blank cell in its foreground, so they are exempt. */
 			if (_options.TerminalTransparencyMode != Configuration.TerminalTransparencyMode.PreserveTerminalTransparency)
 				return fg;
 			if (character.Value != ' ')

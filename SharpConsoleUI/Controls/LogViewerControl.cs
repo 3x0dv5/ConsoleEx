@@ -455,7 +455,7 @@ public class LogViewerControl : BaseControl, IInteractiveControl, IFocusableCont
 
 	// One-row sticky-bottom threshold. A single-row Add runs ApplyTailFollow AFTER RowCount already
 	// counts the just-appended line, so a follower's stored offset lags the new bottom by exactly one
-	// row. (T89 P1a.)
+	// row.
 	private const int StickyBottomThreshold = 1;
 
 	// Whether the tail is being followed. Re-derived ONLY on a single-row Add (the one event where the
