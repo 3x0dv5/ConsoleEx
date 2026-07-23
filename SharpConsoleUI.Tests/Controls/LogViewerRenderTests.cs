@@ -111,7 +111,7 @@ public class LogViewerRenderTests
 	/// <summary>
 	/// Tail-follow at the bottom: as 100 log entries are added while the viewer sits at the bottom,
 	/// it keeps the newest entry visible. Renamed from the old ...UnlessScrolledUp, which overpromised:
-	/// its body never scrolled up. The scrolled-up cases are the two T89 P1a tests below.
+	/// its body never scrolled up. The scrolled-up cases are the two tests below.
 	/// </summary>
 	[Fact]
 	public void LogViewer_TailFollow_KeepsNewestVisible_WhenAtBottom()
@@ -142,7 +142,7 @@ public class LogViewerRenderTests
 	}
 
 	/// <summary>
-	/// T89 P1a: with the viewer scrolled up, a newly-logged line must NOT yank the viewport back to the
+	/// With the viewer scrolled up, a newly-logged line must NOT yank the viewport back to the
 	/// bottom (follow is paused). The one-row StickyBottomThreshold guard in ApplyTailFollow makes this
 	/// hold; before the guard the control pinned to the bottom on every incoming line.
 	/// </summary>
@@ -189,7 +189,7 @@ public class LogViewerRenderTests
 	}
 
 	/// <summary>
-	/// T89 P1a: after scrolling back to the bottom, tail-follow resumes: the next logged line is visible.
+	/// After scrolling back to the bottom, tail-follow resumes: the next logged line is visible.
 	/// </summary>
 	[Fact]
 	public void LogViewer_TailFollow_ResumesAtBottom()

@@ -295,7 +295,7 @@ namespace SharpConsoleUI.Windows
 			/* In PreserveTerminalTransparency (no-colour) mode the active-window title buttons
 			   must not paint their hardcoded Yellow / Red: pass Color.Transparent (A=0) so
 			   FormatCellAnsi emits terminal-default (;39) and a colour-free frame stays
-			   colour-free (for the no-colour vendoring consumer, T82.18). Inactive already
+			   colour-free (for the no-colour vendoring consumer). Inactive already
 			   uses the border colour, so it is unaffected. */
 			bool preserveTransparency = _window.GetConsoleWindowSystem?.Options.TerminalTransparencyMode
 				== Configuration.TerminalTransparencyMode.PreserveTerminalTransparency;
