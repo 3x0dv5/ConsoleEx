@@ -1,6 +1,7 @@
 using System.Text;
 using SharpConsoleUI;
 using SharpConsoleUI.Controls;
+using SharpConsoleUI.Drivers;
 using SharpConsoleUI.Tests.Infrastructure;
 using Spectre.Console;
 using Xunit;
@@ -503,5 +504,37 @@ public class ConsoleBufferTests
 		Assert.Equal(new Rune('E'), char2);
 		Assert.Equal(new Rune('S'), char3);
 		Assert.Equal(new Rune('T'), char4);
+	}
+
+	[Fact]
+	public void Ctor_RejectsNegativeWidth()
+	{
+		// Assert - a negative width is a caller error, not an allocation overflow.
+		var ex = Assert.Throws<ArgumentOutOfRangeException>(() => new ConsoleBuffer(-1, 24));
+		Assert.Equal("width", ex.ParamName);
+	}
+
+	[Fact]
+	public void Ctor_RejectsNegativeHeight()
+	{
+		// Assert - pinned to the real numbers a terminal-size read produced (80x-1).
+		var ex = Assert.Throws<ArgumentOutOfRangeException>(() => new ConsoleBuffer(80, -1));
+		Assert.Equal("height", ex.ParamName);
+	}
+
+	[Fact]
+	public void Ctor_AcceptsZeroDimensions()
+	{
+		// Assert - zero stays legal: a 0x0 buffer is a working case today and must not become a throw.
+		var buffer = new ConsoleBuffer(0, 0);
+		Assert.NotNull(buffer);
+	}
+
+	[Fact]
+	public void Ctor_AcceptsOrdinaryDimensions()
+	{
+		// Assert - the guard must not reject a real terminal size.
+		var buffer = new ConsoleBuffer(80, 24);
+		Assert.NotNull(buffer);
 	}
 }

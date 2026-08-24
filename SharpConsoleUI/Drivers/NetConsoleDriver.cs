@@ -136,6 +136,7 @@ namespace SharpConsoleUI.Drivers
 		private DateTime _lastClickTime;
 		private int _lastConsoleHeight;
 		private int _lastConsoleWidth;
+		private bool _lastSizeSubstituted;
 		private bool _running = false;
 		private EventHandler? _processExitHandler;
 
@@ -282,19 +283,21 @@ namespace SharpConsoleUI.Drivers
 		/// </summary>
 		internal bool UseDirectAnsi => _useDirectAnsi;
 
-		/// <inheritdoc/>
-		public Size ScreenSize
+		/// <summary>Reads the console size and reports whether a default had to be substituted.</summary>
+		private (Size Size, bool Substituted) ReadScreenSize()
 		{
-			get
+			if (_useDirectAnsi)
 			{
-				if (_useDirectAnsi)
-				{
-					var (w, h) = TerminalRawMode.GetWindowSize();
-					return new Size(w, h);
-				}
-				return new Size(Console.WindowWidth, Console.WindowHeight);
+				var (w, h, substituted) = TerminalRawMode.GetWindowSize();
+				return (new Size(w, h), substituted);
 			}
+
+			var (cw, ch, consoleSubstituted) = TerminalRawMode.ReadConsoleSizeGuarded();
+			return (new Size(cw, ch), consoleSubstituted);
 		}
+
+		/// <inheritdoc/>
+		public Size ScreenSize => ReadScreenSize().Size;
 
 		/// <summary>
 		/// Restores the console to its original configuration.
@@ -393,7 +396,10 @@ namespace SharpConsoleUI.Drivers
 			}
 
 			log?.LogDebug("Querying terminal size (ioctl on Unix)", "Driver");
-			var screenSize = ScreenSize; // Uses ioctl if _useDirectAnsi
+			var (screenSize, sizeSubstituted) = ReadScreenSize(); // Uses ioctl if _useDirectAnsi
+			if (sizeSubstituted)
+				log?.LogWarning($"No usable terminal size reported; using the {TerminalRawMode.DefaultWindowWidth}x{TerminalRawMode.DefaultWindowHeight} default.", "Driver");
+			_lastSizeSubstituted = sizeSubstituted;
 			log?.LogInfo($"Terminal size: {screenSize.Width}x{screenSize.Height}", "Driver");
 
 			if (RenderMode.Buffer == RenderMode)
@@ -1587,7 +1593,14 @@ namespace SharpConsoleUI.Drivers
 		{
 			while (_running == true)
 			{
-				var currentSize = ScreenSize; // Uses ioctl when _useDirectAnsi
+				var (currentSize, sizeSubstituted) = ReadScreenSize(); // Uses ioctl when _useDirectAnsi
+				if (sizeSubstituted != _lastSizeSubstituted)
+				{
+					_consoleWindowSystem?.LogService?.LogWarning(
+						sizeSubstituted ? "Terminal size became unreadable; using the default." : "Terminal size became readable again.",
+						"Driver");
+					_lastSizeSubstituted = sizeSubstituted;
+				}
 				if (currentSize.Width != _lastConsoleWidth || currentSize.Height != _lastConsoleHeight)
 				{
 					if (RenderMode.Buffer == RenderMode)

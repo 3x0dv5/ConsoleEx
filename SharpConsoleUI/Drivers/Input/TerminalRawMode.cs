@@ -512,15 +512,43 @@ namespace SharpConsoleUI.Drivers.Input
 			ulong __x2, ulong __x3, ulong __x4, ulong __x5, ulong __x6, ulong __x7,
 			out WinSize winSize);
 
+		internal const int DefaultWindowWidth = 80;
+		internal const int DefaultWindowHeight = 24;
+
+		/// <summary>Clamps a reported console size to a usable one. Pure: no logging, no state.</summary>
+		/// <returns>The size to use, and whether a default was substituted for a non-positive dimension.</returns>
+		internal static (int Width, int Height, bool Substituted) ClampWindowSize(int width, int height)
+		{
+			var w = width > 0 ? width : DefaultWindowWidth;
+			var h = height > 0 ? height : DefaultWindowHeight;
+			return (w, h, w != width || h != height);
+		}
+
+		/// <summary>Reads Console.WindowWidth/Height, surviving a detached console, and clamps the result.</summary>
+		internal static (int Width, int Height, bool Substituted) ReadConsoleSizeGuarded()
+		{
+			try
+			{
+				return ClampWindowSize(Console.WindowWidth, Console.WindowHeight);
+			}
+			catch (IOException)
+			{
+				// No console attached (e.g. captured/redirected stdout): nothing to read, so
+				// substitute the default rather than let the exception reach the caller.
+				return (DefaultWindowWidth, DefaultWindowHeight, true);
+			}
+		}
+
 		/// <summary>
 		/// Gets the terminal window size via ioctl TIOCGWINSZ, bypassing Console.WindowWidth/Height
 		/// which goes through ConsolePal and may trigger tcsetattr.
-		/// Falls back to Console.WindowWidth/Height if ioctl fails.
+		/// Falls back to Console.WindowWidth/Height if ioctl fails. Never returns a non-positive
+		/// dimension: <c>substituted</c> reports whether the default was used.
 		/// </summary>
-		public static (int width, int height) GetWindowSize()
+		public static (int width, int height, bool substituted) GetWindowSize()
 		{
 			if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-				return (Console.WindowWidth, Console.WindowHeight);
+				return ReadConsoleSizeGuarded();
 
 			uint req = RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? TIOCGWINSZ_MAC : TIOCGWINSZ_LINUX;
 			int fd = StdinFd;
@@ -535,16 +563,16 @@ namespace SharpConsoleUI.Drivers.Input
 			if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) && RuntimeInformation.ProcessArchitecture == Architecture.Arm64)
 			{
 				if (ioctl_arm64(fd, req, 0, 0, 0, 0, 0, 0, out var ws64) == 0 && ws64.ws_col > 0 && ws64.ws_row > 0)
-					return (ws64.ws_col, ws64.ws_row);
+					return (ws64.ws_col, ws64.ws_row, false);
 			}
 			else
 			{
 				if (ioctl(fd, req, out var ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0)
-					return (ws.ws_col, ws.ws_row);
+					return (ws.ws_col, ws.ws_row, false);
 			}
 
 			// Fallback — only reached if ioctl fails
-			return (Console.WindowWidth, Console.WindowHeight);
+			return ReadConsoleSizeGuarded();
 		}
 
 		/// <summary>

@@ -38,13 +38,15 @@ public class SynchronizationContextInstalledTests
 		var opts = new ConsoleWindowSystemOptions() with { InstallSynchronizationContext = true };
 		var sys = new ConsoleWindowSystem(RenderMode.Buffer, options: opts);
 
-		var t = new Thread(() => { try { sys.Run(); } catch { } }) { IsBackground = true };
+		Exception? runFailure = null;
+		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
 		t.Start();
 
 		var becameTrue = WaitFor(() => sys.SynchronizationContextInstalled, timeoutMs: 3000);
 		sys.Shutdown(0);
 		t.Join(2000);
 
+		Assert.True(runFailure is null, $"ConsoleWindowSystem.Run() threw: {runFailure}");
 		Assert.True(becameTrue, "SynchronizationContextInstalled never became true during Run()");
 		Assert.False(sys.SynchronizationContextInstalled, "Should reset to false after Run() returns");
 	}
@@ -56,7 +58,8 @@ public class SynchronizationContextInstalledTests
 		var sys = new ConsoleWindowSystem(RenderMode.Buffer, options: opts);
 
 		bool? observedDuringRun = null;
-		var t = new Thread(() => { try { sys.Run(); } catch { } }) { IsBackground = true };
+		Exception? runFailure = null;
+		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
 		t.Start();
 
 		// Give the loop a moment to start, then observe the resolved state from a queued action.
@@ -66,6 +69,7 @@ public class SynchronizationContextInstalledTests
 		sys.Shutdown(0);
 		t.Join(2000);
 
+		Assert.True(runFailure is null, $"ConsoleWindowSystem.Run() threw: {runFailure}");
 		Assert.True(observedDuringRun.HasValue, "Queued observation never ran");
 		Assert.False(observedDuringRun!.Value);
 	}
