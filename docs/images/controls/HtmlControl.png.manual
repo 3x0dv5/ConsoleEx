@@ -1,0 +1,6 @@
+Taken by hand; the gallery must not overwrite it.
+
+Remote images only render on the LoadUrlAsync path, which the gallery cannot
+drive headlessly. SetContent does render data: and file: images in place, but
+a shot built from those would show none of the real-page layout this control
+exists for, so the screenshot stays a hand-taken one of a fetched page.

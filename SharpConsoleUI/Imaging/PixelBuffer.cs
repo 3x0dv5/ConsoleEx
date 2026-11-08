@@ -7,8 +7,7 @@
 // -----------------------------------------------------------------------
 
 using SharpConsoleUI.Configuration;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using StbImageSharp;
 
 namespace SharpConsoleUI.Imaging
 {
@@ -58,15 +57,34 @@ namespace SharpConsoleUI.Imaging
 		}
 
 		/// <summary>
-		/// Creates a new PixelBuffer resized to the target dimensions using bilinear interpolation.
+		/// Creates a new PixelBuffer at exactly the size asked for.
 		/// </summary>
+		/// <param name="targetWidth">Width in pixels. Must be positive.</param>
+		/// <param name="targetHeight">Height in pixels. Must be positive.</param>
+		/// <remarks>
+		/// <para>
+		/// Shrinking averages the source area each target pixel covers, a box filter, because
+		/// bilinear sampling reads four source pixels per target pixel and therefore throws away
+		/// most of an image being reduced by more than half: a 4000-pixel photo brought down to
+		/// 1568 aliases into a shimmer of whichever four pixels happened to be sampled. Enlarging
+		/// stays bilinear, where there is nothing to average and interpolation is what is wanted.
+		/// </para>
+		/// <para>
+		/// NO SIZE CAP. This used to clamp each side to 500 independently, so an image asked to
+		/// become 1568x882 came back 500x500: the wrong size, and the aspect ratio destroyed, with
+		/// nothing reporting it. A cap belongs to whatever is displaying the result and knows what
+		/// it can show, not to the resize itself.
+		/// </para>
+		/// </remarks>
 		public PixelBuffer Resize(int targetWidth, int targetHeight)
 		{
 			if (targetWidth <= 0) throw new ArgumentOutOfRangeException(nameof(targetWidth));
 			if (targetHeight <= 0) throw new ArgumentOutOfRangeException(nameof(targetHeight));
 
-			targetWidth = Math.Min(targetWidth, ImagingDefaults.MaxImageDimension);
-			targetHeight = Math.Min(targetHeight, ImagingDefaults.MaxImageDimension);
+			// Shrinking on either axis takes the averaging path: a target pixel covering more than
+			// one source pixel has an area to average, and sampling four of them would not see it.
+			if (targetWidth < Width || targetHeight < Height)
+				return ResizeByArea(targetWidth, targetHeight);
 
 			var result = new PixelBuffer(targetWidth, targetHeight);
 
@@ -94,6 +112,54 @@ namespace SharpConsoleUI.Imaging
 					byte b = BilinearInterpolate(p00.B, p10.B, p01.B, p11.B, xFrac, yFrac);
 
 					result._pixels[tx, ty] = new ImagePixel(r, g, b);
+				}
+			}
+
+			return result;
+		}
+
+		/// <summary>
+		/// Resizes by averaging the source rectangle each target pixel covers.
+		/// </summary>
+		/// <remarks>
+		/// Every source pixel contributes to exactly one target pixel, so nothing is dropped. The
+		/// sums are long because a large source region times 255 overflows an int well before it
+		/// overflows a long, and the count is never zero: a target pixel always covers at least the
+		/// one source pixel its own position falls on.
+		/// </remarks>
+		private PixelBuffer ResizeByArea(int targetWidth, int targetHeight)
+		{
+			var result = new PixelBuffer(targetWidth, targetHeight);
+
+			for (int ty = 0; ty < targetHeight; ty++)
+			{
+				int sy0 = (int)((long)ty * Height / targetHeight);
+				int sy1 = (int)((long)(ty + 1) * Height / targetHeight);
+				if (sy1 <= sy0) sy1 = sy0 + 1;
+				if (sy1 > Height) sy1 = Height;
+
+				for (int tx = 0; tx < targetWidth; tx++)
+				{
+					int sx0 = (int)((long)tx * Width / targetWidth);
+					int sx1 = (int)((long)(tx + 1) * Width / targetWidth);
+					if (sx1 <= sx0) sx1 = sx0 + 1;
+					if (sx1 > Width) sx1 = Width;
+
+					long r = 0, g = 0, b = 0, count = 0;
+					for (int sy = sy0; sy < sy1; sy++)
+					{
+						for (int sx = sx0; sx < sx1; sx++)
+						{
+							var pixel = _pixels[sx, sy];
+							r += pixel.R;
+							g += pixel.G;
+							b += pixel.B;
+							count++;
+						}
+					}
+
+					result._pixels[tx, ty] = new ImagePixel(
+						(byte)(r / count), (byte)(g / count), (byte)(b / count));
 				}
 			}
 
@@ -143,49 +209,146 @@ namespace SharpConsoleUI.Imaging
 		}
 
 		/// <summary>
+		/// Decodes image data into a <see cref="PixelBuffer"/>.
+		/// </summary>
+		/// <remarks>
+		/// The decoder recognises PNG, JPEG, BMP, GIF and TGA, and identifies each from its
+		/// content rather than from a file extension or a <c>Content-Type</c>.
+		/// <para>
+		/// TIFF IS NOT DECODABLE HERE, and that is a security property rather than an omission.
+		/// Images reach this method from places the application does not control — a <c>data:</c>
+		/// URI or an <c>&lt;img&gt;</c> in HTML from the network, a file the user opened. TIFF
+		/// decoders have carried heap out-of-bounds writes in their CCITT fax paths
+		/// (CVE-2026-106117, CVE-2026-106118) and a BigTIFF header that spins forever on 24 bytes
+		/// of input (GHSA-wmxv-xphr-5c9g). No TIFF decoder is linked into the library at all, so a
+		/// TIFF is refused on inspection, before any format-specific parsing runs.
+		/// </para>
+		/// </remarks>
+		private static PixelBuffer Decode(byte[] data)
+		{
+			ImageResult image;
+			try
+			{
+				image = ImageResult.FromMemory(data, StbImageSharp.ColorComponents.RedGreenBlue);
+			}
+			catch (Exception ex)
+			{
+				// The decoder reports an unrecognised or malformed image by throwing. Translate it
+				// so callers have one documented type to catch regardless of the backend.
+				throw new UnsupportedImageFormatException(
+					"The data is not in a supported image format (PNG, JPEG, BMP, GIF or TGA).", ex);
+			}
+
+			if (image.Width <= 0 || image.Height <= 0)
+				throw new UnsupportedImageFormatException("The image reports empty dimensions.");
+
+			if (image.Width > MaxPixelBufferDimension || image.Height > MaxPixelBufferDimension)
+				throw new ArgumentOutOfRangeException(
+					nameof(data),
+					$"Image dimensions {image.Width}x{image.Height} exceed maximum {MaxPixelBufferDimension}.");
+
+			return FromRgb24Bytes(image.Data, image.Width, image.Height);
+		}
+
+		/// <summary>
 		/// Creates a PixelBuffer by loading an image from a file path.
-		/// Supports PNG, JPEG, BMP, GIF, TIFF, TGA, PBM, and WebP formats.
+		/// Supports PNG, JPEG, BMP, GIF and TGA formats.
 		/// </summary>
 		/// <param name="filePath">Path to the image file.</param>
 		/// <returns>A PixelBuffer containing the decoded image pixels.</returns>
+		/// <exception cref="UnsupportedImageFormatException">
+		/// The data is not one of the supported formats. A TIFF lands here by design — see
+		/// <see cref="Decode"/>.
+		/// </exception>
 		public static PixelBuffer FromFile(string filePath)
 		{
-			using var image = SixLabors.ImageSharp.Image.Load<Rgb24>(filePath);
-			return FromImageSharp(image);
+			return Decode(File.ReadAllBytes(filePath));
 		}
 
 		/// <summary>
 		/// Creates a PixelBuffer by loading an image from a stream.
-		/// Supports PNG, JPEG, BMP, GIF, TIFF, TGA, PBM, and WebP formats.
+		/// Supports PNG, JPEG, BMP, GIF and TGA formats.
 		/// </summary>
 		/// <param name="stream">Stream containing image data.</param>
 		/// <returns>A PixelBuffer containing the decoded image pixels.</returns>
+		/// <exception cref="UnsupportedImageFormatException">
+		/// The data is not one of the supported formats. A TIFF lands here by design — see
+		/// <see cref="Decode"/>.
+		/// </exception>
 		public static PixelBuffer FromStream(Stream stream)
 		{
-			using var image = SixLabors.ImageSharp.Image.Load<Rgb24>(stream);
-			return FromImageSharp(image);
+			if (stream is MemoryStream ms)
+				return Decode(ms.ToArray());
+
+			using var copy = new MemoryStream();
+			stream.CopyTo(copy);
+			return Decode(copy.ToArray());
 		}
 
 		/// <summary>
-		/// Creates a PixelBuffer from an ImageSharp Image&lt;Rgb24&gt;.
+		/// Creates a PixelBuffer from tightly packed 24-bit RGB bytes in row-major order
+		/// (left to right, top to bottom, three bytes per pixel).
 		/// </summary>
-		public static PixelBuffer FromImageSharp(Image<Rgb24> image)
+		/// <param name="rgb">The pixel bytes. Length must be at least <c>width * height * 3</c>.</param>
+		/// <param name="width">Image width in pixels.</param>
+		/// <param name="height">Image height in pixels.</param>
+		/// <remarks>
+		/// This is the seam for pixels produced by another imaging library: copy that library's
+		/// pixels into a byte buffer and hand it here, and no imaging dependency is shared with
+		/// SharpConsoleUI.
+		/// </remarks>
+		public static PixelBuffer FromRgb24Bytes(ReadOnlySpan<byte> rgb, int width, int height)
 		{
-			var buffer = new PixelBuffer(image.Width, image.Height);
+			if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
+			if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
 
-			image.ProcessPixelRows(accessor =>
+			long required = (long)width * height * 3;
+			if (rgb.Length < required)
+				throw new ArgumentException(
+					$"Expected at least {required} bytes for {width}x{height} RGB, got {rgb.Length}.",
+					nameof(rgb));
+
+			var buffer = new PixelBuffer(width, height);
+			for (int y = 0; y < height; y++)
 			{
-				for (int y = 0; y < accessor.Height; y++)
+				int row = y * width * 3;
+				for (int x = 0; x < width; x++)
 				{
-					var row = accessor.GetRowSpan(y);
-					for (int x = 0; x < row.Length; x++)
-					{
-						ref var pixel = ref row[x];
-						buffer._pixels[x, y] = new ImagePixel(pixel.R, pixel.G, pixel.B);
-					}
+					int i = row + x * 3;
+					buffer._pixels[x, y] = new ImagePixel(rgb[i], rgb[i + 1], rgb[i + 2]);
 				}
-			});
+			}
+			return buffer;
+		}
 
+		/// <summary>
+		/// Creates a PixelBuffer from tightly packed 32-bit RGBA bytes in row-major order
+		/// (left to right, top to bottom, four bytes per pixel). The alpha byte is ignored.
+		/// </summary>
+		/// <param name="rgba">The pixel bytes. Length must be at least <c>width * height * 4</c>.</param>
+		/// <param name="width">Image width in pixels.</param>
+		/// <param name="height">Image height in pixels.</param>
+		public static PixelBuffer FromRgba32Bytes(ReadOnlySpan<byte> rgba, int width, int height)
+		{
+			if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
+			if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
+
+			long required = (long)width * height * 4;
+			if (rgba.Length < required)
+				throw new ArgumentException(
+					$"Expected at least {required} bytes for {width}x{height} RGBA, got {rgba.Length}.",
+					nameof(rgba));
+
+			var buffer = new PixelBuffer(width, height);
+			for (int y = 0; y < height; y++)
+			{
+				int row = y * width * 4;
+				for (int x = 0; x < width; x++)
+				{
+					int i = row + x * 4;
+					buffer._pixels[x, y] = new ImagePixel(rgba[i], rgba[i + 1], rgba[i + 2]);
+				}
+			}
 			return buffer;
 		}
 

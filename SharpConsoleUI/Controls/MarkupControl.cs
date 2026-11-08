@@ -75,8 +75,6 @@ namespace SharpConsoleUI.Controls
 		private Padding _padding = new Padding(0, 0, 0, 0);
 
 		// Double-click detection
-		private DateTime _lastClickTime = DateTime.MinValue;
-		private Point _lastClickPosition = Point.Empty;
 		private int _doubleClickThresholdMs = Configuration.ControlDefaults.DefaultDoubleClickThresholdMs;
 		private bool _doubleClickEnabled = true;
 
@@ -132,8 +130,11 @@ namespace SharpConsoleUI.Controls
 			get { lock (_contentLock) { return string.Join("\n", _content); } }
 			set
 			{
-				lock (_contentLock) { _content = SplitContentPreservingTagRegions(value); }
-				BumpContentVersion();
+				lock (_contentLock)
+				{
+					_content = SplitContentPreservingTagRegions(value);
+					BumpContentVersion();
+				}
 				InvalidateLinkCount();
 				OnPropertyChanged();
 				Invalidate(Invalidation.Relayout);
@@ -179,8 +180,15 @@ namespace SharpConsoleUI.Controls
 
 		/// <summary>
 		/// Gets or sets the double-click threshold in milliseconds.
-		/// Default: 500ms, minimum: 100ms.
 		/// </summary>
+		/// <remarks>
+		/// No longer consulted. The double click is derived once, by
+		/// <c>MouseGestureRecognizer</c>, so that every control agrees on what one
+		/// is; this control used to run a second clock beside it and the two
+		/// agreed only by accident. Kept because it is public API, and because
+		/// setting it was never harmful - only ineffective from here on.
+		/// Configure the timing on the recognizer instead.
+		/// </remarks>
 		public int DoubleClickThresholdMs
 		{
 			get => _doubleClickThresholdMs;
@@ -295,14 +303,25 @@ namespace SharpConsoleUI.Controls
 			// Reuse ContentWidth for width calculation (already includes border + padding chrome).
 			int width = ContentWidth ?? 0;
 
-			// Calculate total lines (including splits)
-			List<string> snapshot;
-			lock (_contentLock) { snapshot = _content.ToList(); }
+			// Count hard lines without allocating split strings or a content snapshot.
 			int totalLines = 0;
-			foreach (var line in snapshot)
+			lock (_contentLock)
 			{
-				var subLines = line.Split(["\r\n", "\r", "\n"], StringSplitOptions.None);  // fix: handle windows newline char.
-				totalLines += subLines.Length;
+				foreach (var line in _content)
+				{
+					totalLines++; // Includes an empty line and the empty segment after a final newline.
+					for (int i = 0; i < line.Length; i++)
+					{
+						if (line[i] == '\r')
+						{
+							totalLines++;
+							if (i + 1 < line.Length && line[i + 1] == '\n')
+								i++;
+						}
+						else if (line[i] == '\n')
+							totalLines++;
+					}
+				}
 			}
 
 			// Include the optional border + inner padding in the logical height so a bordered markup
@@ -319,11 +338,36 @@ namespace SharpConsoleUI.Controls
 		/// <param name="lines">The lines of text to display, supporting Spectre.Console markup syntax.</param>
 		public void SetContent(List<string> lines)
 		{
-			lock (_contentLock) { _content = lines; }
-			BumpContentVersion();
+			lock (_contentLock)
+			{
+				// Content a control already has is not a change. A live view
+				// refills its panes several times a second, almost always with
+				// what they already say, and relayouting for that is what a
+				// reader sees as flicker.
+				if (SameContent(lines)) return;
+
+				_content = lines;
+				BumpContentVersion();
+			}
 			InvalidateLinkCount();
 			OnPropertyChanged(nameof(Text));
 			Invalidate(Invalidation.Relayout);
+		}
+
+		/// <summary>Whether these lines are the ones already held.</summary>
+		/// <remarks>Called inside <c>_contentLock</c>.</remarks>
+		private bool SameContent(List<string>? lines)
+		{
+			if (lines == null) return _content.Count == 0;
+			if (lines.Count != _content.Count) return false;
+
+			for (int i = 0; i < lines.Count; i++)
+			{
+				if (!string.Equals(lines[i], _content[i], StringComparison.Ordinal))
+					return false;
+			}
+
+			return true;
 		}
 
 		/// <summary>
@@ -449,7 +493,11 @@ namespace SharpConsoleUI.Controls
 		/// <param name="line">The line to append, supporting markup syntax.</param>
 		public void AppendLine(string line)
 		{
-			lock (_contentLock) { _content.Add(line ?? string.Empty); }
+			lock (_contentLock)
+			{
+				_content.Add(line ?? string.Empty);
+				BumpContentVersion();
+			}
 			OnContentAppended();
 		}
 
@@ -463,6 +511,7 @@ namespace SharpConsoleUI.Controls
 			{
 				foreach (var line in lines)
 					_content.Add(line ?? string.Empty);
+				BumpContentVersion();
 			}
 			OnContentAppended();
 		}
@@ -494,6 +543,7 @@ namespace SharpConsoleUI.Controls
 
 				for (int i = startIndex; i < parts.Length; i++)
 					_content.Add(parts[i]);
+				BumpContentVersion();
 			}
 			OnContentAppended();
 		}
@@ -510,7 +560,6 @@ namespace SharpConsoleUI.Controls
 		/// <summary>Shared post-append bookkeeping: any active selection is now stale, so clear it.</summary>
 		private void OnContentAppended()
 		{
-			BumpContentVersion();
 			if (_enableSelection && _hasSelection)
 				ClearSelection();
 			InvalidateLinkCount();
@@ -547,10 +596,6 @@ namespace SharpConsoleUI.Controls
 			// MouseClick path below, which only returns true when MouseClick != null.
 			if (args.HasFlag(MouseFlags.Button1DoubleClicked) && _doubleClickEnabled && MouseDoubleClick != null)
 			{
-				// Reset tracking state since driver handled the gesture
-				_lastClickTime = DateTime.MinValue;
-				_lastClickPosition = Point.Empty;
-
 				MouseDoubleClick.Invoke(this, args);
 				return true;
 			}
@@ -569,25 +614,12 @@ namespace SharpConsoleUI.Controls
 				if (TryRaiseLinkClick(args))
 					return true;
 
-				// Detect double-click
-				var now = DateTime.UtcNow;
-				var timeSince = (now - _lastClickTime).TotalMilliseconds;
-				bool isDoubleClick = _doubleClickEnabled &&
-									 args.Position == _lastClickPosition &&
-									 timeSince <= _doubleClickThresholdMs;
-
-				// Always update tracking state
-				_lastClickTime = now;
-				_lastClickPosition = args.Position;
-
-				// Mutually exclusive: Fire either MouseDoubleClick OR MouseClick
-				// Only consider handled if there are subscribers
-				if (isDoubleClick && MouseDoubleClick != null)
-				{
-					MouseDoubleClick.Invoke(this, args);
-					return true;
-				}
-				else if (!isDoubleClick && MouseClick != null)
+				// A click is a click. MouseDoubleClick belongs to the
+				// Button1DoubleClicked branch above, because the recognizer is the
+				// one place that decides what a double click is - a second clock
+				// here agreed with it only by accident, and two double clicks in a
+				// row raised three.
+				if (MouseClick != null)
 				{
 					MouseClick.Invoke(this, args);
 					return true;
@@ -641,9 +673,7 @@ namespace SharpConsoleUI.Controls
 			int parseWidth = ComputeParseWidth(contentWidth);
 			var parsed = EnsureParsed(parseWidth, measureFg, measureBg, mdStyle, _wrap);
 
-			int maxContentWidth = 0;
-			for (int i = 0; i < parsed.Rows.Count; i++)
-				maxContentWidth = Math.Max(maxContentWidth, parsed.Rows[i].Count);
+			int maxContentWidth = parsed.MaxWidth;
 			int totalLines = parsed.TotalRows;
 
 			// Account for margins
@@ -695,7 +725,7 @@ namespace SharpConsoleUI.Controls
 			var mdStyle = ResolveMarkdownStyle();
 			var (effectiveFg, effectiveBg) = ResolveParseColors();
 
-			// Consume the parse cache instead of re-parsing. EnsureParsed returns one cell-row per display
+			// Consume the parse cache instead of re-parsing. EnsureParsed returns one text range per display
 			// row, its source (logical) line index, and the link spans per row — the same three lists the
 			// old per-line loop built. CountParse now lives inside EnsureParsed, so a repeated paint with an
 			// unchanged key performs zero new parses (the issue #42 fix).
@@ -703,14 +733,6 @@ namespace SharpConsoleUI.Controls
 			var parsed = EnsureParsed(parseWidth, effectiveFg, effectiveBg, mdStyle, _wrap);
 			var renderedCellLines = parsed.Rows;
 			var renderedLinkLines = parsed.RowLinks;
-			var rowSourceLineIndex = parsed.RowSourceLine;
-			var rowSoftWrapFlags = parsed.RowIsSoftWrapContinuation;
-
-			// Calculate content width for alignment (Center/Right). Derived from the parsed rows (already in
-			// display columns) so it stays consistent with what is painted.
-			int maxContentWidth = 0;
-			for (int i = 0; i < renderedCellLines.Count; i++)
-				maxContentWidth = Math.Max(maxContentWidth, renderedCellLines[i].Count);
 
 			// Paint with margins + border + padding inset
 			int startY = bounds.Y + topInset;
@@ -721,26 +743,28 @@ namespace SharpConsoleUI.Controls
 			// NOTE: mouse coordinates delivered to ProcessMouseEvent are CONTROL-RELATIVE
 			// (content top-left = (0,0)), so the cache stores origins relative to the control
 			// (Margin.Top / Margin.Left + alignOffset), NOT the absolute buffer bounds.
-			UpdateSelectionLayoutCache(renderedCellLines, rowSourceLineIndex, rowSoftWrapFlags, leftInset, topInset, targetWidth);
-			UpdateLinkLayoutCache(renderedLinkLines);
-			UpdateLinkVisibilityCache(renderedCellLines.Count, startY, clipRect.Y, clipRect.Bottom);
+			lock (_selectionLock)
+			{
+				_selectionContent = parsed;
+				UpdateSelectionLayoutCache(renderedCellLines, leftInset, topInset, targetWidth);
+				UpdateLinkLayoutCache(renderedLinkLines);
+				UpdateLinkVisibilityCache(startY, clipRect.Y, clipRect.Bottom);
+			}
 
-			// Resolve the focused link's (row, span) once for this paint so the loop can invert its cells.
+			// Resolve the focused link's rows once for this paint so the loop can invert its cells.
+			// A link whose text wraps covers several rows: FlattenLinks reports it as ONE stop (its
+			// first row), but the highlight has to cover every row it spans, or focus appears to sit
+			// on a fragment of the link (#86).
 			bool highlightFocus = ComputeHasFocus() && _focusedLinkIndex >= 0;
-			int focusedRow = -1;
-			Parsing.LinkSpan focusedSpan = default;
+			Dictionary<int, Parsing.LinkSpan>? focusedRowSpans = null;
 			if (highlightFocus)
 			{
 				var flat = FlattenLinks();
 				if (_focusedLinkIndex < flat.Count)
-				{
-					focusedRow = flat[_focusedLinkIndex].row;
-					focusedSpan = flat[_focusedLinkIndex].span;
-				}
-				else
-				{
+					focusedRowSpans = ResolveFocusedLinkRows(flat[_focusedLinkIndex]);
+
+				if (focusedRowSpans == null || focusedRowSpans.Count == 0)
 					highlightFocus = false;
-				}
 			}
 
 			// Fill top margin (outer margin rows above the border/content)
@@ -753,7 +777,7 @@ namespace SharpConsoleUI.Controls
 				?? effectiveFg;
 
 			// Paint content lines (leave room for the bottom border + bottom padding + bottom margin)
-			for (int i = 0; i < renderedCellLines.Count && startY + i < bounds.Bottom - bottomInset; i++)
+			for (int i = Math.Max(0, clipRect.Y - startY); i < renderedCellLines.Count && startY + i < Math.Min(clipRect.Bottom, bounds.Bottom - bottomInset); i++)
 			{
 				int y = startY + i;
 				if (y < clipRect.Y || y >= clipRect.Bottom)
@@ -789,20 +813,17 @@ namespace SharpConsoleUI.Controls
 					ControlRenderingHelpers.FillRect(buffer, new LayoutRect(startX, y, alignOffset, 1), fgColor, marginBg);
 				}
 
-				// Record this row's horizontal paint offset (control-relative) for mouse hit-testing.
-				// Uses the full inset (margin + border + padding) so a click inside a bordered markup
-				// maps to the correct cell.
-				SetRowPaintOffset(i, leftInset + alignOffset);
-
 				// Apply selection highlight (only when selection is enabled and this row is selected).
-				var paintLine = ApplySelectionHighlight(i, cellLine);
+				var paintLine = PreparePaintRow(i, cellLine);
 
 				// Apply focus highlight (keyboard nav): invert the focused link's cells on its row.
-				if (highlightFocus && i == focusedRow)
-					paintLine = ApplyFocusHighlight(paintLine, focusedSpan);
+				if (highlightFocus && focusedRowSpans!.TryGetValue(i, out var rowFocusSpan))
+					paintLine.SetFocus(rowFocusSpan.StartCol, rowFocusSpan.EndCol,
+						_focusedLinkForegroundColor ?? DefaultFocusedLinkForeground,
+						_focusedLinkBackgroundColor ?? DefaultFocusedLinkBackground);
 
 				// Paint the line content
-				buffer.WriteCellsClipped(startX + alignOffset, y, paintLine, clipRect);
+				buffer.WriteTextRowClipped(startX + alignOffset, y, paintLine, clipRect);
 
 				// Fill remaining space (right side) up to the right inset (leaves the right border /
 				// right padding / right margin columns untouched).
@@ -810,8 +831,16 @@ namespace SharpConsoleUI.Controls
 				int rightPadWidth = bounds.Right - rightPadStart - rightInset;
 				if (rightPadWidth > 0)
 				{
-					// Use the control's background color if set, otherwise container's
-					var rightFillBg = _backgroundColor == null ? Color.Transparent : _backgroundColor.Value;
+					// The control's background if set, ELSE THE CONTAINER'S — which is what this
+					// comment always claimed and the code never did. Falling back to Transparent left
+					// every line's trailing space showing whatever sat behind the control, so a
+					// MarkupControl inside a coloured container painted its text on the container's
+					// surface and its right-hand pad on the window's. Measured live in a chat
+					// transcript: a message body's rows carried the panel colour up to the last
+					// character and reverted for the rest of the row, while the header — filled by
+					// CollapsiblePanel itself — ran the full width. The block read as a header band
+					// with ragged text under it rather than one surface.
+					var rightFillBg = _backgroundColor ?? Container?.BackgroundColor ?? Color.Transparent;
 
 					// If this line's last cell requests fill-to-width (via the [fillwidth] marker),
 					// extend that cell's background instead — e.g. a shaded code-block line whose
@@ -852,5 +881,17 @@ namespace SharpConsoleUI.Controls
 		}
 
 		#endregion
+
+		/// <inheritdoc/>
+		public override void DescribeState(IStateWriter w)
+		{
+			ArgumentNullException.ThrowIfNull(w);
+			base.DescribeState(w);
+
+			// The markup as written, not as rendered: a probe asking what a label says
+			// usually wants to know whether the tags are what the author intended.
+			w.Text(StateVocabulary.Shorten(Text));
+		}
+
 	}
 }

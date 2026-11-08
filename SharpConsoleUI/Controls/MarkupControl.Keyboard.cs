@@ -32,24 +32,7 @@ namespace SharpConsoleUI.Controls
 		}
 
 		/// <summary>Number of clickable links in the current content (cached; derived from content, not paint).</summary>
-		private int LinkCount
-		{
-			get
-			{
-				// Compute AND write the cache under _contentLock so a concurrent content mutation
-				// (which clears the cache under the same lock) can't be overwritten by a stale value.
-				// CountLinks is a pure static, safe to call while holding the lock.
-				lock (_contentLock)
-				{
-					if (_cachedLinkCount.HasValue) return _cachedLinkCount.Value;
-					int total = 0;
-					foreach (var line in _content)
-						total += Parsing.MarkupParser.CountLinks(line);
-					_cachedLinkCount = total;
-					return total;
-				}
-			}
-		}
+		private int LinkCount => MeasureSourceLinkCount();
 
 		/// <summary>Invalidates the cached link count after a content change.</summary>
 		private void InvalidateLinkCount()
@@ -101,15 +84,15 @@ namespace SharpConsoleUI.Controls
 
 			lock (_selectionLock)
 			{
-				// _lastClipRect / _cachedRowAbsoluteY are co-written in PaintDOM under _selectionLock.
+				// _lastClipRect / _cachedAbsoluteOriginY are co-written in PaintDOM under _selectionLock.
 				if (_lastClipRectValid)
 				{
 					for (int i = 0; i < links.Count; i++)
 					{
 						int row = links[i].row;
-						if (row >= 0 && row < _cachedRowAbsoluteY.Length)
+						if (row >= 0 && row < _cachedRows.Count)
 						{
-							int y = _cachedRowAbsoluteY[row];
+							int y = _cachedAbsoluteOriginY + row;
 							if (y >= _lastClipRectY && y < _lastClipRectBottom)
 								return i;
 						}
@@ -128,15 +111,84 @@ namespace SharpConsoleUI.Controls
 			var result = new List<(int, Parsing.LinkSpan)>();
 			lock (_selectionLock)
 			{
+				// One entry per LINK, not per rendered row. A link whose text wraps is cached as one
+				// span per row, all sharing a LinkIndex; emitting each of them made a wrapped link
+				// several keyboard stops, so Right stepped through its own rows before reaching the
+				// next link (#86). Keep the first row's span — it is where focus lands and where the
+				// highlight starts — and skip the continuations.
+				// LinkIndex restarts at 0 for each parsed group (ParseLines is called and cached per
+				// content group), so a matching index alone is not enough — two separate lines would
+				// both report 0. A continuation also has to be the very next row AND that row has to
+				// be a soft-wrap continuation of the one before it.
+				int lastLinkIndex = -1;
+				int lastRow = -1;
 				for (int row = 0; row < _cachedRowLinks.Count; row++)
 				{
 					var spans = _cachedRowLinks[row];
 					if (spans == null) continue;
+
+					bool continuesPreviousRow =
+						row == lastRow + 1 &&
+						_selectionContent != null &&
+						row < _selectionContent.RowIsSoftWrapContinuation.Count &&
+						_selectionContent.RowIsSoftWrapContinuation[row];
+
 					foreach (var span in spans)
+					{
+						// LinkIndex is -1 for spans built without one; those are always their own stop.
+						if (span.LinkIndex >= 0 && span.LinkIndex == lastLinkIndex && continuesPreviousRow)
+							continue;
+						lastLinkIndex = span.LinkIndex;
 						result.Add((row, span));
+					}
+
+					lastRow = row;
 				}
 			}
 			return result;
+		}
+
+		/// <summary>
+		/// The rows the focused link actually covers, keyed by rendered row index, with the span to
+		/// invert on each. A link that does not wrap yields its single row.
+		/// </summary>
+		/// <param name="stop">The focused entry from <see cref="FlattenLinks"/>.</param>
+		/// <returns>Row index → span to highlight on that row.</returns>
+		/// <remarks>
+		/// Walks forward from the stop's own row for as long as the next row is a soft-wrap
+		/// continuation carrying the same <see cref="Parsing.LinkSpan.LinkIndex"/> — the same rule
+		/// <see cref="FlattenLinks"/> uses to collapse those rows into one stop, so the highlight and
+		/// the navigation can never disagree about where a link ends.
+		/// </remarks>
+		private Dictionary<int, Parsing.LinkSpan> ResolveFocusedLinkRows((int row, Parsing.LinkSpan span) stop)
+		{
+			var rows = new Dictionary<int, Parsing.LinkSpan> { [stop.row] = stop.span };
+			if (stop.span.LinkIndex < 0) return rows;
+
+			lock (_selectionLock)
+			{
+				for (int row = stop.row + 1; row < _cachedRowLinks.Count; row++)
+				{
+					if (_selectionContent == null || row >= _selectionContent.RowIsSoftWrapContinuation.Count || !_selectionContent.RowIsSoftWrapContinuation[row])
+						break;
+
+					var spans = _cachedRowLinks[row];
+					if (spans == null) break;
+
+					bool matched = false;
+					foreach (var span in spans)
+					{
+						if (span.LinkIndex != stop.span.LinkIndex) continue;
+						rows[row] = span;
+						matched = true;
+						break;
+					}
+
+					if (!matched) break;
+				}
+			}
+
+			return rows;
 		}
 
 		/// <summary>

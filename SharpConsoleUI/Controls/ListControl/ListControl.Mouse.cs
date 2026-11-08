@@ -43,8 +43,9 @@ namespace SharpConsoleUI.Controls
 		}
 
 		/// <summary>
-		/// Gets or sets the number of lines to scroll with mouse wheel.
-		/// Default: 3.
+		/// Gets or sets the number of lines scrolled per mouse wheel notch.
+		/// Values below 1 are clamped to 1.
+		/// Default: <see cref="ControlDefaults.DefaultScrollWheelLines"/>.
 		/// </summary>
 		public int MouseWheelScrollSpeed
 		{
@@ -74,9 +75,39 @@ namespace SharpConsoleUI.Controls
 		}
 
 		/// <summary>
-		/// Gets or sets the double-click threshold in milliseconds.
-		/// Default: 500.
+		/// Gets or sets whether a single click activates an item.
+		/// Default: false.
 		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// A list activates on a double click, which is right for a file list and
+		/// wrong for a menu - nobody double clicks a start menu. Turn this on and one
+		/// click both selects and activates.
+		/// </para>
+		/// <para>
+		/// Independent of <see cref="DoubleClickActivates"/>: that one gates the
+		/// double-click path, so turning it off does not make single clicks activate,
+		/// it makes nothing activate. With both on, a double click still activates
+		/// once - the second click lands on an item already activated by the first.
+		/// </para>
+		/// </remarks>
+		public bool ActivateOnSingleClick
+		{
+			get => _activateOnSingleClick;
+			set { _activateOnSingleClick = value; OnPropertyChanged(); }
+		}
+
+		/// <summary>
+		/// Gets or sets the double-click threshold in milliseconds.
+		/// </summary>
+		/// <remarks>
+		/// No longer consulted. The double click is derived once, by
+		/// <c>MouseGestureRecognizer</c>, so that every control agrees on what one
+		/// is; this control used to run a second clock beside it and the two
+		/// agreed only by accident. Kept because it is public API, and because
+		/// setting it was never harmful - only ineffective from here on.
+		/// Configure the timing on the recognizer instead.
+		/// </remarks>
 		public int DoubleClickThresholdMs
 		{
 			get => _doubleClickThresholdMs;
@@ -106,21 +137,59 @@ namespace SharpConsoleUI.Controls
 				return true;
 			}
 
-			// Handle scrollbar drag-in-progress (must be checked early)
-			if (args.HasAnyFlag(MouseFlags.Button1Dragged, MouseFlags.Button1Pressed))
+			// Scrollbar gesture capture: once a press lands on the scrollbar, subsequent resent
+			// press/drag events route to it without re-hit-testing, even if the pointer wanders off
+			// the bar into the content column - this is what stops a thumb drag from leaking into
+			// content selection. Content presses are captured too (region Content) so the capture is
+			// always released on Up, but Content gestures fall through to the existing handling below
+			// (this preserves the exact pre-existing content click/double-click/checkbox behavior).
+			if (args.HasAnyFlag(MouseFlags.Button1Pressed, MouseFlags.Button1Dragged,
+				MouseFlags.Button1Released, MouseFlags.Button1Clicked))
 			{
-				if (_isScrollbarDragging)
+				var route = _gesture.Route(args, HitTestRegion);
+				if (route.Phase != GesturePhase.None && route.Region == ListGestureRegion.Scrollbar)
 				{
-					HandleScrollbarDrag(args);
+					switch (route.Phase)
+					{
+						case GesturePhase.Down:
+							if (!HasFocus && CanFocusWithMouse)
+								this.GetParentWindow()?.FocusManager.SetFocus(this, FocusReason.Mouse);
+							_thumbDragging = false;
+							HandleScrollbarThumbPress(args);
+							if (!_thumbDragging)
+								HandleScrollbarClick(args);
+							args.Handled = true;
+							return true;
+
+						case GesturePhase.Move:
+							if (_thumbDragging)
+								HandleScrollbarDrag(args);
+							args.Handled = true;
+							return true;
+
+						case GesturePhase.Up:
+							_thumbDragging = false;
+							args.Handled = true;
+							return true;
+					}
+				}
+
+				// A bare Button1Clicked with no prior captured press (some drivers/tests deliver a click
+				// without a separate Button1Pressed) landing on the scrollbar: synthesize a full click by
+				// hit-testing fresh and dispatching Down then Up, so arrow/track clicks still fire.
+				if (route.Phase == GesturePhase.None && args.HasFlag(MouseFlags.Button1Clicked)
+					&& HitTestRegion(args) == ListGestureRegion.Scrollbar)
+				{
+					if (!HasFocus && CanFocusWithMouse)
+						this.GetParentWindow()?.FocusManager.SetFocus(this, FocusReason.Mouse);
+					_thumbDragging = false;
+					HandleScrollbarThumbPress(args);
+					if (!_thumbDragging)
+						HandleScrollbarClick(args);
+					_thumbDragging = false;
+					args.Handled = true;
 					return true;
 				}
-			}
-
-			// Handle scrollbar drag end
-			if (args.HasFlag(MouseFlags.Button1Released) && _isScrollbarDragging)
-			{
-				_isScrollbarDragging = false;
-				return true;
 			}
 
 			// Calculate which item the mouse is over
@@ -192,15 +261,25 @@ namespace SharpConsoleUI.Controls
 			}
 
 			// Handle double-click event from driver (preferred method)
-			if (!mouseOnScrollbar && args.HasFlag(MouseFlags.Button1DoubleClicked) && _doubleClickActivates)
+			// Not when a single click already activates: the recognizer reports the
+			// click on the release and the double on the next press, so both branches
+			// would fire and one double click would activate twice. Most specific
+			// gesture first is the rule; here the specific one has nothing to add,
+			// because the first click of the pair already did the work.
+			// A real double click delivers Button1Clicked TWICE - once on each
+			// release - with Button1DoubleClicked on the second press between them.
+			// In single-click mode the first release already activated, so the
+			// second must not. Remembered rather than timed: the recognizer owns
+			// the timing, and a clock here would be the second opinion that
+			// issue #92 was about.
+			if (args.HasFlag(MouseFlags.Button1DoubleClicked)) _swallowNextClick = true;
+
+			if (!mouseOnScrollbar && args.HasFlag(MouseFlags.Button1DoubleClicked)
+				&& _doubleClickActivates && !_activateOnSingleClick)
 			{
 				int clickedIndex = GetItemIndexAtRelativeY(relativeY);
 				if (clickedIndex >= 0)
 				{
-					// Reset tracking state since driver handled the gesture
-					_lastClickTime = DateTime.MinValue;
-					_lastClickIndex = -1;
-
 					// Commit highlight to selection
 					if (_selectedIndex != clickedIndex)
 					{
@@ -220,26 +299,6 @@ namespace SharpConsoleUI.Controls
 					args.Handled = true;
 					return true;
 				}
-			}
-
-			// Handle scrollbar thumb drag initiation (needs Button1Pressed for responsive dragging)
-			if (mouseOnScrollbar && args.HasFlag(MouseFlags.Button1Pressed))
-			{
-				if (!HasFocus && CanFocusWithMouse)
-					this.GetParentWindow()?.FocusManager.SetFocus(this, FocusReason.Mouse);
-				HandleScrollbarThumbPress(args);
-				args.Handled = true;
-				return true;
-			}
-
-			// Handle scrollbar arrow/track clicks (Button1Clicked only to avoid double-firing)
-			if (mouseOnScrollbar && args.HasFlag(MouseFlags.Button1Clicked))
-			{
-				if (!HasFocus && CanFocusWithMouse)
-					this.GetParentWindow()?.FocusManager.SetFocus(this, FocusReason.Mouse);
-				HandleScrollbarClick(args);
-				args.Handled = true;
-				return true;
 			}
 
 			// Handle mouse clicks - set focus, select item, detect double-click
@@ -269,42 +328,22 @@ namespace SharpConsoleUI.Controls
 							}
 						}
 
-						// Detect double-click (ProcessMouseEvent is always called on UI thread)
-						var now = DateTime.UtcNow;
-						var timeSince = (now - _lastClickTime).TotalMilliseconds;
-						bool isDoubleClick = _doubleClickActivates &&
-										clickedIndex == _lastClickIndex &&
-										timeSince <= _doubleClickThresholdMs;
-
-						_lastClickTime = now;
-						_lastClickIndex = clickedIndex;
-
-						// Set selection directly
+						// A click selects. It activates too only when the list was
+						// asked to behave like a menu - and note there is still no
+						// clock here: the recognizer is the one place that decides
+						// what a double click is, and a second one agreed with it
+						// only by accident, which is how two double clicks in a row
+						// once activated three times.
 						SelectedIndex = clickedIndex;
+						MouseClick?.Invoke(this, args);
 
-						// Double click: Commit to selection and activate
-						if (isDoubleClick)
+						if (_activateOnSingleClick && _items[clickedIndex].IsEnabled
+							&& !_swallowNextClick)
 						{
-							// Commit highlight to selection
-							if (_selectedIndex != clickedIndex)
-							{
-								SelectedIndex = clickedIndex;
-							}
-
-							MouseDoubleClick?.Invoke(this, args);
-
-							// Fire ItemActivated (like Enter key)
-							var item = _items[clickedIndex];
-							if (item.IsEnabled)
-							{
-								ItemActivated?.Invoke(this, item);
-							}
+							ItemActivated?.Invoke(this, _items[clickedIndex]);
 						}
-						else
-						{
-							// Fire mouse click event
-							MouseClick?.Invoke(this, args);
-						}
+
+						_swallowNextClick = false;
 
 						Invalidate(Invalidation.Relayout);
 					}
@@ -372,6 +411,15 @@ namespace SharpConsoleUI.Controls
 
 		#region Scrollbar Interaction
 
+		/// <summary>
+		/// Maps a fresh Button1 press position to the sub-region that should own the resulting gesture.
+		/// Called ONLY on a fresh press by <see cref="MouseGestureCapture{TRegion}"/>; never re-invoked
+		/// mid-gesture, which is what stops a resent-press-on-motion from re-hit-testing a drag that has
+		/// wandered off the scrollbar column into the item area (or vice versa).
+		/// </summary>
+		private ListGestureRegion HitTestRegion(MouseEventArgs args) =>
+			IsClickOnScrollbar(args) ? ListGestureRegion.Scrollbar : ListGestureRegion.Content;
+
 		private bool IsClickOnScrollbar(MouseEventArgs args)
 		{
 			int effectiveMaxVisibleItems = GetEffectiveVisibleItems();
@@ -405,7 +453,7 @@ namespace SharpConsoleUI.Controls
 			var zone = ScrollbarHelper.HitTest(relY, trackHeight, thumbY, thumbHeight);
 			if (zone == ScrollbarHitZone.Thumb)
 			{
-				_isScrollbarDragging = true;
+				_thumbDragging = true;
 				_scrollbarDragStartY = args.Position.Y;
 				_scrollbarDragStartOffset = _scrollOffset;
 			}

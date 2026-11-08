@@ -203,8 +203,10 @@ namespace SharpConsoleUI.Controls
 					case ConsoleKey.End:
 						if (VerticalIsScrollable)
 						{
-							_autoScroll = true;  // Explicitly re-attach
-							ScrollVerticalTo(Math.Max(0, _contentHeight - VisibleContentHeight));
+							// Explicitly re-attach (End = "go to the bottom and follow again"), but only for a
+							// panel that opted into AutoScroll in the first place.
+							if (_autoScrollEverEnabled) _autoScroll = true;
+							ScrollVerticalTo(MaxVerticalScrollOffset);
 							return true;
 						}
 						if (HorizontalIsScrollable)

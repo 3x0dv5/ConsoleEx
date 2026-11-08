@@ -97,6 +97,54 @@ public partial class TableControl
 	}
 
 	/// <summary>
+	/// Gets the data row index of the selected row, or -1 if there is no selection.
+	/// </summary>
+	/// <remarks>
+	/// <para>
+	/// USE THIS, NOT <see cref="SelectedRowIndex"/>, TO IDENTIFY THE SELECTED ROW. The two differ
+	/// whenever rows are filtered or hidden: <see cref="SelectedRowIndex"/> counts displayed rows,
+	/// so under a filter showing three of forty rows it is 0, 1 or 2, while this property is the
+	/// index of that row among all the rows there are. Only this one indexes
+	/// <see cref="GetRowTagAt"/>, <see cref="ITableDataSource.GetRowTag"/> and the other data-index
+	/// members.
+	/// </para>
+	/// <para>
+	/// The two agree when nothing is filtered, and when a data source applied the filter itself
+	/// (<see cref="ITableDataSource.CanFilter"/>) — such a source reports only the matching rows, so
+	/// its own indices already are the displayed ones. They diverge when the table does the
+	/// filtering: a compound AND/OR expression, or any filter over a source that cannot take one.
+	/// </para>
+	/// </remarks>
+	public int SelectedDataIndex
+	{
+		get
+		{
+			int display = _selectedRowIndex;
+			if (display < 0) return -1;
+			return display < RowCount ? MapDisplayToData(display) : -1;
+		}
+	}
+
+	/// <summary>
+	/// Gets the <see cref="TableRow.Tag"/> of the selected row — or, in data-source mode, the tag
+	/// <see cref="ITableDataSource.GetRowTag"/> returns for it — and null if there is no selection.
+	/// </summary>
+	/// <remarks>
+	/// This works in both modes, unlike <see cref="SelectedRow"/>, which is null for a data source
+	/// because a data source has no <see cref="TableRow"/> to hand back. It resolves the display
+	/// index through <see cref="SelectedDataIndex"/>, so it names the highlighted row under a filter
+	/// as well.
+	/// </remarks>
+	public object? SelectedRowTag
+	{
+		get
+		{
+			int dataIndex = SelectedDataIndex;
+			return dataIndex >= 0 ? GetRowTagAt(dataIndex) : null;
+		}
+	}
+
+	/// <summary>
 	/// Gets or sets the selected column index for cell navigation. -1 means no column selected.
 	/// </summary>
 	public int SelectedColumnIndex
@@ -153,6 +201,25 @@ public partial class TableControl
 			}
 			Invalidate(Invalidation.Relayout);
 		}
+	}
+
+	/// <summary>
+	/// Gets or sets whether right-click extends the multi-selection from the anchor to the clicked
+	/// row. Requires <see cref="MultiSelectEnabled"/>.
+	/// </summary>
+	/// <remarks>
+	/// Off by default: right-click otherwise selects the clicked row and fires
+	/// <see cref="MouseRightClick"/>, which is what a context menu acting on the current selection
+	/// expects — extending the range would replace that selection underneath it.
+	///
+	/// <para>Intended for terminals that never deliver Shift+Click. Windows Terminal and VS Code
+	/// bind it to their own text selection and do not forward the modifier, which leaves the mouse
+	/// with no native range gesture; turning this on restores one.</para>
+	/// </remarks>
+	public bool RightClickExtendsSelection
+	{
+		get => _rightClickExtendsSelection;
+		set { if (_rightClickExtendsSelection == value) return; _rightClickExtendsSelection = value; OnPropertyChanged(); }
 	}
 
 	/// <summary>
@@ -236,6 +303,60 @@ public partial class TableControl
 		_selectedRowIndex = newIndex;
 
 		EnsureSelectedRowVisible();
+		RaiseSelectedRowChanged();
+		Invalidate(Invalidation.Relayout);
+	}
+
+	/// <summary>
+	/// Moves the selection to the first row there is, or to none when there are none, and says so
+	/// if that changed which row is selected.
+	/// </summary>
+	/// <remarks>
+	/// WHAT A FILTER DOES TO THE SELECTION IS STILL A SELECTION CHANGE. Applying, retyping or
+	/// clearing a filter re-seats the cursor on the first matching row, and a consumer tracking the
+	/// selection through <see cref="SelectedRowChanged"/> has no other way to learn that: the filter
+	/// events say the filter changed, not that a different row is now highlighted. Leaving it
+	/// unraised let a consumer act on the row it last heard about while the table highlighted
+	/// another one.
+	/// <para>
+	/// Call this only once the table's state is consistent — the display map recomputed, the source
+	/// told, the row count final — because a handler reads <see cref="SelectedRowIndex"/>,
+	/// <see cref="SelectedDataIndex"/> and <see cref="SelectedRowTag"/> back synchronously.
+	/// </para>
+	/// </remarks>
+	/// <param name="resetScroll">
+	/// Whether to scroll back to the top as well. False where the rows changed under a viewport the
+	/// user had scrolled themselves — a log view at its buffer capacity rebuilds on every append,
+	/// and scrolling such a view to the top on each new line yanks it out from under them.
+	/// </param>
+	/// <remarks>
+	/// A FILTER SEATS THE CURSOR EVEN WHEN NOTHING WAS SELECTED, which is long-standing behaviour:
+	/// arrow-down after typing a filter goes to the second match, not the first. A Reset does not,
+	/// because it is also how an evicting buffer rebuilds — see the caller in
+	/// <c>OnDataSourceCollectionChanged</c>.
+	/// </remarks>
+	private void ResetSelectionToFirstRow(bool resetScroll = true)
+	{
+		int newIndex = RowCount > 0 ? 0 : -1;
+
+		if (resetScroll)
+			_scrollOffset = 0;
+
+		if (newIndex == _selectedRowIndex)
+			return;
+
+		_selectedRowIndex = newIndex;
+		RaiseSelectedRowChanged();
+	}
+
+	/// <summary>
+	/// Raises what a change of the selected row raises: property-changed for
+	/// <see cref="SelectedRowIndex"/>, <see cref="SelectedRowChanged"/>, and for in-memory rows
+	/// <see cref="SelectedRowItemChanged"/> with the row now selected.
+	/// </summary>
+	private void RaiseSelectedRowChanged()
+	{
+		int newIndex = _selectedRowIndex;
 
 		// INPC for SelectedRowIndex so data binding sees selection changes (property + key/mouse all route here).
 		OnPropertyChanged(nameof(SelectedRowIndex));
@@ -252,8 +373,6 @@ public partial class TableControl
 			}
 			Core.AsyncEvent.Raise(SelectedRowItemChanged, SelectedRowItemChangedAsync, this, row, Container?.GetConsoleWindowSystem?.LogService);
 		}
-
-		Invalidate(Invalidation.Relayout);
 	}
 
 	/// <summary>
@@ -275,11 +394,22 @@ public partial class TableControl
 	}
 
 	/// <summary>
+	/// Whether checking a row is the same thing as multi-selecting it. True here, because the flat
+	/// table's checkbox is a view of its selection.
+	/// </summary>
+	/// <remarks>
+	/// A table whose rows nest overrides this to false: there, checking answers "which rows do I
+	/// act on" and selection answers "where is the cursor", and the two have to move
+	/// independently. While this is false the selection APIs leave check state alone.
+	/// </remarks>
+	protected virtual bool ChecksFollowSelection => true;
+
+	/// <summary>
 	/// Clears all selection (multi-select mode).
 	/// </summary>
 	public void ClearSelection()
 	{
-		if (_checkboxMode && _dataSource == null)
+		if (_checkboxMode && _dataSource == null && ChecksFollowSelection)
 		{
 			lock (_tableLock)
 			{
@@ -290,6 +420,26 @@ public partial class TableControl
 		_selectedRowIndices.Clear();
 		Invalidate(Invalidation.Repaint);
 		Core.AsyncEvent.Raise(MultiSelectionChanged, MultiSelectionChangedAsync, this, 0, Container?.GetConsoleWindowSystem?.LogService);
+	}
+
+	/// <summary>Returns the multi-selected row indices (test-only observation seam).</summary>
+	internal List<int> SelectedRowIndicesForTest() => new List<int>(_selectedRowIndices);
+
+	/// <summary>
+	/// Drives the right-click selection path for the row at <paramref name="rowIndex"/> exactly as
+	/// <c>ProcessMouseEvent</c> does, without needing a laid-out control to hit-test against
+	/// (test-only seam).
+	/// </summary>
+	internal void RightClickRowForTest(int rowIndex)
+	{
+		if (_multiSelectEnabled && _rightClickExtendsSelection)
+		{
+			int anchor = _selectionAnchorRowIndex >= 0 ? _selectionAnchorRowIndex : _selectedRowIndex;
+			_selectionAnchorRowIndex = anchor;
+			_selectedRowIndices.Clear();
+			SelectRange(anchor, rowIndex);
+		}
+		SetSelectedRow(rowIndex);
 	}
 
 	/// <summary>
@@ -373,7 +523,7 @@ public partial class TableControl
 	/// </summary>
 	private void SyncCheckboxState(int displayIndex)
 	{
-		if (_dataSource != null) return;
+		if (_dataSource != null || !ChecksFollowSelection) return;
 		lock (_tableLock)
 		{
 			int dataIdx = MapDisplayToData(displayIndex);

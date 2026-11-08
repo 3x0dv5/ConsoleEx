@@ -37,7 +37,7 @@ namespace SharpConsoleUI.Controls
 		private HorizontalAlignment _horizontalAlignment = HorizontalAlignment.Left;
 		private VerticalAlignment _verticalAlignment = VerticalAlignment.Top;
 		private Margin _margin = new Margin(0, 0, 0, 0);
-		private StickyPosition _stickyPosition = StickyPosition.None;
+		private Layout.Dock _dock = Layout.Dock.None;
 		private bool _visible = true;
 		private int? _width;
 		private int? _height;
@@ -45,6 +45,8 @@ namespace SharpConsoleUI.Controls
 		private BindingCollection? _bindings;
 		private IContainer? _container;
 		private Window? _focusSubscribedWindow;
+		private long _lastGotFocusSequence = -1;
+		private long _lastLostFocusSequence = -1;
 
 		/// <inheritdoc/>
 		public event PropertyChangedEventHandler? PropertyChanged;
@@ -90,9 +92,29 @@ namespace SharpConsoleUI.Controls
 		private void OnFocusManagerChanged(object? sender, FocusChangedEventArgs e)
 		{
 			if (e.Current is IFocusableControl current && ReferenceEquals(current, this))
-				GotFocus?.Invoke(this, EventArgs.Empty);
+				RaiseGotFocus(e.Sequence);
 			if (e.Previous is IFocusableControl previous && ReferenceEquals(previous, this))
-				LostFocus?.Invoke(this, EventArgs.Empty);
+				RaiseLostFocus(e.Sequence);
+		}
+
+		// Focus events are raised through these two entry points from BOTH directions: the
+		// FocusManager.FocusChanged subscription above (when this control managed to subscribe), and
+		// FocusManager itself calling the control directly (#81 — a control built before its container
+		// joined a window never got the chance to subscribe). The sequence number makes that
+		// belt-and-braces delivery idempotent: whichever path arrives first wins, the second is a
+		// no-op, so no handler ever sees a focus change twice.
+		internal void RaiseGotFocus(long sequence)
+		{
+			if (_lastGotFocusSequence == sequence) return;
+			_lastGotFocusSequence = sequence;
+			GotFocus?.Invoke(this, EventArgs.Empty);
+		}
+
+		internal void RaiseLostFocus(long sequence)
+		{
+			if (_lastLostFocusSequence == sequence) return;
+			_lastLostFocusSequence = sequence;
+			LostFocus?.Invoke(this, EventArgs.Empty);
 		}
 
 		/// <summary>
@@ -181,10 +203,44 @@ namespace SharpConsoleUI.Controls
 		}
 
 		/// <inheritdoc/>
+		/// <remarks>
+		/// Projected onto <see cref="Dock"/> rather than stored separately, so the two can never
+		/// disagree. A control docked Left or Right reports <see cref="StickyPosition.None"/>,
+		/// which is accurate - sticky only ever named the vertical edges.
+		/// </remarks>
 		public virtual StickyPosition StickyPosition
 		{
-			get => _stickyPosition;
-			set => SetProperty(ref _stickyPosition, value);
+			get => _dock switch
+			{
+				Layout.Dock.Top => StickyPosition.Top,
+				Layout.Dock.Bottom => StickyPosition.Bottom,
+				_ => StickyPosition.None,
+			};
+			set => Dock = value switch
+			{
+				StickyPosition.Top => Layout.Dock.Top,
+				StickyPosition.Bottom => Layout.Dock.Bottom,
+				_ => Layout.Dock.None,
+			};
+		}
+
+		/// <inheritdoc/>
+		public virtual Layout.Dock Dock
+		{
+			get => _dock;
+			set
+			{
+				if (_dock == value)
+					return;
+
+				_dock = value;
+				OnPropertyChanged();
+
+				// Both names change together, because they are one value seen two ways. A binding
+				// on either must see the other move.
+				OnPropertyChanged(nameof(StickyPosition));
+				Invalidate(Invalidation.Relayout);
+			}
 		}
 
 		/// <inheritdoc/>
@@ -192,6 +248,61 @@ namespace SharpConsoleUI.Controls
 
 		/// <inheritdoc/>
 		public object? Tag { get; set; }
+
+		/// <summary>
+		/// Reports what this control currently IS, for diagnostics.
+		/// </summary>
+		/// <param name="w">Collects the values.</param>
+		/// <remarks>
+		/// <para>
+		/// State, not layout: whether a checkbox is checked, which item is selected,
+		/// what text an editor holds, whether a dropdown is open. Position, size and
+		/// alignment are already reported by the layout tree and should not be
+		/// repeated here.
+		/// </para>
+		/// <para>
+		/// Every control answers. The base writes what every control has; an override
+		/// calls <c>base.DescribeState(w)</c> first and then adds its own. Keep it to
+		/// the handful of values that define the control — a reader wants to know
+		/// what it is looking at, not to reconstruct it.
+		/// </para>
+		/// <para>
+		/// Written explicitly rather than reflected, because the library is
+		/// <c>IsAotCompatible</c> and walking properties would break that.
+		/// </para>
+		/// </remarks>
+		/// <example>
+		/// <code>
+		/// public override void DescribeState(IStateWriter w)
+		/// {
+		///     base.DescribeState(w);
+		///     w.Write("checked", IsChecked);
+		///     w.Write("text", Text);
+		/// }
+		/// </code>
+		/// </example>
+		public virtual void DescribeState(IStateWriter w)
+		{
+			ArgumentNullException.ThrowIfNull(w);
+
+			// Only what is both universal and not already in the layout tree.
+			// Interactivity is the first thing to check when input appears to go
+			// nowhere, and it does not live on BaseControl: a passive control has
+			// no enabled or focus state at all, which is itself worth reporting.
+			if (this is IInteractiveControl interactive)
+			{
+				w.Write("enabled", interactive.IsEnabled);
+			}
+			else
+			{
+				w.Write("interactive", false);
+			}
+
+			if (this is IFocusableControl focusable)
+			{
+				w.Write("focusable", focusable.CanReceiveFocus);
+			}
+		}
 
 		/// <inheritdoc/>
 		public virtual bool Visible

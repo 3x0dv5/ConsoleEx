@@ -7,6 +7,7 @@
 // -----------------------------------------------------------------------
 
 using System.Linq;
+using SharpConsoleUI.Configuration;
 using SharpConsoleUI.Extensions;
 using SharpConsoleUI.Helpers;
 using SharpConsoleUI.Layout;
@@ -69,6 +70,30 @@ namespace SharpConsoleUI.Controls
 			var inactUnfocFg = ColorResolver.ResolveTabHeaderForeground(_inactiveUnfocusedForeground, Container);
 			var inactUnfocBg = ColorResolver.ResolveTabHeaderBackground(_inactiveUnfocusedBackground, Container);
 
+			// The rule under the strip, and the accent marking the active tab within
+			// it. Both were hardcoded - Grey and Cyan1 - so the one part of the
+			// control that did not follow the theme was the part drawn largest: a
+			// bright cyan underline on a dark blue-grey palette read as a stray
+			// highlight from another application.
+			//
+			// The accent is drawn ON THE STRIP, so it needs a colour picked against
+			// the strip - which neither of the active tab's own colours is. Its
+			// background is often the window surface (that is what makes an active
+			// tab look joined to the content below), and its foreground when focused
+			// is text-on-fill, chosen to read against that fill rather than against
+			// this row. Taking either one painted the mark in something within a
+			// point or two of the background and it vanished.
+			//
+			// So: start from the active tab's accent - its focused fill, which IS
+			// the theme's accent colour, falling back to its text when unfocused -
+			// then guarantee it clears the contrast floor against the surface it
+			// actually lands on.
+			var ruleColor = ColorResolver.ResolveTabContentBorder(null, Container);
+
+			Color accentSeed = HasFocus ? activeFocBg : activeUnfocFg;
+			var accentColorResolved =
+				PaletteColors.EnsureContrastRatio(accentSeed, bgColor, PaletteColors.GraphicContrast);
+
 			int headerLeft = bounds.X + Margin.Left;
 			int headerRight = bounds.X + bounds.Width - Margin.Right;
 			int headerY = bounds.Y + Margin.Top;
@@ -77,8 +102,22 @@ namespace SharpConsoleUI.Controls
 			int activeTabStartX = -1;
 			int activeTabEndX = -1;
 
-			for (int i = 0; i < snapshot.Count; i++)
+			// Which tabs fit, positioned so the active one is among them. Without this the row drew from
+			// index 0 and clipped, so a strip narrower than its tabs simply stopped — with the active tab
+			// itself off the end whenever it sat late enough in the order.
+			var strip = LayoutStrip(snapshot, activeIdx, headerRight - headerLeft);
+
+			// MoreLeft/MoreRight are facts about the strip; the property decides whether to say them out
+			// loud. With it off no cell was reserved for them either, so nothing here has room to draw.
+			if (strip.MoreLeft && _showTabScrollIndicators)
 			{
+				buffer.SetNarrowCell(x, headerY, ControlDefaults.TabScrollLeftGlyph, Color.Grey, bgColor);
+				x++;
+			}
+
+			for (int drawn = 0; drawn < strip.Count; drawn++)
+			{
+				int i = strip.First + drawn;
 				bool isActive = i == activeIdx;
 				var title = $" {snapshot[i].Title} ";
 
@@ -113,8 +152,8 @@ namespace SharpConsoleUI.Controls
 				if (isActive)
 					activeTabEndX = x;
 
-				// Draw separator
-				if (x < headerRight && i < snapshot.Count - 1)
+				// Draw separator — between the tabs actually drawn, not between every tab there is.
+				if (x < headerRight && drawn < strip.Count - 1)
 				{
 					buffer.SetNarrowCell(x, headerY, '│', Color.Grey, bgColor);
 					x++;
@@ -127,10 +166,20 @@ namespace SharpConsoleUI.Controls
 			int hintStartX = headerRight - navHintDisplayWidth;
 			int tabsEndX = x; // capture before fill loops modify x
 
+			// Drawn after the tabs and before the fill, so the cell it needs is one the fill will not
+			// take back. It sits at the row's own right edge rather than after the last tab: it marks
+			// where the row ends, and a strip a cell short of full would otherwise strand it mid-row.
+			int fillRight = headerRight;
+			if (strip.MoreRight && _showTabScrollIndicators && headerRight - 1 >= headerLeft)
+			{
+				buffer.SetNarrowCell(headerRight - 1, headerY, ControlDefaults.TabScrollRightGlyph, Color.Grey, bgColor);
+				fillRight--;
+			}
+
 			if (_headerStyle == TabHeaderStyle.Classic)
 			{
 				// Fill remaining header space with ─
-				while (x < headerRight)
+				while (x < fillRight)
 				{
 					buffer.SetNarrowCell(x, headerY, '─', Color.Grey, bgColor);
 					x++;
@@ -139,7 +188,7 @@ namespace SharpConsoleUI.Controls
 			else
 			{
 				// Fill remaining row 1 space with spaces
-				while (x < headerRight)
+				while (x < fillRight)
 				{
 					buffer.SetNarrowCell(x, headerY, ' ', Color.Grey, bgColor);
 					x++;
@@ -149,7 +198,7 @@ namespace SharpConsoleUI.Controls
 				int separatorY = headerY + 1;
 				if (_headerStyle == TabHeaderStyle.Separator)
 				{
-					var sepColor = HasFocus ? Color.Cyan1 : Color.Grey;
+					var sepColor = HasFocus ? accentColorResolved : ruleColor;
 					for (int x2 = headerLeft; x2 < headerRight; x2++)
 						buffer.SetNarrowCell(x2, separatorY, '─', sepColor, bgColor);
 				}
@@ -157,8 +206,8 @@ namespace SharpConsoleUI.Controls
 				{
 					// When the tab strip has keyboard focus the entire separator row is
 					// drawn in the accent colour so it stands out as a highlighted band.
-					var sepColor = HasFocus ? Color.Cyan1 : Color.Grey;
-					var accentColor = Color.Cyan1;
+					var sepColor = HasFocus ? accentColorResolved : ruleColor;
+					var accentColor = accentColorResolved;
 
 					for (int x2 = headerLeft; x2 < headerRight; x2++)
 					{

@@ -8,6 +8,7 @@
 
 using System.Collections.Concurrent;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Threading;
 using SharpConsoleUI.Animation;
 using SharpConsoleUI.Configuration;
@@ -51,6 +52,15 @@ namespace SharpConsoleUI
 		// UI thread action queue - allows background threads to schedule work on the main thread.
 		// Each item carries an optional best-effort label for the watchdog breadcrumb.
 		private readonly ConcurrentQueue<(Action Action, string? Label)> _uiActionQueue = new();
+
+		/// <summary>The queued actions that are RUNNING, which the queue cannot report.</summary>
+		private readonly Core.WorkInFlight _uiActionsRunning = new();
+
+		/// <summary>What is outstanding, and what that leaves unsettled.</summary>
+		private readonly Core.WorkingState _workingState;
+
+		/// <summary>Test seam: whether a dequeued UI action is executing.</summary>
+		internal bool IsRunningUiAction => _uiActionsRunning.IsRunning;
 		private volatile bool _uiActionsPending;
 
 		// Managed thread id of the main-loop (UI) thread; set at Run() start. -1 until then.
@@ -63,8 +73,304 @@ namespace SharpConsoleUI
 		// Signal to wake the main loop when input or UI actions arrive
 		private readonly ManualResetEventSlim _wakeSignal = new(false);
 
+		// Piped-stdin capture. Null when stdin is a TTY, capture is disabled, or stdin is unreadable.
+
+		/// <summary>The clock the multi-click window is measured on.</summary>
+		public TimeProvider MouseTime => _mouseTime;
+
+		private readonly Core.SwappableTimeProvider _mouseTime;
+
+		/// <summary>The clocks this system runs on, by the name the socket uses.</summary>
+		internal Core.SwappableTimeProvider ClockFor(string target) => target switch
+		{
+			"mouse" => _mouseTime,
+			"repaint" => _scheduleRepaintTime,
+			"animation" => _animationTime,
+			_ => throw new ArgumentException(
+				$"unknown clock '{target}'; known: mouse, repaint, animation", nameof(target)),
+		};
+
+		/// <summary>The names <see cref="ClockFor"/> accepts.</summary>
+		internal static IReadOnlyList<string> ClockNames { get; } = ["mouse", "repaint", "animation"];
+
+		/// <summary>
+		/// The clock controls that repaint on a cadence are scheduled against - a
+		/// panel clock, an FPS readout, an indeterminate progress bar.
+		/// </summary>
+		public TimeProvider ScheduleRepaintTime => _scheduleRepaintTime;
+
+		private readonly Core.SwappableTimeProvider _scheduleRepaintTime;
+
+		/// <summary>
+		/// The clock the per-frame animation delta is measured on: every tween, and
+		/// animated desktop backgrounds.
+		/// </summary>
+		/// <remarks>
+		/// Not the same as frame PACING, which stays on the machine clock -
+		/// see <see cref="Configuration.TimeOptions"/>.
+		/// </remarks>
+		public TimeProvider AnimationTime => _animationTime;
+
+		private readonly Core.SwappableTimeProvider _animationTime;
+
+		/// <summary>
+		/// Whether this system captures piped standard input.
+		/// </summary>
+		/// <remarks>
+		/// Resolved from <see cref="Configuration.ConsoleWindowSystemOptions.PipedInput"/>
+		/// when one was given, and otherwise from the driver: a headless system does not
+		/// read stdin, since nothing it is attached to is a terminal.
+		/// </remarks>
+		public bool PipedInputEnabled => _pipedInputOptions.Enabled;
+
+		#region Periodic repainting
+
+		/// <summary>A scheduled repaint, cancelled by disposing it.</summary>
+		private sealed class RepaintSchedule : IDisposable
+		{
+			internal TimeSpan Interval;
+			internal DateTime Due;
+			internal Action Callback = null!;
+			internal ConsoleWindowSystem? Owner;
+
+			public void Dispose()
+			{
+				var owner = Interlocked.Exchange(ref Owner, null);
+				owner?.RemoveRepaintSchedule(this);
+			}
+		}
+
+		private readonly List<RepaintSchedule> _repaintSchedules = new();
+		private readonly object _repaintLock = new();
+
+		/// <summary>
+		/// Asks to be called back roughly every <paramref name="interval"/>, on the UI
+		/// thread, so something can repaint itself periodically.
+		/// </summary>
+		/// <param name="interval">How often, at best. A frame is the finest resolution.</param>
+		/// <param name="callback">What to run. It is already on the UI thread.</param>
+		/// <returns>A handle; dispose it to stop.</returns>
+		/// <remarks>
+		/// <para>
+		/// This replaces a private <see cref="System.Threading.Timer"/> per widget. A
+		/// clock in a panel, an FPS readout, an indeterminate progress bar and an
+		/// animated desktop each had one, and each was a clock the system could not
+		/// see: it kept ticking when the application was idle, it read the machine
+		/// clock rather than a clock the application chose, and it fired on a pool thread, so the
+		/// widget had to publish its state with <c>Interlocked</c> for the renderer to
+		/// read it safely.
+		/// </para>
+		/// <para>
+		/// The callback runs on the UI thread, between input and paint, so it may touch
+		/// control state directly. It is NOT a precise timer: a frame is the finest
+		/// resolution, and an application idle for a minute gets ONE catch-up call
+		/// rather than a minute's worth.
+		/// </para>
+		/// </remarks>
+		public IDisposable ScheduleRepaint(TimeSpan interval, Action callback)
+		{
+			ArgumentNullException.ThrowIfNull(callback);
+
+			if (interval <= TimeSpan.Zero)
+				throw new ArgumentOutOfRangeException(nameof(interval), "interval must be positive");
+
+			var schedule = new RepaintSchedule
+			{
+				Interval = interval,
+				Due = ScheduleRepaintTime.GetUtcNow().UtcDateTime + interval,
+				Callback = callback,
+				Owner = this,
+			};
+
+			lock (_repaintLock) { _repaintSchedules.Add(schedule); }
+
+			return schedule;
+		}
+
+		private void RemoveRepaintSchedule(RepaintSchedule schedule)
+		{
+			lock (_repaintLock) { _repaintSchedules.Remove(schedule); }
+		}
+
+		/// <summary>
+		/// Runs whichever schedules are due. Called once per frame.
+		/// </summary>
+		/// <returns>True when at least one ran, so the caller knows to render.</returns>
+		/// <remarks>
+		/// A schedule that has fallen behind is moved to one interval from NOW rather
+		/// than caught up tick by tick: sixty missed seconds of a one-second clock is
+		/// one repaint, not sixty.
+		/// </remarks>
+		public bool ServiceRepaintSchedules()
+		{
+			RepaintSchedule[] due;
+			DateTime now = ScheduleRepaintTime.GetUtcNow().UtcDateTime;
+
+			lock (_repaintLock)
+			{
+				if (_repaintSchedules.Count == 0) return false;
+
+				due = _repaintSchedules.Where(s => s.Due <= now).ToArray();
+
+				foreach (var schedule in due) schedule.Due = now + schedule.Interval;
+			}
+
+			foreach (var schedule in due)
+			{
+				try
+				{
+					schedule.Callback();
+				}
+				catch (Exception ex)
+				{
+					// One widget's bad repaint must not stop the loop or the others.
+					LogService?.LogError(
+						$"A scheduled repaint threw: {ex.Message}", ex, "Render");
+				}
+			}
+
+			return due.Length > 0;
+		}
+
+		#endregion
+
+		#region Settling
+
+		/// <summary>
+		/// Whether the system has finished reacting to everything it has been given.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// Every condition has to be clear, and <see cref="Core.WorkingState"/>
+		/// holds the list of them. Any one outstanding means another frame will
+		/// change something.
+		/// </para>
+		/// <para>
+		/// Two of them are about work a queue cannot report. A mouse event is
+		/// dispatched synchronously on whichever thread raised it and never enters
+		/// a queue at all; a queued UI action is taken OUT of its queue before it
+		/// runs, so between those two moments the queue answers empty - truthfully -
+		/// while the work it held is half done. Both are counted while they run.
+		/// </para>
+		/// <para>
+		/// Distinct from <see cref="IsIdle"/>, which is a wall-clock timeout - "no
+		/// key for a while". That can be true while work is queued, and it needs
+		/// real time to pass. This is the question a test is actually asking: is it
+		/// safe to look at the screen yet.
+		/// </para>
+		/// </remarks>
+		public bool IsSettled => _workingState.IsSettled;
+
+		/// <summary>
+		/// Why the system is not settled, for a caller that has to report it.
+		/// </summary>
+		/// <returns>
+		/// The conditions that are holding it, or an empty string when it is settled.
+		/// </returns>
+		/// <remarks>
+		/// A bare false is not actionable. A test that times out wants to know whether
+		/// it was an animation that never finished or a window that never painted.
+		/// </remarks>
+		public string SettleBlockers() => _workingState.Blockers;
+
+		/// <summary>
+		/// Completes once another frame has been composed.
+		/// </summary>
+		/// <param name="cancellationToken">Cancels the wait.</param>
+		/// <returns>The frame number reached.</returns>
+		/// <remarks>
+		/// The frame counter is the same one the diagnostics socket's <c>frame</c>
+		/// verb reports, so a test in process and a cxdbg session agree on what a
+		/// frame is rather than inventing two definitions.
+		/// </remarks>
+		public async Task<long> WaitForFrameAsync(CancellationToken cancellationToken = default)
+		{
+			long start = ConsoleDriver.FrameNumber;
+
+			while (ConsoleDriver.FrameNumber <= start)
+			{
+				cancellationToken.ThrowIfCancellationRequested();
+				await Task.Yield();
+
+				// A system that is not running its own loop will never advance on its
+				// own, so a caller that renders by hand still gets an answer.
+				if (ConsoleDriver.FrameNumber <= start) await Task.Delay(1, cancellationToken);
+			}
+
+			return ConsoleDriver.FrameNumber;
+		}
+
+		/// <summary>
+		/// Completes once <see cref="IsSettled"/> is true AND a frame has been
+		/// composed since the call.
+		/// </summary>
+		/// <param name="cancellationToken">Cancels the wait.</param>
+		/// <remarks>
+		/// <para>
+		/// Replaces polling for a window to have a height and then polling again for
+		/// the effect of an input. Pumps the UI queue and renders when the system is
+		/// not running its own loop, so a test need not interleave the two by hand.
+		/// </para>
+		/// <para>
+		/// The frame is a floor, not a formality, and it is why this is not simply
+		/// <c>while (!IsSettled)</c>. Every settling condition asks whether work is
+		/// still OUTSTANDING, and work already done synchronously is not
+		/// outstanding - so after an input dispatched inline, such as a mouse
+		/// event, all of them read true with the frame that input caused not yet
+		/// composed. The frame is what turns "nothing is pending" into "you may
+		/// look now".
+		/// </para>
+		/// <para>
+		/// It cannot stall on an idle UI: the counter advances on every composed
+		/// frame, changed or not, so the floor is always reachable.
+		/// </para>
+		/// </remarks>
+		public async Task WaitUntilSettledAsync(CancellationToken cancellationToken = default)
+		{
+			// Read BEFORE the first check, so a frame composed while this method
+			// runs counts. Taken after it, a frame could land in between and be
+			// waited for twice.
+			long floor = ConsoleDriver.FrameNumber;
+
+			while (!IsSettled || ConsoleDriver.FrameNumber <= floor)
+			{
+				cancellationToken.ThrowIfCancellationRequested();
+
+				if (!_running)
+				{
+					DrainUIActionQueue();
+					Render.UpdateDisplay();
+				}
+				else
+				{
+					await WaitForFrameAsync(cancellationToken).ConfigureAwait(false);
+				}
+
+				await Task.Yield();
+			}
+		}
+
+		#endregion
+
+		private readonly Core.PipedInputCapture? _pipedInputCapture;
+		private readonly Configuration.PipedInputOptions _pipedInputOptions;
+
+		// Hosted-loop state. The sync-context pair were locals of Run(); they are fields now because
+		// StartHostedCore() sets them and StopHostedCore() consumes them.
+		private SynchronizationContext? _previousSyncContext;
+		private bool _installedSyncContext;
+		private bool _hostedStopped;
+
 		// Frame rate limiting (configured via ConsoleWindowSystemOptions)
 		private DateTime _lastRenderTime = DateTime.UtcNow;
+
+		/// <summary>When animations were last advanced.</summary>
+		/// <remarks>
+		/// Separate from <see cref="_lastRenderTime"/> because animations advance on
+		/// every tick and rendering does not: sharing one timestamp made a tick that
+		/// skipped rendering count its elapsed span twice.
+		/// </remarks>
+		private DateTime _lastAnimationTime;   // seeded from AnimationTime in the constructor
 
 		// Performance metrics tracking - delegated to PerformanceTracker
 		private ConsoleWindowSystemOptions _options;
@@ -339,12 +645,57 @@ namespace SharpConsoleUI
 		/// <param name="registryConfiguration">Optional registry configuration for persistent key-value storage.</param>
 		public ConsoleWindowSystem(IConsoleDriver driver, ITheme theme, ConsoleWindowSystemOptions? options = null, RegistryConfiguration? registryConfiguration = null)
 		{
-			// Capture piped stdin before the driver takes over the terminal.
-			// Must be done first — once the driver initializes, stdin may be redirected to /dev/tty.
-			if (Console.IsInputRedirected)
+			// Resolve diagnostics-socket consent FIRST, before anything touches the terminal.
+			// The prompt needs plain line-buffered stdin and an unpainted screen; once the
+			// driver puts the terminal into raw mode and the alternate screen, a prompt either
+			// scribbles over the UI or is swallowed, and there is no second chance to ask.
+			// Only the DECISION happens here - the socket itself opens at the end of the
+			// constructor, once there is a system for it to serve.
+			var diagnosticsDecision = Diagnostics.Socket.DiagnosticsConsent.Resolve(
+				(options ?? ConsoleWindowSystemOptions.Create()).DiagnosticsSocket,
+				driver);
+
+			// Begin capturing piped stdin. Started before the driver initializes so no input is missed,
+			// but NOT waited on here: stdin held open by a live writer (a streaming producer, or a parent
+			// process that keeps the pipe open) would otherwise block construction forever, before the
+			// application could draw anything. See PipedInputCapture and PipedInput.
+			// The DEFAULT is per driver. Capturing piped stdin is right for a terminal
+			// application started with `cat file | app`. It is wrong for a headless
+			// one: nothing it is attached to is a terminal, and the common case by
+			// far is a test runner or a CI job that redirected stdin for its own
+			// reasons - reading that is never what anyone wanted. Piping INTO a
+			// headless app still works; it is opt-in now rather than assumed.
+			_pipedInputOptions = (options ?? ConsoleWindowSystemOptions.Create()).PipedInput
+				?? (driver is Drivers.HeadlessConsoleDriver
+					? new Configuration.PipedInputOptions(Enabled: false)
+					: new Configuration.PipedInputOptions());
+			var timeOptions = (options ?? ConsoleWindowSystemOptions.Create()).Time
+				?? new Configuration.TimeOptions();
+
+			// Wrapped, so the diagnostics socket can point one at a frozen clock
+			// while the application runs. Consumers capture the provider they are
+			// given - the gesture recognizer holds a closure over it - so the swap
+			// has to happen behind them rather than by replacing a property.
+			_mouseTime = new Core.SwappableTimeProvider(timeOptions.Resolve(timeOptions.Mouse));
+			_scheduleRepaintTime = new Core.SwappableTimeProvider(timeOptions.Resolve(timeOptions.ScheduleRepaint));
+			_animationTime = new Core.SwappableTimeProvider(timeOptions.Resolve(timeOptions.Animation));
+
+			// Seeded from the CONFIGURED clock, not the field initialiser's
+			// DateTime.UtcNow: a fake clock usually starts at some fixed instant, and
+			// the first animation delta would otherwise be the gap between that and
+			// the real year - hugely negative, or hugely positive.
+			_lastAnimationTime = AnimationTime.GetUtcNow().UtcDateTime;
+			// Deliberately NOT gated on Windows. Whether piped input can reach the application is a
+			// property of the DRIVER, not the OS: NetConsoleDriver refuses redirected stdio on Windows
+			// and throws from its own constructor — which runs before this one, since the driver is
+			// passed in — so it never reaches here. Every driver that does reach here (headless,
+			// embedded, a future front-end) reads no console handles and can consume piped data fine
+			// on any platform. An OS check here would discard their input for a reason that does not
+			// apply to them.
+			if (_pipedInputOptions.Enabled && Console.IsInputRedirected)
 			{
-				try { PipedInput = Console.In.ReadToEnd(); }
-				catch { /* stdin read failed — leave as null */ }
+				try { _pipedInputCapture = new Core.PipedInputCapture(Console.In); }
+				catch { /* stdin unreadable — leave the capture null, PipedInput stays null */ }
 			}
 
 			_consoleDriver = driver ?? throw new ArgumentNullException(nameof(driver));
@@ -371,14 +722,33 @@ namespace SharpConsoleUI
 			_themeRegistryStateService = new Core.ThemeRegistryStateService();
 			_themeStateService = new ThemeStateService(_theme, _logService);
 			_inputStateService = new InputStateService();
+
+			// Built here, once, with what it reads. The driver goes in as a
+			// function because ConsoleDriver has a setter: a captured instance
+			// would answer for a driver that had been replaced.
+			_workingState = new Core.WorkingState(
+				_inputStateService,
+				_uiActionQueue,
+				_uiActionsRunning,
+				() => _consoleDriver,
+				() => Animations.HasActiveAnimations,
+				() => Windows.Values);
 			_inputStateService.WakeCallback = () => _wakeSignal.Set();
 			_panelStateService = new PanelStateService(_logService, () => this);
 			_desktopPortalService = new Core.DesktopPortalService(_logService, this);
 
 			// Initialize desktop background service
+			// Advanced by the animator, which hands out capped deltas and keeps the
+			// loop rendering while something is moving - so a background stays
+			// smooth under heavy UI work rather than waiting on a timer that does
+			// not know how busy the frame is. The elapsed time a PaintCallback
+			// receives is animation time: a callback that reads it runs at the
+			// same speed whatever the frame rate does, and one that ignores it and
+			// steps per call will not.
 			_desktopBackgroundService = new Core.DesktopBackgroundService(
 				() => Theme,
-				() => Render.DesktopNeedsRender = true);
+				() => Render.DesktopNeedsRender = true,
+				Animations);
 
 			if (options?.DesktopBackground != null)
 				_desktopBackgroundService.Config = options.DesktopBackground;
@@ -447,11 +817,20 @@ namespace SharpConsoleUI
 				Render,
 				() => this);
 
-			// Initialize diagnostics BEFORE driver.Initialize() so driver can connect them
-			if (_options.EnableDiagnostics)
-			{
-				_renderingDiagnostics = new Diagnostics.RenderingDiagnostics(_options);
-			}
+			// Initialize diagnostics BEFORE driver.Initialize() so driver can connect them.
+			//
+			// The recorder always exists; the option decides whether it starts
+			// ENABLED (its constructor reads EnableDiagnostics). The cost that
+			// made diagnostics opt-in is per frame, not per object - every
+			// capture path returns immediately when IsEnabled is false - so an
+			// app that never asks pays for one small object and nothing else,
+			// while an app that IS misbehaving can be switched on over the
+			// socket instead of being restarted, which is the one thing that
+			// loses the state you wanted to look at.
+			_renderingDiagnostics = new Diagnostics.RenderingDiagnostics(_options);
+
+			// The input tape, for the same reason: off unless asked for.
+			Input.RecordEvents = _options.EnableDiagnostics;
 
 			// NOW initialize driver with 'this' reference (after services and diagnostics exist)
 			_consoleDriver.Initialize(this);
@@ -473,6 +852,49 @@ namespace SharpConsoleUI
 			if (_consoleDriver is Drivers.NetConsoleDriver netDriver)
 			{
 				_defaultCursorBlink = netDriver.Options.CursorBlink;
+			}
+
+			// The socket opens last: consent was resolved at the top of this constructor, but
+			// the server needs a fully-built system to serve.
+			StartDiagnosticsSocket(diagnosticsDecision);
+		}
+
+		private Diagnostics.Socket.DiagnosticsServer? _diagnosticsServer;
+
+		private void StartDiagnosticsSocket(Diagnostics.Socket.DiagnosticsConsent.Decision decision)
+		{
+			if (!decision.Allowed)
+			{
+				// A denial that the user chose, or that the non-interactive rule made for
+				// them, is worth a log line. "Nothing was asked for" is not.
+				if (decision.DenialReason != null)
+					_logService.LogWarning(decision.DenialReason, "Diagnostics");
+				return;
+			}
+
+			// A socket opened from the environment had no prompt behind it - a headless
+			// app has nobody to ask. That is deliberate, and it is exactly the kind of
+			// thing that should leave a record: an unexplained socket is worth being
+			// able to trace back to the run that opened it.
+			if (decision.FromEnvironment)
+			{
+				_logService.LogWarning(
+					$"Diagnostics socket opened from the environment at {decision.SocketPath}. "
+					+ "Anything running as this user can read what this application "
+					+ "displays and send it input.",
+					"Diagnostics");
+			}
+
+			try
+			{
+				_diagnosticsServer = new Diagnostics.Socket.DiagnosticsServer(this, decision.SocketPath!);
+				_diagnosticsServer.Start();
+			}
+			catch (Exception ex)
+			{
+				// A diagnostics channel must never stop the application it is meant to help.
+				_logService.LogError("Diagnostics socket failed to start", ex, "Diagnostics");
+				_diagnosticsServer = null;
 			}
 		}
 
@@ -597,9 +1019,37 @@ namespace SharpConsoleUI
 
 		/// <summary>
 		/// Gets the text that was piped into the application via stdin, or null if stdin is a TTY.
-		/// Automatically captured at construction time — available throughout the app lifecycle.
+		/// Captured automatically — available throughout the app lifecycle.
 		/// </summary>
-		public string? PipedInput { get; }
+		/// <remarks>
+		/// The capture starts at construction and runs in the background, so constructing the system
+		/// never blocks. For the usual finite pipe (<c>echo x | app</c>) it has already finished by the
+		/// time anything reads this, and the full text is returned immediately.
+		///
+		/// <para>On Windows this is null in practice for a terminal application, because
+		/// <c>NetConsoleDriver</c> refuses redirected stdio outright — but that is the driver's
+		/// limitation, not this property's: a headless or embedded driver receives piped input on
+		/// every platform.</para>
+		///
+		/// <para>Reading this property before <see cref="Run"/> waits up to
+		/// <see cref="Configuration.PipedInputOptions.PreUiTimeoutMs"/> for input still in flight, then
+		/// returns what arrived — a bounded wait, because no UI exists yet to report a longer one. Once
+		/// the UI is up, <see cref="Run"/> surfaces a still-pending capture as a cancellable progress
+		/// dialog instead, and this property returns the text captured by the time it resolved.</para>
+		/// </remarks>
+		public string? PipedInput
+		{
+			get
+			{
+				var capture = _pipedInputCapture;
+				if (capture == null) return null;
+
+				// Once the UI is running, the dialog owns the waiting; block only before that.
+				return capture.IsCompleted || _running
+					? capture.PartialText
+					: capture.WaitForText(_pipedInputOptions.PreUiTimeoutMs);
+			}
+		}
 
 		/// <summary>
 		/// Gets the piped stdin split into lines, or null if stdin is a TTY.
@@ -937,11 +1387,47 @@ namespace SharpConsoleUI
 		#region System Control
 
 		/// <summary>
-		/// Starts the main event loop of the window system. Blocks until <see cref="Shutdown"/> is called.
+		/// Whether <see cref="HostedSession.Tick"/> waits out its idle interval before returning.
 		/// </summary>
-		/// <returns>The exit code set by <see cref="Shutdown"/> or 1 if an unhandled exception occurred.</returns>
-		public int Run()
+		/// <remarks>
+		/// <c>true</c> (the default) is what <see cref="Run"/> needs: the loop sleeps between frames
+		/// rather than spinning. A host driving frames from its own event loop should set this to
+		/// <c>false</c> and pace the calls itself — on a single-threaded host such as WebAssembly a
+		/// blocking wait here holds the only thread and no further tick can fire.
+		/// </remarks>
+		public bool BlockWhenIdle { get; set; } = true;
+
+		/// <summary>
+		/// Starts the system for a host that owns its own event loop, and returns a session whose
+		/// <see cref="HostedSession.Tick"/> renders one frame.
+		/// </summary>
+		/// <remarks>
+		/// <see cref="Run"/> is this plus a loop: it is the same machinery, differing only in who owns
+		/// the loop. Use this when the host already has one — a browser, a game loop, a GUI application
+		/// embedding a console surface.
+		/// <example>
+		/// <code>
+		/// using var session = ws.BeginHosted();
+		/// while (session.Tick()) await Task.Delay(33);
+		/// </code>
+		/// </example>
+		/// <para>Disposing the session tears down what this established. Call <see cref="HostedSession.Tick"/>
+		/// on the thread that called this method — the first call captures it as the UI thread.</para>
+		/// </remarks>
+		/// <exception cref="InvalidOperationException">The system is already running.</exception>
+		public HostedSession BeginHosted()
 		{
+			if (_running)
+				throw new InvalidOperationException("The console window system is already running.");
+
+			StartHostedCore();
+			return new HostedSession(this);
+		}
+
+		/// <summary>The one-time startup shared by <see cref="Run"/> and <see cref="BeginHosted"/>.</summary>
+		private void StartHostedCore()
+		{
+			_hostedStopped = false;
 			_logService.LogInfo("Console window system starting", "System");
 			_running = true;
 
@@ -952,18 +1438,18 @@ namespace SharpConsoleUI
 			// Optionally install a UI SynchronizationContext so that `await` in handlers resumes on
 			// the main-loop (UI) thread, mirroring the WinForms/WPF model. Opt-out for legacy apps
 			// that block on async work on the UI thread (see ConsoleWindowSystemOptions).
-			SynchronizationContext? previousSyncContext = null;
-			bool installedSyncContext = false;
+			_previousSyncContext = null;
+			_installedSyncContext = false;
 			if (_options.InstallSynchronizationContext)
 			{
-				previousSyncContext = SynchronizationContext.Current;
+				_previousSyncContext = SynchronizationContext.Current;
 				SynchronizationContext.SetSynchronizationContext(
 					new Core.ConsoleUISynchronizationContext(EnqueueOnUIThread, () => IsOnUIThread));
-				installedSyncContext = true;
+				_installedSyncContext = true;
 			}
 
 			// Report the resolved async model so user code can query it at runtime (Issue #35).
-			SynchronizationContextInstalled = installedSyncContext;
+			SynchronizationContextInstalled = _installedSyncContext;
 
 			// Subscribe to the console driver events
 			// Store handlers in fields so they can be properly unsubscribed in Shutdown()
@@ -995,6 +1481,20 @@ namespace SharpConsoleUI
 					onForceExit: () =>
 					{
 						_logService.LogCritical("Watchdog: forcing exit \u2014 main loop unresponsive", null, "Watchdog");
+
+						// Stop the loop and restore the terminal either way.
+						_running = false;
+						_wakeSignal.Set();
+
+						if (!wd.AllowProcessExit)
+						{
+							// Embedded: the process belongs to the host, and killing it over one wedged
+							// loop is not ours to decide. Stop the driver so the terminal is usable and
+							// let the host handle a Run() that has returned.
+							try { _consoleDriver.Stop(); } catch { }
+							return;
+						}
+
 						// Hard kill in 1s — guarantees exit even if Stop() deadlocks
 						new Thread(() => { Thread.Sleep(1000); Environment.Exit(1); })
 						{ IsBackground = true, Name = "WatchdogKill" }.Start();
@@ -1029,133 +1529,307 @@ namespace SharpConsoleUI
 			// Initialize the console window system with background color and character
 			_renderer.FillDesktopBackground(Theme, _consoleDriver.ScreenSize.Width, _consoleDriver.ScreenSize.Height);
 
+			BeginPipedInputDialogWatch();
+		}
+
+		/// <summary>
+		/// Surfaces a still-running piped-stdin capture as a cancellable progress dialog, once the UI is up.
+		/// </summary>
+		/// <remarks>
+		/// Stdin held open by a live writer never reaches end-of-input, so the capture can outlast startup.
+		/// Rather than blocking (which is the bug this replaces) or waiting invisibly, the wait becomes
+		/// something the user can see and dismiss. Cancelling leaves <see cref="PipedInput"/> holding
+		/// whatever arrived, which is what an application reading best-effort piped input expects.
+		/// </remarks>
+		private void BeginPipedInputDialogWatch()
+		{
+			var capture = _pipedInputCapture;
+			if (capture == null || capture.IsCompleted) return;
+			if (!_pipedInputOptions.ShowDialog) return;
+
+			_ = ShowPipedInputDialogAsync(capture);
+		}
+
+		private async Task ShowPipedInputDialogAsync(Core.PipedInputCapture capture)
+		{
+			try
+			{
+				// Grace period: the common finite pipe finishes in well under a millisecond, and a dialog
+				// that appears and vanishes reads as a glitch. Only a genuinely slow capture gets one.
+				var delay = Task.Delay(_pipedInputOptions.DialogDelayMs);
+				if (await Task.WhenAny(capture.Completion, delay).ConfigureAwait(false) == capture.Completion)
+					return;
+
+				if (!_running || capture.IsCompleted) return;
+
+				await Dialogs.Dialogs.RunWithProgressAsync<object?>(
+					this,
+					_pipedInputOptions.DialogTitle,
+					_pipedInputOptions.DialogMessage,
+					async (CancellationToken cancellationToken, IProgress<Dialogs.ProgressUpdate> _) =>
+					{
+						// Completes on end-of-input, or unblocks when the user cancels; either way the
+						// capture keeps whatever it read, and the background thread is left to finish.
+						var cancelled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+						using (cancellationToken.Register(() => cancelled.TrySetResult(true)))
+							await Task.WhenAny(capture.Completion, cancelled.Task).ConfigureAwait(false);
+
+						return (object?)null;
+					}).ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				// The dialog is a courtesy over a best-effort capture: never let it take down the app.
+				_logService.LogWarning($"Piped-input dialog failed: {ex.Message}", "System");
+			}
+		}
+
+		/// <summary>Runs one iteration of the main loop. Returns <c>false</c> once the system should stop.</summary>
+		internal bool TickCore()
+		{
+			if (!_running) return false;
+
+			_watchdog.Heartbeat();
+			_currentPhase = Core.MainLoopPhase.Input;
+			Input.ProcessInput();
+			_currentPhase = Core.MainLoopPhase.Drain;
+			DrainUIActionQueue();
+
+			// Periodic repaints, on the UI thread, between the queue and the paint.
+			// A widget that wants to redraw itself every N ms asks for this rather
+			// than running a timer of its own on a pool thread.
+			bool repaintDue = ServiceRepaintSchedules();
+
+			// TWO clocks here, deliberately.
+			//
+			// `machineNow` paces the FRAME. Frame-rate limiting is a statement about
+			// the terminal - do not redraw more than TargetFPS times a second - so it
+			// belongs to the machine. Pacing on a configured clock means a frozen one
+			// renders nothing at all, and an application cannot even start.
+			//
+			// `now` is what the application BELIEVES the time is, and feeds the
+			// animation delta. Reading the machine clock for that meant a
+			// TimeProvider an application supplied was ignored by every tween.
+			var machineNow = DateTime.UtcNow;
+			var elapsed = (machineNow - _lastRenderTime).TotalMilliseconds;
+
+			var now = AnimationTime.GetUtcNow().UtcDateTime;
+
+			// Track performance metrics on EVERY iteration (independent of rendering)
+			bool metricsNeedUpdate = false;
+			if (Performance.IsPerformanceMetricsEnabled)
+			{
+				metricsNeedUpdate = Performance.BeginFrame();
+				if (metricsNeedUpdate)
+				{
+					Render.InvalidateStatusCache();
+				}
+
+				Performance.UpdateMetrics(
+					Windows.Count,
+					Windows.Values.Count(w => w.PendingWork != FrameWork.None)
+				);
+			}
+
+			// Advance animations before rendering.
+			//
+			// NOT `elapsed`: that is measured from the last RENDER, while this runs
+			// on every TICK. A tick that does not render leaves _lastRenderTime
+			// alone, so the next tick counts the same span again - and a window
+			// being dragged produces many such ticks, which is how an animated
+			// desktop background came to run visibly fast while the mouse moved.
+			// Animations need time since the last time ANIMATIONS were advanced.
+			if (Animations.HasActiveAnimations)
+			{
+				Animations.Update(now - _lastAnimationTime);
+			}
+
+			_lastAnimationTime = now;
+
+			// Advance drag-select autoscroll (independent of EnableAnimations).
+			if (DragAutoScrollActive)
+			{
+				StepDragAutoScroll(elapsed);
+			}
+
+			// Advance inline [spinner] markup. ShouldKeepRendering below only keeps the loop calling
+			// UpdateDisplay; it does not dirty any window, and RenderWindows skips a clean one. Tick
+			// invalidates the controls that painted an inline spinner, so their glyph advances on
+			// time instead of only when some other event happens to dirty the window.
+			Parsing.MarkupSpinnerClock.Tick(Animations.IsEnabled);
+
+			// Frame pacing: render if windows are dirty OR metrics need update OR desktop needs render OR animations active
+			bool shouldRender = repaintDue || AnyWindowDirty() || metricsNeedUpdate || Render.DesktopNeedsRender || Animations.HasActiveAnimations || Parsing.MarkupSpinnerClock.ShouldKeepRendering(Animations.IsEnabled) || Render.IsStatusBarDirty() || _desktopPortalService.AnyPortalDirty() || DragAutoScrollActive;
+
+			// Calculate recommended sleep duration once (used in both branches)
+			var recommendedSleep = _inputStateService.GetRecommendedSleepDuration(
+				Configuration.SystemDefaults.MinSleepDurationMs,
+				Configuration.SystemDefaults.MaxSleepDurationMs);
+
+			if (Performance.IsFrameRateLimitingEnabled)
+			{
+				// Frame rate limiting enabled: only render if enough time elapsed
+				if (shouldRender && elapsed >= Performance.MinFrameTime)
+				{
+					_currentPhase = Core.MainLoopPhase.Render;
+					Render.UpdateDisplay();
+					SampleRenderedFrame(elapsed);
+					_lastRenderTime = machineNow;
+
+					// Rounded up, not truncated: sleeping 16 ms for a 16.667 ms
+					// interval wakes early every frame and the cap drifts high. And
+					// floored at one, since MinFrameTime is zero when there is no cap
+					// and a zero sleep is a spin.
+					_idleTime = Math.Max(1, (int)Math.Ceiling(Performance.MinFrameTime));
+				}
+				else
+				{
+					_inputStateService.UpdateIdleState();
+					_idleTime = recommendedSleep;
+				}
+			}
+			else
+			{
+				// Frame rate limiting disabled: render immediately when dirty
+				if (shouldRender)
+				{
+					_currentPhase = Core.MainLoopPhase.Render;
+					Render.UpdateDisplay();
+					SampleRenderedFrame(elapsed);
+					_lastRenderTime = machineNow;
+					_idleTime = Configuration.SystemDefaults.FastLoopIdleMs; // Fast loop when dirty, no frame rate cap
+				}
+				else
+				{
+					_inputStateService.UpdateIdleState();
+					_idleTime = recommendedSleep;
+				}
+			}
+
+			UpdateCursor();
+			if (_uiActionsPending && _idleTime > Configuration.SystemDefaults.MinSleepDurationMs)
+				_idleTime = Configuration.SystemDefaults.MinSleepDurationMs;
+			_currentPhase = Core.MainLoopPhase.Idle;
+			try
+			{
+				// A host driving frames from its own event loop paces them itself; blocking here would
+				// hold its thread (on a single-threaded host, the only one) and starve the next tick.
+				if (BlockWhenIdle)
+					_wakeSignal.Wait(_idleTime);
+				_wakeSignal.Reset();
+			}
+			catch (ObjectDisposedException)
+			{
+				// Shutdown disposed the signal — stop ticking.
+				_running = false;
+			}
+
+			return _running;
+		}
+
+		/// <summary>Files the frame just rendered into the performance window.</summary>
+		/// <param name="intervalMs">Since the previous rendered frame.</param>
+		/// <remarks>
+		/// <para>
+		/// Called from the render branches only, so what it measures is the rate the
+		/// screen actually changes at. The loop iterates far more often than it
+		/// renders - it wakes for input and for idle bookkeeping - so sampling per
+		/// iteration would report a rate nobody is seeing.
+		/// </para>
+		/// <para>
+		/// The per-stage costs come from the renderer's own metrics, which it records
+		/// only while diagnostics are on. Without them the frame is still filed, with
+		/// its interval and zero costs: the achieved rate is the thing most worth
+		/// having and it must not need a flag.
+		/// </para>
+		/// </remarks>
+		private void SampleRenderedFrame(double intervalMs)
+		{
+			var m = RenderingDiagnostics?.LastMetrics;
+
+			Performance.Frames.Add(new Performance.FrameSampleRing.Sample(
+				IntervalMs: intervalMs,
+				LayoutMs: m?.DomLayoutTimeMs ?? 0,
+				AnsiMs: m?.AnsiGenerationTimeMs ?? 0,
+				OutputMs: m?.ConsoleOutputTimeMs ?? 0,
+				CompareMs: m?.BufferComparisonTimeMs ?? 0,
+				BytesWritten: m?.BytesWritten ?? 0,
+				CellsRendered: m?.CellsActuallyRendered ?? 0,
+				CellsMarked: m?.DirtyCellsMarked ?? 0));
+		}
+
+		/// <summary>The teardown shared by <see cref="Run"/> and <see cref="HostedSession.Dispose"/>.</summary>
+		internal void StopHostedCore()
+		{
+			if (_hostedStopped) return;
+			_hostedStopped = true;
+			_running = false;
+
+			// Stop the watchdog with the loop it watches. Left running it would keep sampling a
+			// heartbeat nobody is beating any more, decide the loop is hung, and escalate — a
+			// finished session must not be able to act on a loop that no longer exists.
+			_watchdog.Stop();
+
+			// Restore the previously-installed SynchronizationContext for the calling thread
+			// (only if we installed our own).
+			if (_installedSyncContext)
+				SynchronizationContext.SetSynchronizationContext(_previousSyncContext);
+			_installedSyncContext = false;
+
+			// The hosted session has ended — the resolved async model no longer applies.
+			SynchronizationContextInstalled = false;
+
+			// ALWAYS restore console state (mouse mode, cursor, etc.)
+			// This ensures the terminal is usable even if the app crashes
+			try
+			{
+				_consoleDriver.Stop();
+			}
+			catch
+			{
+				// Ignore cleanup errors - we're already exiting
+			}
+		}
+
+		/// <summary>
+		/// Runs the console window system until it exits.
+		/// </summary>
+		/// <returns>The process exit code.</returns>
+		/// <summary>
+		/// Starts the main event loop of the window system. Blocks until <see cref="Shutdown"/> is called.
+		/// </summary>
+		/// <remarks>
+		/// This is <see cref="BeginHosted"/> plus the loop. A host that owns its own event loop calls
+		/// that instead.
+		/// </remarks>
+		/// <returns>The exit code set by <see cref="Shutdown"/> or 1 if an unhandled exception occurred.</returns>
+		/// <exception cref="InvalidOperationException">The driver does not support a blocking loop.</exception>
+		public int Run()
+		{
+			if (!_consoleDriver.SupportsBlockingLoop)
+				throw new InvalidOperationException(
+					$"{_consoleDriver.GetType().Name} cannot be driven by a blocking loop. " +
+					"Use BeginHosted() and drive frames from the host's own event loop.");
+
 			Exception? fatalException = null;
+			StartHostedCore();
 
 			try
 			{
-				// Main loop
 				while (_running)
 				{
-					_watchdog.Heartbeat();
-					_currentPhase = Core.MainLoopPhase.Input;
-					Input.ProcessInput();
-					_currentPhase = Core.MainLoopPhase.Drain;
-					DrainUIActionQueue();
-
-					var now = DateTime.UtcNow;
-					var elapsed = (now - _lastRenderTime).TotalMilliseconds;
-
-					// Track performance metrics on EVERY iteration (independent of rendering)
-					bool metricsNeedUpdate = false;
-					if (Performance.IsPerformanceMetricsEnabled)
-					{
-						metricsNeedUpdate = Performance.BeginFrame();
-						if (metricsNeedUpdate)
-						{
-							Render.InvalidateStatusCache();
-						}
-
-						Performance.UpdateMetrics(
-							Windows.Count,
-							Windows.Values.Count(w => w.PendingWork != FrameWork.None)
-						);
-					}
-
-					// Advance animations before rendering
-					if (Animations.HasActiveAnimations)
-					{
-						Animations.Update(TimeSpan.FromMilliseconds(elapsed));
-					}
-
-					// Advance drag-select autoscroll (independent of EnableAnimations).
-					if (DragAutoScrollActive)
-					{
-						StepDragAutoScroll(elapsed);
-					}
-
-					// Frame pacing: render if windows are dirty OR metrics need update OR desktop needs render OR animations active
-					bool shouldRender = AnyWindowDirty() || metricsNeedUpdate || Render.DesktopNeedsRender || Animations.HasActiveAnimations || Parsing.MarkupSpinnerClock.ShouldKeepRendering(Animations.IsEnabled) || Render.IsStatusBarDirty() || _desktopPortalService.AnyPortalDirty() || DragAutoScrollActive;
-
-					// Calculate recommended sleep duration once (used in both branches)
-					var recommendedSleep = _inputStateService.GetRecommendedSleepDuration(
-						Configuration.SystemDefaults.MinSleepDurationMs,
-						Configuration.SystemDefaults.MaxSleepDurationMs);
-
-					if (Performance.IsFrameRateLimitingEnabled)
-					{
-						// Frame rate limiting enabled: only render if enough time elapsed
-						if (shouldRender && elapsed >= Performance.MinFrameTime)
-						{
-							_currentPhase = Core.MainLoopPhase.Render;
-							Render.UpdateDisplay();
-							_lastRenderTime = now;
-							_idleTime = (int)Performance.MinFrameTime;
-						}
-						else
-						{
-							_inputStateService.UpdateIdleState();
-							_idleTime = recommendedSleep;
-						}
-					}
-					else
-					{
-						// Frame rate limiting disabled: render immediately when dirty
-						if (shouldRender)
-						{
-							_currentPhase = Core.MainLoopPhase.Render;
-							Render.UpdateDisplay();
-							_lastRenderTime = now;
-							_idleTime = Configuration.SystemDefaults.FastLoopIdleMs; // Fast loop when dirty, no frame rate cap
-						}
-						else
-						{
-							_inputStateService.UpdateIdleState();
-							_idleTime = recommendedSleep;
-						}
-					}
-
-					UpdateCursor();
-					if (_uiActionsPending && _idleTime > Configuration.SystemDefaults.MinSleepDurationMs)
-						_idleTime = Configuration.SystemDefaults.MinSleepDurationMs;
-					_currentPhase = Core.MainLoopPhase.Idle;
-					try
-					{
-						_wakeSignal.Wait(_idleTime);
-						_wakeSignal.Reset();
-					}
-					catch (ObjectDisposedException)
-					{
-						break; // Shutdown disposed the signal — exit loop
-					}
+					if (!TickCore()) break;
 				}
 			}
 			catch (Exception ex)
 			{
-				// Log the exception to file (if file logging is enabled) before cleanup
 				LogService?.LogCritical($"Unhandled exception in main loop: {ex.Message}", ex, "System");
 				fatalException = ex;
-				_exitCode = 1;  // Error exit code
+				_exitCode = 1;
 			}
 			finally
 			{
-				// Restore the previously-installed SynchronizationContext for the calling thread
-				// (only if we installed our own).
-				if (installedSyncContext)
-					SynchronizationContext.SetSynchronizationContext(previousSyncContext);
-
-				// Run() has returned — the resolved async model no longer applies.
-				SynchronizationContextInstalled = false;
-
-				// ALWAYS restore console state (mouse mode, cursor, etc.)
-				// This ensures the terminal is usable even if the app crashes
-				try
-				{
-					_consoleDriver.Stop();
-				}
-				catch
-				{
-					// Ignore cleanup errors - we're already exiting
-				}
+				StopHostedCore();
 			}
 
 			// After console is restored, show error message to user
@@ -1168,6 +1842,134 @@ namespace SharpConsoleUI
 			}
 
 			return _exitCode;
+		}
+
+		/// <summary>
+		/// Starts the system on a background thread and returns once it has rendered a frame.
+		/// </summary>
+		/// <param name="startTimeout">
+		/// How long to wait for that first frame before giving up. The default is ample for a
+		/// real application; raise it only if startup does heavy work.
+		/// </param>
+		/// <param name="stopTimeout">How long <see cref="BackgroundSession.Dispose"/> waits for the loop to end.</param>
+		/// <returns>A session that keeps the application running until disposed.</returns>
+		/// <exception cref="InvalidOperationException">The system is already running, or it did not start in time.</exception>
+		/// <remarks>
+		/// <para>
+		/// <see cref="Run"/> owns the loop and blocks; <see cref="BeginHosted"/> hands the loop
+		/// to the caller. This is the third case - the system owns the loop and the caller keeps
+		/// its thread - which is what a host needs when something else owns the main thread: a
+		/// web server, a test, an agent driving the application from outside.
+		/// </para>
+		/// <para>
+		/// Returns after the FIRST FRAME, not merely after the thread starts. A caller that
+		/// connects to the diagnostics socket or captures the screen immediately afterwards
+		/// would otherwise race the application into existence.
+		/// </para>
+		/// <para>
+		/// A failure during startup is thrown from here, where the caller cannot miss it. A
+		/// failure afterwards lands in <see cref="BackgroundSession.Fault"/>, because nobody is
+		/// awaiting the thread and the only other symptom would be a screen that stopped
+		/// changing.
+		/// </para>
+		/// <example>
+		/// <code>
+		/// var ws = new ConsoleWindowSystem(new HeadlessConsoleDriver(120, 40), options);
+		/// BuildUI(ws);
+		///
+		/// using var session = ws.RunInBackground();
+		/// // the app is up and has painted; drive it, capture it, assert on it
+		/// </code>
+		/// </example>
+		/// </remarks>
+		public BackgroundSession RunInBackground(
+			TimeSpan? startTimeout = null,
+			TimeSpan? stopTimeout = null)
+		{
+			if (_running)
+				throw new InvalidOperationException("The console window system is already running.");
+
+			// Same restriction as Run: a host whose platform has one thread cannot be given a
+			// second one to loop on. Such a host drives frames itself through BeginHosted.
+			if (!_consoleDriver.SupportsBlockingLoop)
+				throw new InvalidOperationException(
+					$"{_consoleDriver.GetType().Name} cannot be driven by a loop on another thread. " +
+					"Use BeginHosted() and drive frames from the host's own event loop.");
+
+			var started = new TaskCompletionSource<Exception?>(
+				TaskCreationOptions.RunContinuationsAsynchronously);
+
+			BackgroundSession? session = null;
+
+			var thread = new Thread(() =>
+			{
+				try
+				{
+					StartHostedCore();
+				}
+				catch (Exception ex)
+				{
+					// Startup failed, so there will never be a frame. Hand the exception to the
+					// caller rather than letting it die unobserved on this thread.
+					started.TrySetResult(ex);
+					return;
+				}
+
+				try
+				{
+					while (_running && session?.Stopping != true)
+					{
+						if (!TickCore()) break;
+
+						// Signal on a real FRAME, not on a tick. A tick does input and
+						// animation work whether or not it paints - rendering is gated by the
+						// frame-rate check - so signalling per tick would let the caller
+						// return to a screen that does not exist yet.
+						if (_consoleDriver.FrameNumber > 0) started.TrySetResult(null);
+					}
+				}
+				catch (Exception ex)
+				{
+					_logService.LogCritical($"Unhandled exception in background loop: {ex.Message}", ex, "System");
+
+					if (session != null) session.Fault = ex;
+					started.TrySetResult(ex);
+				}
+				finally
+				{
+					StopHostedCore();
+
+					// A loop that exited before painting must not leave the caller waiting out
+					// the full timeout for a frame that is never coming.
+					started.TrySetResult(null);
+				}
+			})
+			{
+				IsBackground = true,
+				Name = $"SharpConsoleUI loop ({_consoleDriver.GetType().Name})",
+			};
+
+			session = new BackgroundSession(this, thread, stopTimeout ?? TimeSpan.FromSeconds(5));
+			thread.Start();
+
+			var timeout = startTimeout ?? TimeSpan.FromSeconds(30);
+			if (!started.Task.Wait(timeout))
+			{
+				session.Dispose();
+				throw new InvalidOperationException(
+					$"The console window system did not render a frame within {timeout.TotalSeconds:0.#}s. "
+					+ "Startup is either blocked or slower than the timeout allows; pass a larger "
+					+ "startTimeout if it is genuinely slow.");
+			}
+
+			if (started.Task.Result is { } startupFailure)
+			{
+				session.Dispose();
+				throw new InvalidOperationException(
+					$"The console window system failed to start: {startupFailure.Message}", startupFailure);
+			}
+
+			return session;
 		}
 
 		/// <summary>
@@ -1204,6 +2006,11 @@ namespace SharpConsoleUI
 
 			// Dispose watchdog (stops timer thread)
 			_watchdog.Dispose();
+
+			// Close the diagnostics socket and remove its file, so a later run does not trip
+			// over a stale one.
+			_diagnosticsServer?.Dispose();
+			_diagnosticsServer = null;
 
 			// Dispose wake signal
 			_wakeSignal.Dispose();
@@ -1255,12 +2062,21 @@ namespace SharpConsoleUI
 		}
 
 		/// <summary>
-		/// Processes one iteration of the main loop (input, display, cursor).
-		/// This is useful for modal dialogs that need to block while still processing UI events.
+		/// Processes one iteration of the main loop (input, queued UI actions, display, cursor).
+		/// This is useful for modal dialogs that need to block while still processing UI events,
+		/// and for a host that owns its own loop and drives frames itself.
 		/// </summary>
+		/// <remarks>
+		/// Drains the <see cref="EnqueueOnUIThread(Action)"/> queue, in the same order
+		/// <see cref="Run"/> does. Without that, work marshalled from a background thread never
+		/// runs under a host that pumps this method instead of calling <c>Run</c> - it simply
+		/// accumulates, and every caller that waits on it times out. A modal dialog that
+		/// awaits a background task, and the diagnostics socket, both depend on this.
+		/// </remarks>
 		public void ProcessOnce()
 		{
 			Input.ProcessInput();
+			DrainUIActionQueue();
 			Render.UpdateDisplay();
 			UpdateCursor();
 		}
@@ -1425,17 +2241,29 @@ namespace SharpConsoleUI
 			while (_uiActionQueue.TryDequeue(out var item))
 			{
 				anyDrained = true;
-				using (new Core.UiCallbackScope(this, item.Label ?? "UIAction"))
+
+				// Counted for as long as it runs. TryDequeue takes the action OUT
+				// of the queue before it executes, so between those two moments
+				// the work exists nowhere the system can see: the queue answers
+				// empty, truthfully, while the action it held is halfway done,
+				// and a caller asking whether the system has settled is told yes.
+				//
+				// Outside the catch below, which is per action: the count has to
+				// come back down even when the action throws.
+				_uiActionsRunning.While(() =>
 				{
-					try
+					using (new Core.UiCallbackScope(this, item.Label ?? "UIAction"))
 					{
-						item.Action();
+						try
+						{
+							item.Action();
+						}
+						catch (Exception ex)
+						{
+							LogService?.LogError($"Error in EnqueueOnUIThread action: {ex.Message}", ex, "System");
+						}
 					}
-					catch (Exception ex)
-					{
-						LogService?.LogError($"Error in EnqueueOnUIThread action: {ex.Message}", ex, "System");
-					}
-				}
+				});
 
 				long nowTick = Environment.TickCount64;
 				if (nowTick - lastPulse >= _uiDrainHeartbeatIntervalMs)

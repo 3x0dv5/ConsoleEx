@@ -62,6 +62,54 @@ public class ConsoleBufferSnapshot
 	public bool IsCellDirty(int x, int y) => DirtyCells.Contains((x, y));
 
 	/// <summary>
+	/// The composed screen as one string per row, for asserting on what is displayed.
+	/// </summary>
+	/// <returns>
+	/// <see cref="Height"/> strings, each <see cref="Width"/> columns wide.
+	/// </returns>
+	/// <remarks>
+	/// <para>
+	/// The alternative is stripping ANSI escapes out of the driver's raw output with
+	/// a regular expression, which is what every caller was doing. This reads the
+	/// cells instead, so there is nothing to strip and nothing to get wrong.
+	/// </para>
+	/// <para>
+	/// Width is in COLUMNS, not characters: the second cell of a wide glyph is a
+	/// continuation and contributes nothing, so a row holding two CJK characters is
+	/// four columns and two runes. Combining marks are appended to the rune they
+	/// modify, which is where they belong and where a search for the base character
+	/// still finds them.
+	/// </para>
+	/// </remarks>
+	public List<string> ToLines()
+	{
+		var lines = new List<string>(Height);
+		var row = new StringBuilder(Width);
+
+		for (int y = 0; y < Height; y++)
+		{
+			row.Clear();
+
+			for (int x = 0; x < Width; x++)
+			{
+				var cell = FrontBuffer[x, y];
+
+				// The trailing half of a wide glyph. Its character is whatever the
+				// buffer happened to leave there; emitting it would double the glyph.
+				if (cell.IsWideContinuation) continue;
+
+				row.Append(cell.Character.ToString());
+
+				if (!string.IsNullOrEmpty(cell.Combiners)) row.Append(cell.Combiners);
+			}
+
+			lines.Add(row.ToString());
+		}
+
+		return lines;
+	}
+
+	/// <summary>
 	/// Gets the front buffer cell at the specified position.
 	/// </summary>
 	public ConsoleCell GetFront(int x, int y)
@@ -124,12 +172,33 @@ public struct ConsoleCell : IEquatable<ConsoleCell>
 	public string AnsiEscape { get; set; }
 
 	/// <summary>
+	/// Gets or sets whether this cell is the second column of a wide glyph.
+	/// </summary>
+	/// <remarks>
+	/// The glyph belongs to the preceding cell. Without this, a reader cannot tell a
+	/// continuation column from a real cell and will draw the glyph twice.
+	/// </remarks>
+	public bool IsWideContinuation { get; set; }
+
+	/// <summary>
+	/// Gets or sets the combining marks and ZWJ cluster continuations attached to
+	/// <see cref="Character"/>, or null.
+	/// </summary>
+	/// <remarks>
+	/// Dropping this truncates a grapheme to its base rune: an accented letter loses its
+	/// accent, and a ZWJ family emoji loses all but its first member.
+	/// </remarks>
+	public string? Combiners { get; set; }
+
+	/// <summary>
 	/// Creates a new console cell with a Rune.
 	/// </summary>
 	public ConsoleCell(Rune character, string ansiEscape)
 	{
 		Character = character;
 		AnsiEscape = ansiEscape ?? string.Empty;
+		IsWideContinuation = false;
+		Combiners = null;
 	}
 
 	/// <summary>
@@ -138,15 +207,39 @@ public struct ConsoleCell : IEquatable<ConsoleCell>
 	public ConsoleCell(char character, string ansiEscape)
 		: this(new Rune(character), ansiEscape) { }
 
+	/// <summary>
+	/// Creates a new console cell carrying full grapheme fidelity.
+	/// </summary>
+	/// <param name="character">The base rune.</param>
+	/// <param name="ansiEscape">The emitted escape.</param>
+	/// <param name="isWideContinuation">True for the second column of a wide glyph.</param>
+	/// <param name="combiners">Combining marks attached to the base rune, or null.</param>
+	public ConsoleCell(Rune character, string ansiEscape, bool isWideContinuation, string? combiners)
+	{
+		Character = character;
+		AnsiEscape = ansiEscape ?? string.Empty;
+		IsWideContinuation = isWideContinuation;
+		Combiners = combiners;
+	}
+
 	/// <summary>Determines equality.</summary>
+	/// <remarks>
+	/// Grapheme state participates: two cells that differ only in a combining mark or in
+	/// wide-continuation status are genuinely different cells, and
+	/// <see cref="ConsoleBufferSnapshot.GetDifferences"/> must see that.
+	/// </remarks>
 	public bool Equals(ConsoleCell other) =>
-		Character == other.Character && AnsiEscape == other.AnsiEscape;
+		Character == other.Character
+		&& AnsiEscape == other.AnsiEscape
+		&& IsWideContinuation == other.IsWideContinuation
+		&& Combiners == other.Combiners;
 
 	/// <summary>Determines equality with object.</summary>
 	public override bool Equals(object? obj) => obj is ConsoleCell other && Equals(other);
 
 	/// <summary>Gets hash code.</summary>
-	public override int GetHashCode() => HashCode.Combine(Character, AnsiEscape);
+	public override int GetHashCode() =>
+		HashCode.Combine(Character, AnsiEscape, IsWideContinuation, Combiners);
 
 	/// <summary>Equality operator.</summary>
 	public static bool operator ==(ConsoleCell left, ConsoleCell right) => left.Equals(right);

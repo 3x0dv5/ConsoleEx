@@ -108,15 +108,22 @@ echo ""
 # docs/CODE_QUALITY_ENFORCEMENT.md). Fails fast and locally, before any version bump or tag.
 echo -e "${BLUE}[1.5/5]${NC} Code-quality gate..."
 
-if ! dotnet format SharpConsoleUI/SharpConsoleUI.csproj --verify-no-changes --verbosity quiet >/dev/null 2>&1; then
-    echo -e "${RED}Error: code is not formatted. Run: dotnet format SharpConsoleUI/SharpConsoleUI.csproj${NC}"
-    exit 1
-fi
+# Everything this script publishes, not only the library: cxdbg and schost go
+# to NuGet from the same tag, and an unformatted tool ships just as far as an
+# unformatted library would.
+for PROJ in SharpConsoleUI/SharpConsoleUI.csproj \
+            tools/cxdbg/src/cxdbg/cxdbg.csproj \
+            tools/schost/src/schost/schost.csproj; do
+    if ! dotnet format "$PROJ" --verify-no-changes --verbosity quiet >/dev/null 2>&1; then
+        echo -e "${RED}Error: code is not formatted. Run: dotnet format $PROJ${NC}"
+        exit 1
+    fi
+done
 
 HEADER_MISSING=0
 while IFS= read -r f; do
     head -8 "$f" | grep -q "License: MIT" || HEADER_MISSING=$((HEADER_MISSING + 1))
-done < <(find SharpConsoleUI -name '*.cs' -not -path '*/bin/*' -not -path '*/obj/*')
+done < <(find SharpConsoleUI tools/cxdbg/src tools/schost/src -name '*.cs' -not -path '*/bin/*' -not -path '*/obj/*')
 if [ "$HEADER_MISSING" -ne 0 ]; then
     echo -e "${RED}Error: $HEADER_MISSING source file(s) missing the license-header banner.${NC}"
     exit 1
@@ -129,7 +136,20 @@ if [ "$WARN_COUNT" -ne 0 ]; then
     exit 1
 fi
 
-echo -e "${GREEN}✓ Format clean, headers present, build warning-clean${NC}"
+# The tools are published by this tag too, so their tests gate it. The library's
+# own suite runs in CI; these do not, which is why they run here.
+echo -e "${BLUE}      ${NC}Testing the tools..."
+
+for TESTS in tools/cxdbg/tests/cxdbg.Tests tools/schost/tests/schost.Tests; do
+    # CXDBG_TERMINAL=none so no test can open a window on the desktop of
+    # whoever is running the release.
+    if ! CXDBG_TERMINAL=none dotnet test "$TESTS" -c Release --verbosity quiet >/dev/null 2>&1; then
+        echo -e "${RED}Error: $TESTS failed. Run: dotnet test $TESTS${NC}"
+        exit 1
+    fi
+done
+
+echo -e "${GREEN}✓ Format clean, headers present, build warning-clean, tools tested${NC}"
 echo ""
 
 # Fetch tags
@@ -236,7 +256,7 @@ echo ""
 echo -e "${YELLOW}This will trigger GitHub Actions to:${NC}"
 echo -e "  1. Build the solution"
 echo -e "  2. Run tests"
-echo -e "  3. Create NuGet packages (SharpConsoleUI + SharpConsoleUI.Templates + SharpConsoleUI.Host ${NEW_VERSION})"
+echo -e "  3. Create NuGet packages (SharpConsoleUI + SharpConsoleUI.Templates + SharpConsoleUI.Host + cxdbg ${NEW_VERSION})"
 if [ "$IS_RC" = true ]; then
     echo -e "  4. Publish to NuGet.org ${YELLOW}as a prerelease${NC}"
     echo ""
@@ -267,8 +287,13 @@ if [ "$IS_RC" = true ]; then
     echo -e "${BLUE}ℹ${NC} RC build — leaving template dependencies on the last stable version."
 fi
 
-# 1. csproj-based templates (dotnet-new templates, schost templates)
-for TEMPLATE_CSPROJ in templates/content/*/*.csproj tools/schost/templates/*/*.csproj; do
+# 1. csproj-based templates (dotnet-new templates, schost templates), and the
+#    tutorial projects, which are the same thing by another name: a reader
+#    copies one out and builds it against the published package, so a stale
+#    version there teaches the wrong library. They sat on 2.5.12 through ten
+#    releases because nothing moved them.
+for TEMPLATE_CSPROJ in templates/content/*/*.csproj tools/schost/templates/*/*.csproj \
+                       docs/tutorials/*/*/*.csproj; do
     [ "$IS_RC" = true ] && break
     if [ -f "$TEMPLATE_CSPROJ" ]; then
         sed -i "s|<PackageReference Include=\"SharpConsoleUI\" Version=\"[^\"]*\"|<PackageReference Include=\"SharpConsoleUI\" Version=\"${NEW_VERSION}\"|" "$TEMPLATE_CSPROJ"
@@ -285,8 +310,8 @@ for TEMPLATE_CS in docs/scripting/templates/*.cs; do
     fi
 done
 
-if [ "$TEMPLATES_UPDATED" = true ] && ! git diff --quiet templates/ tools/schost/templates/ docs/scripting/templates/; then
-    git add templates/ tools/schost/templates/ docs/scripting/templates/
+if [ "$TEMPLATES_UPDATED" = true ] && ! git diff --quiet templates/ tools/schost/templates/ docs/scripting/templates/ docs/tutorials/; then
+    git add templates/ tools/schost/templates/ docs/scripting/templates/ docs/tutorials/
     git commit -m "Update template SharpConsoleUI dependency to ${NEW_VERSION}"
     git push origin "$(git branch --show-current)"
     echo -e "${GREEN}✓ Updated template dependencies to ${NEW_VERSION}${NC}"

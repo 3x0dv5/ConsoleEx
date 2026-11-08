@@ -2,9 +2,14 @@
 
 A WinUI-`<Grid>`-style two-dimensional layout container for the terminal: arrange child controls into rows and columns with fixed, size-to-content, or proportional tracks, span cells across rows and columns, add CSS-style gaps, and style each cell individually with a background, border, and padding.
 
+<!-- gallery -->
+
+![GridControl](../images/controls/GridControl.png)
+
+
 ## Overview
 
-GridControl is a pure layout container. It divides its area into a grid of rows and columns — each sized as a fixed number of cells, `Auto` (sized to its content), or `Star` (a proportional share of the leftover space) — and places one child control per cell. Cells can span multiple rows and/or columns, and the grid honours each child's `HorizontalAlignment`/`VerticalAlignment` (default `Stretch`/`Fill`) and `Margin` within its cell. This makes it the building block for dashboards, tiled status displays, settings forms, and any layout that is naturally a 2D matrix rather than a single row or column.
+GridControl is a pure layout container. It divides its area into a grid of rows and columns — each sized as a fixed number of cells, `Auto` (sized to its content), or `Star` (a proportional share of the leftover space) — and places one child control per cell. Cells can span multiple rows and/or columns, and the grid honors each child's `HorizontalAlignment`/`VerticalAlignment` (default `Stretch`/`Fill`) and `Margin` within its cell. This makes it the building block for dashboards, tiled status displays, settings forms, and any layout that is naturally a 2D matrix rather than a single row or column.
 
 Children are placed explicitly with `grid.Place(control, row, col, rowSpan, colSpan)`, or appended in row-major **AutoFlow** order with `grid.AddControl(control)` (each lands in the next free cell, growing rows as needed). `RowGap`/`ColumnGap` insert blank tracks between cells (a spanned cell absorbs the gaps it crosses). The grid has its own `Margin` and `Padding`, and a content control marked `Wrap=true` reflows to its column width via a two-pass measure, growing `Auto` rows to the wrapped height.
 
@@ -20,6 +25,11 @@ var grid = Controls.Grid()
     .Rows(GridLength.Auto(), GridLength.Star(1))
     .RowGap(1)
     .ColumnGap(2)
+    // Required whenever the grid has Star tracks: they divide the grid's LEFTOVER space, and a
+    // grid left on its default Left/Top alignment is only as big as its Auto content. Without
+    // these two lines the Star row here is zero rows tall and leftPanel/rightPanel never appear.
+    .WithAlignment(HorizontalAlignment.Stretch)
+    .WithVerticalAlignment(VerticalAlignment.Fill)
     .Place(Controls.Markup("[bold]Header[/]").Build(), 0, 0, colSpan: 2)
     .Place(leftPanel, 1, 0)
     .Place(rightPanel, 1, 1)
@@ -39,6 +49,19 @@ Every row and column is described by a `GridLength`, created with one of three f
 | `GridLength.Star(weight, min?, max?)` | Star | A proportional share of the leftover space, by `weight` |
 
 `Star` tracks split whatever space remains after the `Fixed` and `Auto` tracks are sized, in proportion to their weights — `Star(2)` gets twice the share of `Star(1)`. Every factory takes optional `min`/`max` cell clamps.
+
+> **A grid with `Star` tracks must be told to fill its container.** The grid's own alignment
+> defaults to `Left`/`Top`, which sizes it to its content — so there is no leftover space, every
+> star track resolves to zero, and the children in them are never painted. Nothing throws and
+> nothing is logged; the area is simply blank. Add both:
+>
+> ```csharp
+> .WithAlignment(HorizontalAlignment.Stretch)
+> .WithVerticalAlignment(VerticalAlignment.Fill)
+> ```
+>
+> The examples below leave these out to keep each one to the feature it shows. Any grid you
+> actually run needs them.
 
 ```csharp
 var grid = Controls.Grid()
@@ -94,6 +117,65 @@ var grid = Controls.Grid()
     .Add(tile4)   // -> row 1, col 0 (a new row is grown automatically)
     .Build();
 ```
+
+## Docking
+
+A grid takes two kinds of child. A **placed** child sits in a cell. A **docked** child claims
+a strip off the grid's rectangle, outside the tracks, and the track algorithm then runs on
+whatever is left.
+
+```csharp
+var grid = new GridControl { HorizontalAlignment = HorizontalAlignment.Stretch };
+grid.ColumnDefinitions.Add(GridLength.Star(1));
+grid.ColumnDefinitions.Add(GridLength.Star(1));
+grid.RowDefinitions.Add(GridLength.Star(1));
+
+grid.DockChild(toolbar, Dock.Top);      // outside the tracks
+grid.DockChild(sidebar, Dock.Left);     // outside the tracks
+grid.Place(left,  row: 0, col: 0);      // inside them
+grid.Place(right, row: 0, col: 1);
+
+grid.Undock(sidebar);                   // returns the strip to the tracks
+```
+
+### Coordinates never shift
+
+A docked child claims no row and no column, so `grid[1, 0]` means the same cell however many
+children are docked:
+
+```csharp
+grid.Place(cell, 1, 0);
+grid.DockChild(sidebar, Dock.Left);
+grid.DockChild(statusBar, Dock.Bottom);
+// grid[1, 0] is still the same cell
+```
+
+This is why docks are allocated outside the tracks rather than being turned into them.
+Synthesising tracks from docks would make every coordinate depend on how much was docked, and
+`grid[1, 0]` would mean different cells at different times.
+
+### Why `DockChild` and not `Dock`
+
+Every control already has a `Dock` **property** — the edge it claims in *its own* parent. A
+method of the same name would shadow that property, and a nested grid could then not be
+docked at all. The two are different things and both are available:
+
+```csharp
+innerGrid.Dock = Dock.Left;                 // the inner grid's own edge, in its parent
+innerGrid.DockChild(child, Dock.Top);       // an edge inside the inner grid
+```
+
+### Allocation order
+
+Edges are claimed in declaration order, each shrinking what is left for the rest, so a
+toolbar declared before a sidebar spans the full width while the sidebar starts beneath it.
+Far edges (`Bottom`, `Right`) keep author order within a run. The full rule, shared with the
+window root, is in [Docking](../DOCKING.md).
+
+> `HorizontalAlignment` defaults to `Left`, which sizes the grid to its content. Star tracks
+> only divide the real width under `Stretch`.
+
+---
 
 ## Gaps
 
@@ -191,16 +273,16 @@ A resize writes the new size straight into the live `RowDefinitions`/`ColumnDefi
 
 ### Colors
 
-The highlight is **foreground-only**: the handle's **background is the same in every state** (idle / focused / hovered / dragging) — only the glyph (`║` / `═`) changes. By default everything is theme- and `ColorRole`-driven, so the splitter matches the rest of the grid's chrome with no manual colours:
+The highlight is **foreground-only**: the handle's **background is the same in every state** (idle / focused / hovered / dragging) — only the glyph (`║` / `═`) changes. By default everything is theme- and `ColorRole`-driven, so the splitter matches the rest of the grid's chrome with no manual colors:
 
-- **Idle:** the grid's `ColorRole` border colour, **shaded dimmer**, so the resting handle reads as a quiet line.
+- **Idle:** the grid's `ColorRole` border color, **shaded dimmer**, so the resting handle reads as a quiet line.
 - **Focused / dragging:** the **full-bright** role border (its focused state is brightened), drawn **bold** — a clear dim→bright, normal→bold highlight on the same hue, visible on every theme.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `SplitterColor` | `Color?` | Idle handle glyph colour; `null` resolves to the grid's `ColorRole` border colour (shaded dimmer) |
-| `SplitterFocusedForeground` | `Color?` | Glyph colour when focused/hovered; `null` resolves to the bright role border / theme accent |
-| `SplitterDraggingForeground` | `Color?` | Glyph colour while dragging; `null` resolves the same as focused |
+| `SplitterColor` | `Color?` | Idle handle glyph color; `null` resolves to the grid's `ColorRole` border color (shaded dimmer) |
+| `SplitterFocusedForeground` | `Color?` | Glyph color when focused/hovered; `null` resolves to the bright role border / theme accent |
+| `SplitterDraggingForeground` | `Color?` | Glyph color while dragging; `null` resolves the same as focused |
 | `SplitterFocusedBackground` | `Color?` | Optional fixed handle background; `null` keeps it transparent. **Does not change between states** — it pins the constant background |
 | `SplitterDraggingBackground` | `Color?` | Alias for pinning the same constant background (kept for API symmetry) |
 
@@ -240,14 +322,14 @@ Per-boundary (a rule at a *specific* boundary only); composes with the grid-leve
 | `HasGridlineAfterColumn(int index)` / `HasGridlineAfterRow(int index)` | Query a per-boundary rule |
 | `ClearGridlines()` | Remove all per-boundary rules (does not change the `Show*` flags) |
 
-### Style and colour
+### Style and color
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `GridlineStyle` | `BorderStyle` | Box-drawing style. Default `Single` (`│ ─ ┼`); also `DoubleLine` (`║ ═ ╬`), `Rounded` |
-| `GridlineColor` | `Color?` | Glyph colour; `null` resolves to the grid's `ColorRole` border colour **shaded dimmer** (a rule reads lighter than a full border). Set it for full border-weight colour |
+| `GridlineColor` | `Color?` | Glyph color; `null` resolves to the grid's `ColorRole` border color **shaded dimmer** (a rule reads lighter than a full border). Set it for full border-weight color |
 
-Gridlines are static (no focus/hover reaction) — quiet structure, the same colour every frame.
+Gridlines are static (no focus/hover reaction) — quiet structure, the same color every frame.
 
 ### Junctions, spans, and splitters
 
@@ -255,7 +337,7 @@ Where a vertical and a horizontal rule cross, the correct junction glyph is chos
 
 A boundary that carries a **splitter wins**: the interactive splitter handle is drawn there and the gridline is suppressed at that boundary; gridlines fill every other boundary.
 
-Lines are **centred** in their gap, so a `ColumnGap(2)`/`RowGap` grid shows symmetric rules (this applies to splitters too).
+Lines are **centered** in their gap, so a `ColumnGap(2)`/`RowGap` grid shows symmetric rules (this applies to splitters too).
 
 ### Example
 
@@ -327,7 +409,7 @@ Create a builder with `Controls.Grid()` (or `new GridBuilder()`). A builder impl
 .GridlineAfterColumn(int index)          // rule at one column boundary
 .GridlineAfterRow(int index)             // rule at one row boundary
 .GridlineStyle(BorderStyle style)        // Single (default) / DoubleLine / Rounded
-.GridlineColor(Color color)              // explicit gridline colour (else role-derived, dimmer)
+.GridlineColor(Color color)              // explicit gridline color (else role-derived, dimmer)
 ```
 
 ### Alignment, Theming, and Identity
@@ -353,14 +435,14 @@ Create a builder with `Controls.Grid()` (or `new GridBuilder()`). A builder impl
 | `HorizontalAlignment` | `HorizontalAlignment` | `Left` | Horizontal alignment of the grid within its container |
 | `VerticalAlignment` | `VerticalAlignment` | `Top` | Vertical alignment of the grid within its container |
 | `BackgroundColor` | `Color` | `Transparent` | Background fill (transparent shows through when unset) |
-| `ForegroundColor` | `Color` | from theme | Foreground (text) colour for the grid and its children |
+| `ForegroundColor` | `Color` | from theme | Foreground (text) color for the grid and its children |
 | `Width` | `int?` | `null` | Fixed width (auto-sized when null) |
 | `Height` | `int?` | `null` | Fixed height (auto-sized when null) |
 | `ColorRole` | `ColorRole` | `Default` | Semantic role tinting per-cell chrome (borders and surface fills) from the theme palette |
 | `Outline` | `bool` | `false` | Renders role chrome in outline style |
 | `ShowColumnGridlines` / `ShowRowGridlines` | `bool` | `false` | Draw a rule between every adjacent column / row (see [Gridlines](#gridlines)) |
 | `GridlineStyle` | `BorderStyle` | `Single` | Box-drawing style for gridlines (`Single` → `│ ─ ┼`; `DoubleLine`; `Rounded`) |
-| `GridlineColor` | `Color?` | `null` | Gridline glyph colour; `null` = role border shaded dimmer |
+| `GridlineColor` | `Color?` | `null` | Gridline glyph color; `null` = role border shaded dimmer |
 | `Visible` | `bool` | `true` | Whether the grid is visible |
 | `IsEnabled` | `bool` | `true` | Enables/disables keyboard and mouse handling |
 | `HasFocus` | `bool` | `false` | True when this grid or one of its descendants is focused (read-only) |
@@ -554,7 +636,7 @@ grid[0, 0].Content = resultsPanel;
 
 1. **Reach for a grid when the layout is 2D**: use `GridControl` for matrices and tiled dashboards; use [HorizontalGridControl](HorizontalGridControl.md) for a single row of resizable columns and [ScrollablePanelControl](ScrollablePanelControl.md) for a single scrollable column.
 2. **Mix track types**: give chrome (toolbars, headers) `Auto` rows, fixed sidebars `Cells(n)`, and the main content `Star` tracks so it absorbs leftover space.
-3. **Use `Stretch`/`Fill` alignment for full-bleed grids**: combine `WithAlignment(HorizontalAlignment.Stretch)` and `WithVerticalAlignment(VerticalAlignment.Fill)` so the grid fills its window.
+3. **Use `Stretch`/`Fill` alignment for full-bleed grids**: combine `WithAlignment(HorizontalAlignment.Stretch)` and `WithVerticalAlignment(VerticalAlignment.Fill)` so the grid fills its window. **A grid with `Star` tracks and the default `Left`/`Top` alignment renders nothing at all** — a star track is a share of leftover space, and a grid that was never told to fill its container has none to share, so every star row resolves to zero height and the children are never painted. There is no error; the area is simply blank. If a grid disappears, check its own alignment before anything else.
 4. **Frame tiles with the cell surface, not nested panels**: `grid.Cell(r, c).Border` / `.Background` give per-cell chrome without wrapping each child in a `PanelControl`.
 5. **Compose to scroll**: the grid never scrolls itself — wrap it (or a single cell) in a `ScrollablePanelControl`.
 6. **Mutate on the UI thread**: `Place`, `AddControl`, cell writes, and `RowDefinitions`/`ColumnDefinitions` edits should run on the UI thread; from background work, marshal with `EnqueueOnUIThread`.

@@ -47,6 +47,12 @@ namespace SharpConsoleUI.Input
 			_windowStateService = windowStateService ?? throw new ArgumentNullException(nameof(windowStateService));
 			_logService = logService ?? throw new ArgumentNullException(nameof(logService));
 			_context = context ?? throw new ArgumentNullException(nameof(context));
+
+			// The recognizer's clock comes from the system's options, so a test can
+			// move time instead of sleeping through the multi-click window. Without
+			// this the recognizer was constructed with `new()` and its injectable
+			// clock was unreachable from outside the assembly.
+			_gestures = new MouseGestureRecognizer(time: context.MouseTime);
 		}
 
 		/// <summary>
@@ -86,39 +92,49 @@ namespace SharpConsoleUI.Input
 			{
 				var keyInfo = key.Value;
 
-				// Desktop portals capture keyboard input when open. The portal's content gets the key
-				// first (nav / type-ahead / Enter); a key it does NOT consume falls through to global
-				// shortcuts, so app-level shortcuts still work with a portal open (e.g. to toggle/switch
-				// portals). Escape closes the top portal. The portal always consumes the frame (continue).
-				if (_context.DesktopPortalService.HasPortals)
+				// Taped here, where a key enters the dispatch, for the same
+				// reason a pointing event is taped after the recognizer: this
+				// is the thing the controls actually see. Without it `events`
+				// answered half the question - a control that never received a
+				// key and one that mishandled it look identical from outside.
+				RecordKey(keyInfo);
+
+				// A CAPTURING desktop portal takes the keyboard while open: its content gets the key first
+				// (nav / type-ahead / Enter), a key it does NOT consume falls through to global shortcuts
+				// so app-level shortcuts still work, and Escape closes it. The portal then consumes the
+				// frame (continue).
+				//
+				// Only capturing portals do this. A passive overlay — a toast — sits on top of the window
+				// but must not eat what the user types: swallowing it loses keystrokes with no sign
+				// anything happened, which reads as the app ignoring the keyboard. So look past
+				// non-capturing portals for the top one that actually wants keys; when there is none,
+				// fall through to the normal path exactly as if no portal were open.
+				var topPortal = _context.DesktopPortalService.TopCapturingPortal;
+				if (topPortal != null)
 				{
-					var topPortal = _context.DesktopPortalService.TopPortal;
-					if (topPortal != null)
+					bool handled = false;
+					if (topPortal.Content is Controls.IInteractiveControl interactive)
 					{
-						bool handled = false;
-						if (topPortal.Content is Controls.IInteractiveControl interactive)
-						{
-							handled = interactive.ProcessKey(keyInfo);
-						}
-						if (!handled)
-						{
-							handled = _context.TryHandleGlobalShortcut(keyInfo);
-						}
-						// The configured exit key (default Ctrl+Q) is a quit-from-anywhere shortcut — it
-						// must work with a portal open too, not be swallowed by the portal capture.
-						if (!handled && _context.Options.ExitKey.HasValue
-							&& (keyInfo.Modifiers & ConsoleModifiers.Control) != 0
-							&& keyInfo.Key == _context.Options.ExitKey.Value)
-						{
-							_context.RequestExit(0);
-							handled = true;
-						}
-						if (!handled && keyInfo.Key == ConsoleKey.Escape)
-						{
-							_context.DesktopPortalService.RemovePortal(topPortal);
-						}
+						handled = interactive.ProcessKey(keyInfo);
 					}
-					continue; // Portal captures all keys
+					if (!handled)
+					{
+						handled = _context.TryHandleGlobalShortcut(keyInfo);
+					}
+					// The configured exit key (default Ctrl+Q) is a quit-from-anywhere shortcut — it
+					// must work with a portal open too, not be swallowed by the portal capture.
+					if (!handled && _context.Options.ExitKey.HasValue
+						&& (keyInfo.Modifiers & ConsoleModifiers.Control) != 0
+						&& keyInfo.Key == _context.Options.ExitKey.Value)
+					{
+						_context.RequestExit(0);
+						handled = true;
+					}
+					if (!handled && keyInfo.Key == ConsoleKey.Escape)
+					{
+						_context.DesktopPortalService.RemovePortal(topPortal);
+					}
+					continue; // A capturing portal consumes the frame
 				}
 
 				// Check for Start menu shortcut first
@@ -164,8 +180,8 @@ namespace SharpConsoleUI.Input
 						{
 							handled = HandleMoveInput(keyInfo);
 						}
-						// Try Alt+1-9 window selection
-						else if ((keyInfo.Modifiers & ConsoleModifiers.Alt) != 0)
+						// Try Alt+1-9 window selection (opt-out: an app may want the chord itself)
+						else if ((keyInfo.Modifiers & ConsoleModifiers.Alt) != 0 && _context.Options.AltDigitSelectsWindow)
 						{
 							handled = HandleAltInput(keyInfo);
 						}
@@ -177,11 +193,257 @@ namespace SharpConsoleUI.Input
 		#region Mouse Event Handling
 
 		/// <summary>
+		/// Feeds a synthetic mouse event through the ordinary dispatch path.
+		/// </summary>
+		/// <param name="flags">The mouse flags, as the driver would report them.</param>
+		/// <param name="point">Screen coordinates.</param>
+		/// <remarks>
+		/// For the diagnostics socket. Deliberately routes into <see cref="HandleMouseEvent"/>
+		/// - the exact method the driver's MouseEvent lands on - rather than reaching into
+		/// hit-testing directly. A probe that took a shortcut past dispatch would report
+		/// successes a real click could not reproduce.
+		/// </remarks>
+		internal void InjectMouseEvent(List<MouseFlags> flags, Point point)
+			=> HandleMouseEvent(this, flags, point);
+
+		/// <summary>The parser used to decode injected bytes.</summary>
+		/// <remarks>
+		/// Owned here rather than borrowed from a driver, because not every
+		/// driver has one: a headless system takes already-decoded input, since
+		/// there is no terminal to send bytes. The parser belongs to whatever is
+		/// READING, and this is the first place every configuration converges.
+		/// </remarks>
+		private Drivers.Input.AnsiInputParser? _injectionParser;
+
+		/// <summary>
+		/// Decodes raw terminal bytes and delivers whatever they turn out to be.
+		/// </summary>
+		/// <param name="bytes">The bytes, as a terminal would send them.</param>
+		/// <returns>One line per event, describing what was decoded.</returns>
+		/// <remarks>
+		/// <para>
+		/// The one way into the decoder from outside. Everything else a probe can
+		/// send - a key, a click - enters ABOVE it, already decoded, so this is
+		/// the only way to drive the decoding itself: X10 mouse reports,
+		/// bracketed paste, cursor-position replies and anything malformed, which
+		/// is where a parser goes wrong.
+		/// </para>
+		/// <para>
+		/// Each kind of event goes where the drivers send it, including the
+		/// asymmetry: keys and paste are QUEUED, mouse is dispatched inline on
+		/// the calling thread. Routing them uniformly would make this behave
+		/// unlike the input it imitates.
+		/// </para>
+		/// <para>
+		/// This decodes bytes the way the library decodes bytes. It does not
+		/// pretend a terminal sent them: the byte-reading loops, their partial
+		/// reads and their escape timeout are not exercised.
+		/// </para>
+		/// </remarks>
+		internal List<string> InjectBytes(ReadOnlySpan<byte> bytes)
+		{
+			var parser = _injectionParser ??= new Drivers.Input.AnsiInputParser();
+			var described = new List<string>();
+
+			List<Drivers.Input.InputEvent> events;
+
+			try
+			{
+				events = parser.Parse(bytes, bytes.Length);
+			}
+			finally
+			{
+				// A sequence that ends mid-way leaves the parser expecting more,
+				// and the next injection would be swallowed completing it. Each
+				// call stands alone, so anything partial is flushed here.
+				foreach (var leftover in parser.Flush()) Deliver(leftover, described);
+			}
+
+			foreach (var decoded in events) Deliver(decoded, described);
+
+			return described;
+		}
+
+		/// <summary>Sends one decoded event where its driver would send it.</summary>
+		private void Deliver(Drivers.Input.InputEvent decoded, List<string> described)
+		{
+			switch (decoded)
+			{
+				case Drivers.Input.KeyInputEvent key:
+					described.Add($"key {Describe(key.KeyInfo)}");
+					_inputStateService.EnqueueKey(key.KeyInfo);
+					break;
+
+				case Drivers.Input.MouseInputEvent mouse:
+					described.Add(
+						$"mouse {string.Join("|", mouse.Flags)} @{mouse.Position.X},{mouse.Position.Y}");
+					HandleMouseEvent(this, mouse.Flags, mouse.Position);
+					break;
+
+				case Drivers.Input.PasteInputEvent paste:
+					described.Add($"paste {paste.Text.Length} char(s)");
+					_inputStateService.EnqueuePaste(paste.Text);
+					break;
+
+				case Drivers.Input.UnknownSequenceEvent unknown:
+					// Reported but NOT delivered. The parser could not say what it
+					// was, and guessing would be worse than saying so.
+					described.Add($"unknown {unknown.Data.Length} byte(s)");
+					break;
+			}
+		}
+
+		/// <summary>A key as a person would write it.</summary>
+		private static string Describe(ConsoleKeyInfo key)
+		{
+			var parts = new List<string>();
+
+			if ((key.Modifiers & ConsoleModifiers.Control) != 0) parts.Add("C");
+			if ((key.Modifiers & ConsoleModifiers.Alt) != 0) parts.Add("M");
+			if ((key.Modifiers & ConsoleModifiers.Shift) != 0) parts.Add("S");
+
+			string name = key.Key != ConsoleKey.None
+				? key.Key.ToString()
+				: key.KeyChar switch
+				{
+					'\0' => "NUL",
+					_ => key.KeyChar.ToString(),
+				};
+
+			return parts.Count > 0 ? string.Join("-", parts) + "-" + name : name;
+		}
+
+		/// <summary>
+		/// Derives clicks and drags from the presses and releases the driver reports.
+		/// </summary>
+		/// <remarks>
+		/// One recogniser for every platform and every injected event, so a gesture
+		/// means the same thing wherever it came from. The drivers used to each run
+		/// their own copy of this logic, which is how they came to disagree.
+		/// </remarks>
+		private readonly MouseGestureRecognizer _gestures;
+
+		/// <summary>
 		/// Main mouse event router - handles all mouse events in priority order.
 		/// Priority: release → drag/resize movement → press → click → propagation
 		/// </summary>
-		private void HandleMouseEvent(object sender, List<MouseFlags> flags, Point point)
+		private void HandleMouseEvent(object sender, List<MouseFlags> rawFlags, Point point)
 		{
+			HandleMouseEventCore(sender, rawFlags, point);
+		}
+
+		/// <summary>One dispatched input event, as the controls saw it.</summary>
+		/// <param name="Flags">
+		/// For a pointing event, the flags after the recognizer added its
+		/// gestures. For a key, the key as a person would write it.
+		/// </param>
+		/// <param name="X">Screen column, or -1 for a key.</param>
+		/// <param name="Y">Screen row, or -1 for a key.</param>
+		/// <param name="Kind">"key" or "mouse", so a reader need not guess.</param>
+		public readonly record struct TapeEntry(string Flags, int X, int Y, string Kind = "mouse");
+
+		/// <summary>How many events the tape keeps before dropping the oldest.</summary>
+		/// <remarks>
+		/// Motion arrives continuously, so an unbounded tape is a leak in any app
+		/// the pointer moves across. The recent events are what a reader wants.
+		/// </remarks>
+		private const int TapeLimit = 256;
+
+		private readonly Queue<TapeEntry> _tape = new();
+
+		private readonly object _tapeLock = new();
+
+		/// <summary>Whether events are being taped. Set when a system asks for diagnostics.</summary>
+		public bool RecordEvents { get; set; }
+
+		/// <summary>Records a dispatched event, when taping is on.</summary>
+		/// <remarks>
+		/// Recorded as the CONTROLS will see it - after the recognizer has added
+		/// its derived gestures - because that is the sequence a control's
+		/// handler reads, and a tape of what the terminal said would hide the
+		/// thing that actually reaches them.
+		/// </remarks>
+		private void RecordKey(ConsoleKeyInfo key)
+		{
+			if (!RecordEvents) return;
+
+			lock (_tapeLock)
+			{
+				if (_tape.Count >= TapeLimit) _tape.Dequeue();
+				_tape.Enqueue(new TapeEntry(Spell(key), -1, -1, "key"));
+			}
+		}
+
+		/// <summary>A key as a person would write it, in tmux notation.</summary>
+		/// <remarks>
+		/// The same spelling the <c>key</c> verb accepts, so what the tape
+		/// shows can be sent back verbatim to reproduce it.
+		/// </remarks>
+		private static string Spell(ConsoleKeyInfo key)
+		{
+			// From the table that PARSES a spec, so the two cannot disagree:
+			// the tape used to say "DownArrow", which the key verb does not
+			// take, and the promise that a taped key can be replayed was only
+			// true for the ones that happened to match.
+			string name = Diagnostics.Socket.KeySpec.NameOf(key.Key)
+				?? (key.KeyChar >= ' ' && !char.IsControl(key.KeyChar)
+					? key.KeyChar.ToString()
+					: key.Key.ToString());
+
+			if ((key.Modifiers & ConsoleModifiers.Control) != 0) name = "C-" + name;
+			if ((key.Modifiers & ConsoleModifiers.Alt) != 0) name = "M-" + name;
+			if ((key.Modifiers & ConsoleModifiers.Shift) != 0
+				&& name.Length > 1) name = "S-" + name;
+
+			return name;
+		}
+
+		private void RecordEvent(List<MouseFlags> flags, Point point)
+		{
+			if (!RecordEvents) return;
+
+			lock (_tapeLock)
+			{
+				if (_tape.Count >= TapeLimit) _tape.Dequeue();
+				_tape.Enqueue(new TapeEntry(string.Join("|", flags), point.X, point.Y));
+			}
+		}
+
+		/// <summary>
+		/// Returns the events dispatched since the last call, and clears them.
+		/// </summary>
+		/// <remarks>
+		/// A control that mishandles a gesture and one that never received it
+		/// look identical from outside - nothing happens, or the wrong thing
+		/// happens twice. This is the sequence that actually arrived.
+		/// </remarks>
+		public IReadOnlyList<TapeEntry> ConsumeEventTape()
+		{
+			lock (_tapeLock)
+			{
+				var snapshot = _tape.ToArray();
+				_tape.Clear();
+				return snapshot;
+			}
+		}
+
+		private void HandleMouseEventCore(object sender, List<MouseFlags> rawFlags, Point point)
+		{
+			// Gestures are derived here, once, and ADDED to what the driver said.
+			// A double-click therefore still carries its press, so a control that
+			// wants every press gets every press and one that wants word-select on
+			// a double-click still gets that too.
+			//
+			// Idempotent for a caller that already supplied a gesture (the
+			// diagnostics socket does, and so do tests): Recognize only adds flags
+			// that are not already present.
+			var flags = _gestures.Recognize(rawFlags, point);
+
+			// Taped here rather than on the way in: Recognize is stateful, so a
+			// second call to preview the gestures would advance the click run and
+			// change the very thing being reported.
+			RecordEvent(flags, point);
+
 			// Check panel clicks first (both Pressed and Clicked)
 			if (flags.Contains(MouseFlags.Button1Pressed) || flags.Contains(MouseFlags.Button1Clicked))
 			{
@@ -235,7 +497,7 @@ namespace SharpConsoleUI.Input
 							bool shouldConsume = topPortal.ConsumeClickOnDismiss;
 							// Runs on the driver input thread; portal teardown restores screen regions / touches
 							// the shared console buffer and must not race the render loop (a torn flush spews ANSI).
-							_context.EnqueueOnUIThread(() => _context.DesktopPortalService.DismissAllPortals());
+							_context.EnqueueOnUIThread(() => _context.DesktopPortalService.DismissAllPortals(), "inputCoordinator.action");
 							if (shouldConsume)
 								return;
 						}
@@ -691,6 +953,36 @@ namespace SharpConsoleUI.Input
 		private Window? GetWindowAtPoint(Point point)
 		{
 			return _context.GetWindowAtPoint(point);
+		}
+
+		/// <summary>
+		/// What a point belongs to, as a click would decide it.
+		/// </summary>
+		/// <param name="point">A screen point.</param>
+		/// <returns>The window there, if any, and which part of it.</returns>
+		/// <remarks>
+		/// Answered from the same three methods a press uses -
+		/// <see cref="GetWindowAtPoint"/>, <see cref="GetResizeDirection"/> and
+		/// <see cref="IsInTitleBar"/> - and in the order a press asks them, so
+		/// the answer IS the click's answer. A second implementation walking
+		/// the layout tree would report what should be under the point rather
+		/// than what a click will find there, and the gap between those two is
+		/// the bug this is meant to expose.
+		/// </remarks>
+		internal (Window? Window, string Region, ResizeDirection Resize) ClassifyPoint(Point point)
+		{
+			var window = GetWindowAtPoint(point);
+			if (window == null) return (null, "desktop", ResizeDirection.None);
+
+			// Resize first, then title, then the rest is client - the order the
+			// press handler tries them, which is what decides a corner that is
+			// also title bar.
+			var resize = GetResizeDirection(window, point);
+			if (resize != ResizeDirection.None) return (window, "resize", resize);
+
+			if (IsInTitleBar(window, point)) return (window, "title", ResizeDirection.None);
+
+			return (window, "client", ResizeDirection.None);
 		}
 
 		#endregion

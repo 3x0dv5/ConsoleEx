@@ -105,11 +105,25 @@ namespace SharpConsoleUI.Html
 							   !path.EndsWith(".eot", StringComparison.OrdinalIgnoreCase);
 					}
 				})
+				// What the page is TOLD about its viewport: the frame its media
+				// queries and viewport-relative units resolve against. Not the
+				// frame an image is measured in - that is the narrower content
+				// column, because a browser window also holds furniture a terminal
+				// does not render. See HtmlConstants.CssContentWidthPx.
 				.WithRenderDevice(new AngleSharp.Css.DefaultRenderDevice
 				{
-					DeviceWidth = 1920,
-					DeviceHeight = 1080,
-					FontSize = 16
+					// Device* is the screen; ViewPort* is the window on it, and the
+					// two are separate properties. Media queries and relative units
+					// read the VIEWPORT, so setting only the device left it at zero:
+					// every (min-width: N) was false and every (max-width: N) true,
+					// whatever N said. A page got its phone layout and its desktop
+					// layout at once, and a vw length threw outright. Both pairs are
+					// set, to the same nominal page, so the answers agree.
+					DeviceWidth = (int)HtmlConstants.CssViewportWidthPx,
+					DeviceHeight = (int)HtmlConstants.CssViewportHeightPx,
+					ViewPortWidth = (int)HtmlConstants.CssViewportWidthPx,
+					ViewPortHeight = (int)HtmlConstants.CssViewportHeightPx,
+					FontSize = (int)HtmlConstants.CssRootFontSizePx
 				})
 				.WithCss();
 			_cssContext = BrowsingContext.New(cssConfig);
@@ -155,7 +169,8 @@ namespace SharpConsoleUI.Html
 			string? baseUrl = null,
 			bool showImages = false,
 			Dictionary<string, Imaging.PixelBuffer?>? imageCache = null,
-			Drivers.IGraphicsProtocol? graphicsProtocol = null)
+			Drivers.IGraphicsProtocol? graphicsProtocol = null,
+			bool usePageBackground = false)
 		{
 			// Only re-parse if HTML content or base URL changed
 			if (html != _cachedHtml || baseUrl != _cachedBaseUrl || _cachedDocument == null)
@@ -172,7 +187,107 @@ namespace SharpConsoleUI.Html
 				}
 			}
 
-			return LayoutDocument(_cachedDocument, maxWidth, defaultFg, defaultBg, blockSpacing, linkColor, visitedLinkColor, showImages, imageCache, graphicsProtocol);
+			// The page's own surface, when asked for and when it states one. Text
+			// colours are resolved against whatever background wins, so adopting
+			// the surface and keeping the page's text stay in step: a page that
+			// sets cream and black gets cream and black, and one that sets only a
+			// colour still gets it checked against the terminal's surface.
+			var surface = usePageBackground
+				? PageBackground(_cachedDocument) ?? defaultBg
+				: defaultBg;
+
+			return LayoutDocument(_cachedDocument, maxWidth, defaultFg, surface, blockSpacing, linkColor, visitedLinkColor, showImages, imageCache, graphicsProtocol);
+		}
+
+		/// <summary>
+		/// The background colour a document asks for, or null when it does not ask.
+		/// </summary>
+		/// <remarks>
+		/// <c>bgcolor</c> as well as CSS, because that attribute is how the pages
+		/// that still set a page colour actually set it: Hacker News's cream and
+		/// textfiles.com's black are both <c>bgcolor</c> on an element, not a
+		/// stylesheet rule. Reading only CSS kept their text colours while losing
+		/// the surface those colours were chosen for.
+		/// </remarks>
+		/// <summary>
+		/// How far down a single-child wrapper chain a page background is looked for.
+		/// </summary>
+		/// <remarks>
+		/// Deep enough for the body > center > table shape a classic page uses,
+		/// shallow enough that a deeply nested content element cannot be mistaken
+		/// for the page itself.
+		/// </remarks>
+		private const int MaxPageBackgroundDepth = 4;
+
+		/// <summary>Elements that draw nothing, so they do not make a wrapper ambiguous.</summary>
+		private static readonly HashSet<string> NonRendering =
+			new(StringComparer.OrdinalIgnoreCase) { "script", "style", "noscript", "template", "link", "meta" };
+
+		private static Color? PageBackground(IDocument document)
+		{
+			// Body first, then the element a classic layout actually colours: a
+			// full-width table standing in for the page.
+			foreach (var element in Candidates(document))
+			{
+				if (element == null) continue;
+
+				var attribute = element.GetAttribute("bgcolor");
+				if (!string.IsNullOrWhiteSpace(attribute))
+				{
+					var parsed = HtmlStyleResolver.ParseCssColor(attribute);
+					if (parsed.HasValue) return parsed;
+				}
+
+				var style = element.GetAttribute("style");
+				if (!string.IsNullOrWhiteSpace(style))
+				{
+					var match = System.Text.RegularExpressions.Regex.Match(
+						style, @"background(?:-color)?\s*:\s*([^;]+)",
+						System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+					if (match.Success)
+					{
+						var parsed = HtmlStyleResolver.ParseCssColor(match.Groups[1].Value.Trim());
+						if (parsed.HasValue) return parsed;
+					}
+				}
+			}
+
+			return null;
+
+			static IEnumerable<IElement?> Candidates(IDocument doc)
+			{
+				yield return doc.Body;
+				if (doc.Body == null) yield break;
+
+				// Then down the WRAPPER CHAIN: while an element is the only one at
+				// its level, it is still standing in for the page rather than being
+				// content within it. Hacker News reaches its colour as
+				// body > center > table, and stopping a level short found nothing
+				// at all.
+				//
+				// The walk ends at the first element with siblings, which is where
+				// the page stops being a single container and starts being layout.
+				IElement current = doc.Body;
+				for (int depth = 0; depth < MaxPageBackgroundDepth; depth++)
+				{
+					// Counting RENDERED children, not all of them: Hacker News
+					// closes its body with a <script>, so by a raw count the body
+					// has two children and the walk stopped one step short of the
+					// colour it was looking for.
+					IElement? only = null;
+					foreach (var child in current.Children)
+					{
+						if (NonRendering.Contains(child.LocalName)) continue;
+						if (only != null) { only = null; break; }
+						only = child;
+					}
+
+					if (only == null) yield break;
+
+					current = only;
+					yield return current;
+				}
+			}
 		}
 
 		/// <summary>
@@ -196,6 +311,7 @@ namespace SharpConsoleUI.Html
 				return new LayoutResult(Array.Empty<LayoutLine>(), 0);
 			}
 
+			HtmlInlineFlow.ResetLinkIds();
 			var lines = HtmlBlockFlow.FlowBlocks(
 				body,
 				maxWidth,
@@ -207,7 +323,8 @@ namespace SharpConsoleUI.Html
 				showImages,
 				imageCache,
 				_cssDocument,
-				graphicsProtocol);
+				graphicsProtocol,
+				_cachedBaseUrl);
 
 			// Reassign Y positions sequentially
 			int y = 0;

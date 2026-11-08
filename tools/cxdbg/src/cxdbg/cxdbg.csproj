@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Cxdbg</RootNamespace>
+    <AssemblyName>cxdbg</AssemblyName>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>cxdbg</ToolCommandName>
+    <PackageId>cxdbg</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Attach to a running SharpConsoleUI application over its diagnostics socket and ask it what it is doing: what the screen shows, what layout believes, why a control is the size it is. Drives the app too - keys, clicks, resizes - through its own input dispatch.</Description>
+    <PackageOutputPath>./nupkg</PackageOutputPath>
+
+    <Authors>Nikolaos Protopapas</Authors>
+    <Copyright>Copyright © 2025-2026 Nikolaos Protopapas</Copyright>
+    <PackageProjectUrl>https://nickprotop.github.io/ConsoleEx/</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/nickprotop/ConsoleEx</RepositoryUrl>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <PackageTags>tui terminal-ui console-ui debugger diagnostics dotnet-tool cli sharpconsoleui</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The parser and the formatters are internal and tested directly: they
+         are where a rule lives, and driving the whole binary to assert one is
+         slower and says less about which rule broke. -->
+    <InternalsVisibleTo Include="cxdbg.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The folder's own README is the package's front page: one document, so
+         a reader on NuGet and a reader in the repository cannot be told two
+         different things. -->
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The debugger is built with the thing it debugs. That is not a flourish:
+         it means every session is a live test of the library, and a layout bug
+         an adopter would hit shows up here first. -->
+    <ProjectReference Include="../../../../SharpConsoleUI/SharpConsoleUI.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Spectre.Console" />
+  </ItemGroup>
+
+</Project>

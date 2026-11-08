@@ -28,6 +28,8 @@ public class FocusManager
 	/// <summary>Fired whenever <see cref="FocusedControl"/> changes.</summary>
 	public event EventHandler<FocusChangedEventArgs>? FocusChanged;
 
+	private long _focusChangeSequence;
+
 	/// <summary>Initializes a new <see cref="FocusManager"/> for the given window.</summary>
 	public FocusManager(Window window)
 	{
@@ -85,34 +87,12 @@ public class FocusManager
 			{
 				if (path[i - 1] is IScrollableContainer scrollable)
 				{
-					var directChild = path[i];
-					if (ReferenceEquals(directChild, focusedWc))
-					{
-						// Focused control IS the direct child — reveal the whole child (unchanged behavior).
-						scrollable.ScrollChildIntoView(directChild);
-					}
-					else
-					{
-						// Focused control is nested deeper: reveal ITS actual row within the scroller, not the
-						// whole (possibly tall) intermediate container. Resolve the focused control's offset
-						// within the direct child from the layout subtree (works even when the focused control
-						// is off-viewport and was never painted); fall back to a paint-relative translation.
-						int rowInChild;
-						int focusedHeight;
-						if (Helpers.FocusScrollHelper.TryGetFocusedRowInDirectChild(directChild, focusedWc, out rowInChild, out focusedHeight))
-						{
-							scrollable.ScrollChildRegionIntoView(directChild, rowInChild, focusedHeight);
-						}
-						else
-						{
-							// Subtree resolution failed (self-scrolling child, or a topology we can't probe). The focused
-							// control's live ActualY is unreliable when it is off-viewport, so fall back to revealing the
-							// whole direct child - the historical ScrollChildIntoView behavior. Passing the child's full
-							// height to ScrollRangeIntoView keeps the tall-child guard active, so an already-visible tall
-							// container is not jumped to its top (#67), and a self-scrolling child reveals its own leaf.
-							scrollable.ScrollChildIntoView(directChild);
-						}
-					}
+					// Reveal the focused control's own row rather than the whole (possibly tall)
+					// intermediate container. The overload handles both shapes: the focused control
+					// BEING the direct child degrades to revealing that child, and a topology the row
+					// probe cannot read falls back to the same thing - which keeps the tall-child guard
+					// active so an already-visible container is not jumped to its top (#67).
+					Helpers.FocusScrollHelper.RevealNestedTarget(scrollable, path[i], focusedWc);
 				}
 			}
 		}
@@ -120,7 +100,16 @@ public class FocusManager
 		// Invalidate new control's container to trigger repaint
 		(control as IWindowControl)?.Container?.Invalidate(Invalidation.Relayout);
 
-		FocusChanged?.Invoke(this, new FocusChangedEventArgs(previous, control, reason));
+		// Raise GotFocus / LostFocus on the controls themselves as well as through FocusChanged.
+		// A control only receives FocusChanged if it managed to subscribe, which requires its window
+		// to be reachable when its Container was set — not the case when a container is populated
+		// before it joins a window, as the fluent builders do (#81). Both paths are idempotent per
+		// sequence, so a control reached twice still sees one event.
+		long sequence = ++_focusChangeSequence;
+		(previous as BaseControl)?.RaiseLostFocus(sequence);
+		(control as BaseControl)?.RaiseGotFocus(sequence);
+
+		FocusChanged?.Invoke(this, new FocusChangedEventArgs(previous, control, reason) { Sequence = sequence });
 	}
 
 	/// <summary>Returns <c>true</c> if <paramref name="control"/> is the currently focused control.</summary>
@@ -160,6 +149,55 @@ public class FocusManager
 
 		var scope = FindInnermostScope(FocusedControl);
 		MoveWithinScope(scope, FocusedControl, backward);
+	}
+
+	/// <summary>
+	/// Every control Tab can reach in this window, in the order Tab reaches them.
+	/// </summary>
+	/// <returns>The focus stops, forward order, empty when the window has none.</returns>
+	/// <remarks>
+	/// <para>
+	/// A control can be present in the layout tree, enabled and marked focusable
+	/// and still be unreachable, because the scope it sits in never offers it.
+	/// A snapshot cannot show that and the layout tree cannot either, so it is
+	/// usually found by a user reporting that Tab skips a field.
+	/// </para>
+	/// <para>
+	/// Answered by WALKING focus rather than by reimplementing the rules - the
+	/// scope traversal has real subtlety in it, and a second copy would drift
+	/// from the behaviour it claims to describe. The walk drives the real
+	/// machinery and puts the focus back where it found it.
+	/// </para>
+	/// </remarks>
+	public IReadOnlyList<IFocusableControl> ReachableControls()
+	{
+		var restore = FocusedControl;
+		var seen = new List<IFocusableControl>();
+
+		try
+		{
+			SetFocus(null, FocusReason.Programmatic);
+			MoveFocus(backward: false);
+
+			var first = FocusedControl;
+			if (first == null) return Array.Empty<IFocusableControl>();
+
+			// Bounded by the stops already seen rather than by a guessed limit:
+			// focus wraps, so returning to the first stop is the end of the ring,
+			// and a scope that offered the same control twice would otherwise
+			// spin here forever.
+			while (FocusedControl != null && !seen.Contains(FocusedControl))
+			{
+				seen.Add(FocusedControl);
+				MoveFocus(backward: false);
+			}
+
+			return seen;
+		}
+		finally
+		{
+			SetFocus(restore, FocusReason.Programmatic);
+		}
 	}
 
 	/// <summary>
@@ -316,4 +354,12 @@ public record FocusChangedEventArgs(
 	IFocusableControl? Previous,
 	IFocusableControl? Current,
 	FocusReason Reason
-);
+)
+{
+	/// <summary>
+	/// Monotonic id of this focus change, used to deliver GotFocus / LostFocus exactly once when a
+	/// control is reached both through <see cref="FocusManager.FocusChanged"/> and directly by the
+	/// manager. Defaults to -1 for args constructed outside the manager.
+	/// </summary>
+	public long Sequence { get; init; } = -1;
+}

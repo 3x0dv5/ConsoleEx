@@ -8,8 +8,11 @@
 
 #pragma warning disable CS1591
 
+using System.Runtime.CompilerServices;
+using AngleSharp.Css;
 using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
+using SharpConsoleUI.Helpers;
 
 namespace SharpConsoleUI.Html
 {
@@ -19,6 +22,18 @@ namespace SharpConsoleUI.Html
 	public struct ResolvedStyle
 	{
 		public Color Foreground;
+
+		/// <summary>
+		/// True when <see cref="Foreground"/> came from the page rather than from the caller's default.
+		/// </summary>
+		/// <remarks>
+		/// Lets a link keep a colour the page chose for it while still defaulting
+		/// to the theme's link colour when the page is silent. Without the
+		/// distinction an anchor is always repainted, so a page that styles its
+		/// own links - and whose background may have been adopted to match - loses
+		/// the one colour it cared most about.
+		/// </remarks>
+		public bool ForegroundFromPage;
 		public Color Background;
 		public TextDecoration Decorations;
 		public TextAlignment Alignment;
@@ -70,32 +85,225 @@ namespace SharpConsoleUI.Html
 			["fuchsia"] = Color.Fuchsia,
 		};
 
+		// The CSS-derived part of an element's style depends only on the element, never on
+		// the caller's default colors, so it is computed once per element and reused by every
+		// later layout pass (image batches, resizes). Colors stay nullable so each caller's
+		// defaults still apply where the CSS sets none.
+		private readonly struct CachedStyle
+		{
+			public readonly ICssStyleDeclaration? Declaration;
+			public readonly ResolvedStyle Style;
+			public readonly Color? Foreground;
+			public readonly Color? Background;
+
+			public CachedStyle(ICssStyleDeclaration? declaration, ResolvedStyle style, Color? foreground, Color? background)
+			{
+				Declaration = declaration;
+				Style = style;
+				Foreground = foreground;
+				Background = background;
+			}
+		}
+
+		private sealed class DocumentStyles
+		{
+			public IStyleCollection? Styles;
+			public readonly Dictionary<IElement, CachedStyle> Elements = new();
+		}
+
+		// Keyed weakly on the document, so the cache lives exactly as long as the parsed DOM.
+		// The DOM must not change after its elements are first resolved; HtmlLayoutEngine only
+		// rewrites URLs right after parsing, before any layout.
+		private static readonly ConditionalWeakTable<IDocument, DocumentStyles> _documentStyles = new();
+
+		// Properties whose cascaded value may still hold var()/calc(), which only the full
+		// (much slower) computed-style path can resolve.
+		private static readonly string[] UnresolvedCheckProperties =
+		{
+			"color", "background-color", "display", "border", "border-style", "width",
+			"margin-top", "margin-bottom", "margin-left", "margin-right",
+			"padding-top", "padding-bottom", "padding-left", "padding-right",
+		};
+
 		/// <summary>
 		/// Resolves the effective style for the given element.
 		/// </summary>
 		public static ResolvedStyle Resolve(IElement element, Color defaultFg, Color defaultBg)
 		{
-			var style = new ResolvedStyle
+			var cached = GetCachedStyle(element);
+			var style = cached.Style;
+
+			style.Background = cached.Background ?? defaultBg;
+
+			// A page picks its text colours for ITS background, and a terminal
+			// rarely has that background. Hacker News sets a:link to black, which
+			// is right on its cream page and invisible on a dark terminal: every
+			// story title vanished while the page looked merely empty.
+			//
+			// The page's choice is still honoured - the colour arrives as asked
+			// whenever it can be read - and only lifted to the floor when it
+			// cannot. EnsureContrastRatio moves it the shortest distance that
+			// works and keeps its hue, so a dark red link comes back a readable
+			// red rather than the theme's accent.
+			// Checked whether the colour came from the page or from the terminal.
+			// Only the page's own colours needed it at first, but once a page can
+			// supply the BACKGROUND too the default foreground is just as exposed:
+			// the terminal's white on a page's cream surface reads 1.09:1, which
+			// is the same invisible text arrived at from the other side.
+			style.ForegroundFromPage = cached.Foreground.HasValue;
+			style.Foreground = PaletteColors.EnsureContrastRatio(
+				cached.Foreground ?? defaultFg, style.Background, PaletteColors.TextContrast);
+
+			return style;
+		}
+
+		private static CachedStyle GetCachedStyle(IElement element)
+		{
+			var document = element.Owner;
+			if (document == null)
+				return ComputeStyle(element, ComputeCurrentStyleSafe(element));
+
+			var docStyles = _documentStyles.GetValue(document, _ => new DocumentStyles());
+			lock (docStyles)
 			{
-				Foreground = defaultFg,
-				Background = defaultBg,
-				Decorations = TextDecoration.None,
-				Alignment = TextAlignment.Left,
-			};
+				if (docStyles.Elements.TryGetValue(element, out var cached))
+					return cached;
 
-			// Walk ancestors to accumulate inherited decorations from semantic tags
-			style.Decorations = GetInheritedDecorations(element);
+				docStyles.Styles ??= CreateStyleCollection(document);
 
-			// Read computed CSS (may throw on complex media queries without a render device)
-			ICssStyleDeclaration? css;
+				// Compute top-down from the nearest cached ancestor: each element inherits
+				// from its parent's declaration instead of AngleSharp re-cascading the whole
+				// ancestor chain for every element (that walk made large pages take seconds).
+				var pending = new Stack<IElement>();
+				for (var e = element; e != null && !docStyles.Elements.ContainsKey(e); e = e.ParentElement)
+					pending.Push(e);
+
+				while (pending.Count > 0)
+				{
+					var e = pending.Pop();
+					ICssStyleDeclaration? parentDeclaration = null;
+					if (e.ParentElement != null && docStyles.Elements.TryGetValue(e.ParentElement, out var parentStyle))
+						parentDeclaration = parentStyle.Declaration;
+
+					var declaration = docStyles.Styles != null
+						? ComputeDeclaration(docStyles.Styles, e, parentDeclaration)
+						: ComputeCurrentStyleSafe(e);
+					docStyles.Elements[e] = ComputeStyle(e, declaration);
+				}
+
+				return docStyles.Elements[element];
+			}
+		}
+
+		/// <summary>
+		/// The render device used when the browsing context registers none.
+		/// </summary>
+		/// <remarks>
+		/// Immutable and shared: AngleSharp only reads it. Device and viewport are
+		/// separate properties and both are set, because media queries and
+		/// relative lengths read the viewport pair.
+		/// </remarks>
+		private static readonly DefaultRenderDevice NominalDevice = new()
+		{
+			DeviceWidth = (int)HtmlConstants.CssViewportWidthPx,
+			DeviceHeight = (int)HtmlConstants.CssViewportHeightPx,
+			ViewPortWidth = (int)HtmlConstants.CssViewportWidthPx,
+			ViewPortHeight = (int)HtmlConstants.CssViewportHeightPx,
+			FontSize = (int)HtmlConstants.CssRootFontSizePx
+		};
+
+		private static IStyleCollection? CreateStyleCollection(IDocument document)
+		{
 			try
 			{
-				css = element.ComputeCurrentStyle();
+				var window = document.DefaultView;
+				if (window == null)
+					return null;
+				// A bare DefaultRenderDevice reports a zero viewport, and a zero
+				// viewport makes every (min-width: N) false and every
+				// (max-width: N) true. The synchronous context registers no
+				// device, so this fallback is what the common path uses: it has
+				// to state the same nominal page the engine states everywhere
+				// else, or a page laid out before its CSS arrives gets a phone
+				// layout and the one laid out after gets a desktop one.
+				var device = document.Context?.GetService<IRenderDevice>() ?? NominalDevice;
+				return window.GetStyleCollection(device);
 			}
 			catch
 			{
-				css = null;
+				return null;
 			}
+		}
+
+		private static ICssStyleDeclaration? ComputeDeclaration(IStyleCollection styles, IElement element, ICssStyleDeclaration? parent)
+		{
+			ICssStyleDeclaration? cascaded;
+			try
+			{
+				cascaded = styles.ComputeCascadedStyle(element, parent!);
+			}
+			catch
+			{
+				cascaded = null;
+			}
+
+			if (cascaded != null && !HasUnresolvedValues(cascaded))
+				return cascaded;
+
+			try
+			{
+				return styles.ComputeDeclarations(element);
+			}
+			catch
+			{
+				return cascaded;
+			}
+		}
+
+		private static bool HasUnresolvedValues(ICssStyleDeclaration css)
+		{
+			try
+			{
+				foreach (var property in UnresolvedCheckProperties)
+				{
+					var value = css.GetPropertyValue(property);
+					if (value.Contains("var(", StringComparison.OrdinalIgnoreCase) ||
+						value.Contains("calc(", StringComparison.OrdinalIgnoreCase))
+						return true;
+				}
+				return false;
+			}
+			catch
+			{
+				return true;
+			}
+		}
+
+		private static ICssStyleDeclaration? ComputeCurrentStyleSafe(IElement element)
+		{
+			// May throw on complex media queries without a render device
+			try
+			{
+				return element.ComputeCurrentStyle();
+			}
+			catch
+			{
+				return null;
+			}
+		}
+
+		private static CachedStyle ComputeStyle(IElement element, ICssStyleDeclaration? css)
+		{
+			var style = new ResolvedStyle
+			{
+				Decorations = TextDecoration.None,
+				Alignment = TextAlignment.Left,
+			};
+			Color? foreground = null;
+			Color? background = null;
+
+			// Walk ancestors to accumulate inherited decorations from semantic tags
+			style.Decorations = GetInheritedDecorations(element);
 
 			if (css != null)
 			{
@@ -143,18 +351,14 @@ namespace SharpConsoleUI.Html
 					var color = css.GetPropertyValue("color");
 					if (!string.IsNullOrEmpty(color))
 					{
-						var parsed = ParseCssColor(color);
-						if (parsed.HasValue)
-							style.Foreground = parsed.Value;
+						foreground = ParseCssColor(color);
 					}
 
 					// Background color
 					var bgColor = css.GetPropertyValue("background-color");
 					if (!string.IsNullOrEmpty(bgColor))
 					{
-						var parsed = ParseCssColor(bgColor);
-						if (parsed.HasValue)
-							style.Background = parsed.Value;
+						background = ParseCssColor(bgColor);
 					}
 
 					// Text alignment
@@ -240,7 +444,7 @@ namespace SharpConsoleUI.Html
 				}
 			}
 
-			return style;
+			return new CachedStyle(css, style, foreground, background);
 		}
 
 		/// <summary>
@@ -415,6 +619,70 @@ namespace SharpConsoleUI.Html
 			}
 
 			return 0;
+		}
+
+		/// <summary>
+		/// Parses a CSS length to CSS pixels, leaving the conversion to columns to the caller.
+		/// </summary>
+		/// <param name="value">A CSS length: <c>220px</c>, <c>12em</c>, <c>50%</c>, or a bare number.</param>
+		/// <returns>The length in CSS pixels, or null if it is absent, <c>auto</c>, or unparseable.</returns>
+		/// <remarks>
+		/// <para>
+		/// Images need the pixels, not the columns. <see cref="ParsePxToChars"/>
+		/// bakes in a fixed pixels-per-column ratio, which is right for a margin
+		/// (a margin IS a few columns however wide the window is) and wrong for an
+		/// image, whose size is relative to the page it was designed for. Dividing
+		/// first and rescaling after loses the precision and hides the decision.
+		/// </para>
+		/// <para>
+		/// A percentage resolves against the same content column the caller then
+		/// divides by, so <c>width: 50%</c> comes back as half of it and goes on
+		/// to claim half the columns - which is what the page asked for. The two
+		/// have to agree: resolving a percentage against one frame and measuring
+		/// it against a narrower one would silently inflate every percentage
+		/// width on the page.
+		/// </para>
+		/// </remarks>
+		public static double? ParseCssPixels(string? value)
+		{
+			if (string.IsNullOrWhiteSpace(value))
+				return null;
+
+			value = value.Trim();
+			if (value.Equals("auto", StringComparison.OrdinalIgnoreCase) || value == "0")
+				return null;
+
+			var invariant = System.Globalization.CultureInfo.InvariantCulture;
+			const System.Globalization.NumberStyles Float = System.Globalization.NumberStyles.Float;
+
+			if (value.EndsWith("%", StringComparison.Ordinal))
+			{
+				if (double.TryParse(value.AsSpan(0, value.Length - 1), Float, invariant, out var pct) && pct > 0)
+					return HtmlConstants.CssContentWidthPx * Math.Min(100.0, pct) / 100.0;
+				return null;
+			}
+
+			if (value.EndsWith("em", StringComparison.OrdinalIgnoreCase)
+				|| value.EndsWith("rem", StringComparison.OrdinalIgnoreCase))
+			{
+				int unitLength = value.EndsWith("rem", StringComparison.OrdinalIgnoreCase) ? 3 : 2;
+				if (double.TryParse(value.AsSpan(0, value.Length - unitLength), Float, invariant, out var em) && em > 0)
+					return em * HtmlConstants.CssRootFontSizePx;
+				return null;
+			}
+
+			if (value.EndsWith("px", StringComparison.OrdinalIgnoreCase))
+			{
+				if (double.TryParse(value.AsSpan(0, value.Length - 2), Float, invariant, out var px) && px > 0)
+					return px;
+				return null;
+			}
+
+			// A bare number in an HTML length context is pixels.
+			if (double.TryParse(value, Float, invariant, out var bare) && bare > 0)
+				return bare;
+
+			return null;
 		}
 	}
 }

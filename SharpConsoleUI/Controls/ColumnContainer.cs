@@ -34,14 +34,12 @@ namespace SharpConsoleUI.Controls
 		private IColumnGridOwner? _owner;
 		private bool _isEnabled = true;
 		private Margin _margin = new Margin(0, 0, 0, 0);
-		private StickyPosition _stickyPosition = StickyPosition.None;
+		private Layout.Dock _dock = Layout.Dock.None;
 		private bool _visible = true;
 		private int? _width;
 		private int? _height;
 
 		// Double-click detection
-		private DateTime _lastClickTime = DateTime.MinValue;
-		private Point _lastClickPosition = Point.Empty;
 		private int _doubleClickThresholdMs = Configuration.ControlDefaults.DefaultDoubleClickThresholdMs;
 		private bool _doubleClickEnabled = true;
 
@@ -93,9 +91,22 @@ namespace SharpConsoleUI.Controls
 		private bool _propagatingWindowSystem = false;
 
 		/// <inheritdoc/>
+		/// <remarks>
+		/// Falls back to a LIVE lookup through the owning grid when the cache is empty. The cache is
+		/// filled by the grid's Container setter, which reads the window system off the new parent at
+		/// the moment of attachment. That read returns null whenever the grid is attached to a parent
+		/// that is not itself attached yet, which is the normal order for a built tree: a panel is
+		/// filled, the grid goes into the panel, and only then does the panel reach the window. The
+		/// cache was then never refilled, because nothing re-runs the grid's setter when the
+		/// GRANDPARENT is attached, so every control in the column resolved its colors through a null
+		/// window system and fell through to its own hardcoded literal: on the Radio Buttons demo
+		/// under Slate, cyan markers on an otherwise correctly themed page.
+		/// Reading through the owner on demand cannot go stale, since the owner's own Container
+		/// pointer is always current by the time anything paints.
+		/// </remarks>
 		public ConsoleWindowSystem? GetConsoleWindowSystem
 		{
-			get => _consoleWindowSystem;
+			get => _consoleWindowSystem ?? _owner?.Container?.GetConsoleWindowSystem;
 			set
 			{
 				// Avoid redundant work if value unchanged
@@ -208,9 +219,15 @@ namespace SharpConsoleUI.Controls
 
 		/// <summary>
 		/// Gets or sets the double-click threshold in milliseconds.
-		/// Two clicks within this time window are considered a double-click.
-		/// Default: 500ms, minimum: 100ms.
 		/// </summary>
+		/// <remarks>
+		/// No longer consulted. The double click is derived once, by
+		/// <c>MouseGestureRecognizer</c>, so that every control agrees on what one
+		/// is; this container used to run a second clock beside it and the two
+		/// agreed only by accident. Kept because it is public API, and because
+		/// setting it was never harmful - only ineffective from here on.
+		/// Configure the timing on the recognizer instead.
+		/// </remarks>
 		public int DoubleClickThresholdMs
 		{
 			get => _doubleClickThresholdMs;
@@ -382,12 +399,33 @@ namespace SharpConsoleUI.Controls
 		}
 
 		/// <inheritdoc/>
+		/// <remarks>Projected onto <see cref="Dock"/>; see <see cref="IWindowControl.Dock"/>.</remarks>
 		public StickyPosition StickyPosition
 		{
-			get => _stickyPosition;
+			get => _dock switch
+			{
+				Layout.Dock.Top => StickyPosition.Top,
+				Layout.Dock.Bottom => StickyPosition.Bottom,
+				_ => StickyPosition.None,
+			};
+			set => Dock = value switch
+			{
+				StickyPosition.Top => Layout.Dock.Top,
+				StickyPosition.Bottom => Layout.Dock.Bottom,
+				_ => Layout.Dock.None,
+			};
+		}
+
+		/// <inheritdoc/>
+		public Layout.Dock Dock
+		{
+			get => _dock;
 			set
 			{
-				_stickyPosition = value;
+				if (_dock == value)
+					return;
+
+				_dock = value;
 				Invalidate(Invalidation.Relayout);
 			}
 		}
@@ -586,7 +624,40 @@ namespace SharpConsoleUI.Controls
 		}
 
 		/// <summary>
-		/// Removes a child control from this column and disposes it.
+		/// Removes a child from this column WITHOUT disposing it, so the caller can add it back or
+		/// place it elsewhere later.
+		/// </summary>
+		/// <remarks>
+		/// <see cref="RemoveContent"/> disposes what it removes, which is correct when the column
+		/// owns its children and is the right default. A caller that keeps its own reference and
+		/// intends to re-add the same instance needs this instead: a control whose root is a
+		/// <see cref="ScrollablePanelControl"/> does not merely detach on dispose, it CLEARS its
+		/// child list, so re-adding a disposed page yields an empty one.
+		/// </remarks>
+		/// <param name="content">The control to detach.</param>
+		/// <returns><c>true</c> if the control was a child of this column and was detached.</returns>
+		public bool DetachContent(IWindowControl content)
+		{
+			bool removed;
+			lock (_contentsLock)
+			{
+				removed = _contents.Remove(content);
+			}
+
+			if (removed)
+			{
+				content.Container = null;
+
+				(this as IWindowControl).GetParentWindow()?.ForceRebuildLayout();
+				Invalidate(Invalidation.Relayout);
+			}
+
+			return removed;
+		}
+
+		/// <summary>
+		/// Removes a child control from this column and disposes it. Use
+		/// <see cref="DetachContent"/> instead when the same instance will be added back later.
 		/// </summary>
 		/// <param name="content">The control to remove.</param>
 		public void RemoveContent(IWindowControl content)
@@ -1057,36 +1128,18 @@ namespace SharpConsoleUI.Controls
 					if (args.HasFlag(MouseFlags.Button1DoubleClicked) && _doubleClickEnabled)
 					{
 						// Reset tracking state since driver handled the gesture
-						_lastClickTime = DateTime.MinValue;
-						_lastClickPosition = Point.Empty;
 
 						MouseDoubleClick?.Invoke(this, contentArgs);
 						return true;
 					}
 
-					// Method 2: Manual timer-based detection (fallback)
+					// A click is a click. MouseDoubleClick belongs to the
+					// Button1DoubleClicked branch above: the recognizer is the one
+					// place that decides what a double click is, and this "fallback"
+					// was a second opinion that agreed only by accident.
 					if (args.HasFlag(MouseFlags.Button1Clicked))
 					{
-						// Detect double-click
-						var now = DateTime.UtcNow;
-						var timeSince = (now - _lastClickTime).TotalMilliseconds;
-						bool isDoubleClick = _doubleClickEnabled &&
-											 args.Position == _lastClickPosition &&
-											 timeSince <= _doubleClickThresholdMs;
-
-						_lastClickTime = now;
-						_lastClickPosition = args.Position;
-
-						// Mutually exclusive: Fire either MouseDoubleClick OR MouseClick
-						if (isDoubleClick)
-						{
-							MouseDoubleClick?.Invoke(this, contentArgs);
-						}
-						else
-						{
-							MouseClick?.Invoke(this, contentArgs);
-						}
-
+						MouseClick?.Invoke(this, contentArgs);
 						return true;
 					}
 				}

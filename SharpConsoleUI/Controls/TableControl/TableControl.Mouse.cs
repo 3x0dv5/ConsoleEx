@@ -11,6 +11,7 @@ using SharpConsoleUI.Drivers;
 using SharpConsoleUI.Events;
 using SharpConsoleUI.Extensions;
 using SharpConsoleUI.Helpers;
+using SharpConsoleUI.Helpers.Scrollbar;
 namespace SharpConsoleUI.Controls;
 
 public partial class TableControl
@@ -75,7 +76,9 @@ public partial class TableControl
 			return true;
 		}
 
-		// Right-click: select row/cell first, then fire event
+		// Right-click: select row/cell first, then fire event. When multi-select is enabled, this also
+		// extends the range from the anchor to the clicked row (a Shift+click stand-in, since this
+		// terminal does not deliver Shift/Ctrl mouse-click modifiers - see ExtendOrMoveSelection).
 		if (args.HasFlag(MouseFlags.Button3Clicked))
 		{
 			if (_isEditing)
@@ -85,6 +88,13 @@ public partial class TableControl
 			int rowIdx = GetRowIndexAtY(args.Position.Y);
 			if (rowIdx >= 0)
 			{
+				if (_multiSelectEnabled && _rightClickExtendsSelection)
+				{
+					int anchor = _selectionAnchorRowIndex >= 0 ? _selectionAnchorRowIndex : _selectedRowIndex;
+					_selectionAnchorRowIndex = anchor;
+					_selectedRowIndices.Clear();
+					SelectRange(anchor, rowIdx);
+				}
 				SetSelectedRow(rowIdx);
 				if (_cellNavigationEnabled)
 				{
@@ -115,7 +125,7 @@ public partial class TableControl
 			if (args.HasFlag(MouseFlags.ButtonShift))
 			{
 				int oldH = _horizontalScrollOffset;
-				_horizontalScrollOffset = Math.Max(0, _horizontalScrollOffset - ControlDefaults.DefaultScrollWheelLines);
+				_horizontalScrollOffset = Math.Max(0, _horizontalScrollOffset - _mouseWheelScrollSpeed);
 				if (_horizontalScrollOffset != oldH)
 				{
 					Invalidate(Invalidation.Relayout);
@@ -125,7 +135,7 @@ public partial class TableControl
 			}
 
 			int oldOffset = _scrollOffset;
-			ScrollOffset = Math.Max(0, _scrollOffset - ControlDefaults.DefaultScrollWheelLines);
+			ScrollOffset = Math.Max(0, _scrollOffset - _mouseWheelScrollSpeed);
 			return _scrollOffset != oldOffset; // bubble if didn't scroll
 		}
 
@@ -134,7 +144,7 @@ public partial class TableControl
 			if (args.HasFlag(MouseFlags.ButtonShift))
 			{
 				int oldH = _horizontalScrollOffset;
-				_horizontalScrollOffset += ControlDefaults.DefaultScrollWheelLines;
+				_horizontalScrollOffset += _mouseWheelScrollSpeed;
 				if (_horizontalScrollOffset != oldH)
 				{
 					Invalidate(Invalidation.Relayout);
@@ -145,7 +155,7 @@ public partial class TableControl
 
 			int oldOffset = _scrollOffset;
 			int maxOffset = Math.Max(0, RowCount - GetVisibleRowCount());
-			ScrollOffset = Math.Min(maxOffset, _scrollOffset + ControlDefaults.DefaultScrollWheelLines);
+			ScrollOffset = Math.Min(maxOffset, _scrollOffset + _mouseWheelScrollSpeed);
 			return _scrollOffset != oldOffset; // bubble if didn't scroll
 		}
 
@@ -156,6 +166,13 @@ public partial class TableControl
 			// Cancel any active edit before starting a new one
 			if (_isEditing)
 				CancelEdit();
+
+			if (TryHandleClick(HitTest(args.Position.X, args.Position.Y), 2, args))
+			{
+				ResetClickPairing();
+				MouseDoubleClick?.Invoke(this, args);
+				return true;
+			}
 
 			int rowIdx = GetRowIndexAtY(args.Position.Y);
 			if (rowIdx >= 0)
@@ -335,22 +352,82 @@ public partial class TableControl
 
 			// Fresh press over a data row: just move the cursor, don't touch multi-select state
 			// (multi-select toggling happens on the Button1Clicked / Up phase to avoid double-toggle).
+			// EXCEPTION: a Shift-click's range (Up phase below) is anchored on whatever _selectedRowIndex
+			// was BEFORE this click - moving it here first would make every range collapse to just the
+			// pressed row (anchor == target).
 			int pressRow = GetRowIndexAtY(args.Position.Y);
-			if (pressRow >= 0)
+
+			// A plain (no Ctrl/Shift) press on a data row seeds a click-and-drag range select - the mouse-only
+			// stand-in for Shift+Click, since terminals routinely swallow Shift+Click for native text selection.
+			_isRowDragSelecting = _multiSelectEnabled && pressRow >= 0 && !IsClickOnHeader(args)
+				&& !args.HasFlag(MouseFlags.ButtonShift) && !args.HasFlag(MouseFlags.ButtonCtrl)
+				&& !(_checkboxMode && IsClickOnCheckbox(args.Position.X));
+
+			// A Ctrl-held press on a data row seeds a Ctrl+drag: additional ranges added on top of whatever
+			// was already selected, instead of the plain drag's "replace the whole selection" behavior.
+			bool isCtrlDragSelecting = _multiSelectEnabled && pressRow >= 0 && !IsClickOnHeader(args)
+				&& args.HasFlag(MouseFlags.ButtonCtrl) && !args.HasFlag(MouseFlags.ButtonShift)
+				&& !(_checkboxMode && IsClickOnCheckbox(args.Position.X));
+			_ctrlDragBaseSelection = isCtrlDragSelecting ? new HashSet<int>(_selectedRowIndices) : null;
+
+			if (_isRowDragSelecting || isCtrlDragSelecting)
+				_selectionAnchorRowIndex = pressRow;
+
+			if (pressRow >= 0 && !(_multiSelectEnabled && args.HasFlag(MouseFlags.ButtonShift)))
 				SetSelectedRow(pressRow);
 			return true;
 		}
 
 		if (phase == GesturePhase.Move)
 		{
-			// A cell drag stays owned by the cells area; nothing to extend here.
+			// A cell drag stays owned by the cells area. A plain-press drag seeded above extends the
+			// multi-select range live to the row under the pointer.
+			if (_isRowDragSelecting)
+			{
+				int dragRowIdx = GetRowIndexAtY(args.Position.Y);
+				if (dragRowIdx >= 0)
+				{
+					_selectedRowIndices.Clear();
+					SelectRange(_selectionAnchorRowIndex, dragRowIdx);
+					SetSelectedRow(dragRowIdx);
+				}
+			}
+			else if (_ctrlDragBaseSelection != null)
+			{
+				// Recompute from the pre-drag snapshot each time (rather than accumulating) so backtracking
+				// the pointer past the anchor correctly drops rows the live preview had added.
+				int dragRowIdx = GetRowIndexAtY(args.Position.Y);
+				if (dragRowIdx >= 0)
+				{
+					_selectedRowIndices.Clear();
+					_selectedRowIndices.UnionWith(_ctrlDragBaseSelection);
+					SelectRange(_selectionAnchorRowIndex, dragRowIdx);
+					SetSelectedRow(dragRowIdx);
+				}
+			}
 			return true;
 		}
 
 		// Up phase: the Button1Clicked discrete actions. If the release did not carry Button1Clicked
 		// (e.g. a bare Button1Released ending a press) there is nothing further to do.
+		// Captured once here (rather than read from the field below) so every exit path from this phase -
+		// header sort, empty-area click, or a normal row click - consistently ends the drag-select gesture.
+		bool wasDragSelecting = _isRowDragSelecting;
+		HashSet<int>? ctrlDragBase = _ctrlDragBaseSelection;
+		_isRowDragSelecting = false;
+		_ctrlDragBaseSelection = null;
 		if (!args.HasFlag(MouseFlags.Button1Clicked))
 			return true;
+
+		// A derived table's own click handling comes first; a click it takes is not paired, sorted or
+		// selected on, but is still reported as a click.
+		var hit = HitTest(args.Position.X, args.Position.Y);
+		if (TryHandleClick(hit, CountClicks(hit.DisplayRowIndex), args))
+		{
+			ResetClickPairing();
+			MouseClick?.Invoke(this, args);
+			return true;
+		}
 
 		// Header sort
 		if (IsClickOnHeader(args))
@@ -382,7 +459,19 @@ public partial class TableControl
 		{
 			if (_multiSelectEnabled && args.HasFlag(MouseFlags.ButtonCtrl))
 			{
-				ToggleRowSelection(rowIdx);
+				// A completed Ctrl+drag (anchor differs from the release row) adds the whole dragged range
+				// on top of whatever was selected before the drag; a plain Ctrl+click (no movement) keeps the
+				// original single-row toggle behavior.
+				if (ctrlDragBase != null && _selectionAnchorRowIndex != rowIdx)
+				{
+					_selectedRowIndices.Clear();
+					_selectedRowIndices.UnionWith(ctrlDragBase);
+					SelectRange(_selectionAnchorRowIndex, rowIdx);
+				}
+				else
+				{
+					ToggleRowSelection(rowIdx);
+				}
 				SetSelectedRow(rowIdx);
 			}
 			else if (_multiSelectEnabled && args.HasFlag(MouseFlags.ButtonShift))
@@ -403,7 +492,7 @@ public partial class TableControl
 				if (_multiSelectEnabled)
 				{
 					// Clear checkboxes when clicking outside checkbox column
-					if (_checkboxMode && _dataSource == null)
+					if (_checkboxMode && _dataSource == null && ChecksFollowSelection)
 					{
 						lock (_tableLock)
 						{
@@ -411,7 +500,16 @@ public partial class TableControl
 								row.IsChecked = false;
 						}
 					}
+					// A click-and-drag range select (seeded on Down, extended on Move) finalizes here using its
+					// original press-row anchor, so a completed drag isn't collapsed back down to the single
+					// release row. A plain click (no drag) has anchor == rowIdx, so this degrades to the same
+					// single-row selection as before.
+					int anchor = wasDragSelecting && _selectionAnchorRowIndex >= 0 ? _selectionAnchorRowIndex : rowIdx;
 					_selectedRowIndices.Clear();
+					SelectRange(anchor, rowIdx);
+					// Re-anchor keyboard Shift+Up/Down range-select (see TableControl.Keyboard.cs) here too,
+					// so it starts fresh from wherever was just plain-clicked/dragged.
+					_selectionAnchorRowIndex = rowIdx;
 				}
 				SetSelectedRow(rowIdx);
 			}
@@ -427,24 +525,10 @@ public partial class TableControl
 				}
 			}
 
-			// Double-click detection
-			lock (_clickLock)
-			{
-				var now = DateTime.Now;
-				if (_lastClickRowIndex == rowIdx &&
-					(now - _lastClickTime).TotalMilliseconds < _doubleClickThresholdMs)
-				{
-					Core.AsyncEvent.Raise(RowActivated, RowActivatedAsync, this, rowIdx, Container?.GetConsoleWindowSystem?.LogService);
-					MouseDoubleClick?.Invoke(this, args);
-					_lastClickTime = DateTime.MinValue;
-					_lastClickRowIndex = -1;
-				}
-				else
-				{
-					_lastClickTime = now;
-					_lastClickRowIndex = rowIdx;
-				}
-			}
+			// A click selects, and only that. Activation belongs to the
+			// Button1DoubleClicked branch above, because the recognizer is the one
+			// place that decides what a double click is - a second opinion here
+			// would agree with it only by accident.
 		}
 
 		MouseClick?.Invoke(this, args);
@@ -453,10 +537,99 @@ public partial class TableControl
 
 	#endregion
 
+	#region Gestures Across Row Changes
+
+	/// <summary>
+	/// Ends what the pointer was in the middle of when the displayed rows change underneath it: a
+	/// first click waiting for its second, and a drag selecting a range.
+	/// </summary>
+	/// <remarks>
+	/// Both are held as display positions, which after a sort, a filter or a row change name other
+	/// rows. A click on Bob followed, after a sort, by a click at the same position on Dave paired
+	/// into a double-click and activated Dave; a drag carried on extending from a position its first
+	/// row had left. Hover is left alone on purpose: it follows the pointer, not a row, so the row now
+	/// under the pointer is the right one to highlight.
+	/// </remarks>
+	private void EndRowGestures()
+	{
+		ResetClickPairing();
+		_isRowDragSelecting = false;
+		_ctrlDragBaseSelection = null;
+	}
+
+	/// <summary>Kept for the drag state that <see cref="EndRowGestures"/> clears.</summary>
+	/// <remarks>
+	/// The click pairing it once reset is gone: the recognizer decides what a
+	/// double click is, so there is no per-control pairing left to forget.
+	/// </remarks>
+	private void ResetClickPairing()
+	{
+	}
+
+	/// <summary>
+	/// How many clicks the press path reports to <see cref="TryHandleClick"/>: always one.
+	/// </summary>
+	/// <remarks>
+	/// This read the table's own click pairing and could answer 2, which meant a
+	/// derived table saw a double click from here AND from the
+	/// <see cref="MouseFlags.Button1DoubleClicked"/> branch, which passes 2
+	/// directly. The recognizer is the only thing that decides a double click
+	/// now, so a press is one click by definition.
+	/// </remarks>
+	private static int CountClicks(int displayRowIndex) => 1;
+
+	#endregion
+
+	#region Clicks For Derived Tables
+
+	/// <summary>
+	/// Offers a click to a derived table before the table acts on it.
+	/// </summary>
+	/// <param name="hit">What the click landed on, as <see cref="HitTest"/> reports it.</param>
+	/// <param name="clickCount">
+	/// 2 when the click completes a double-click on the same row, by the table's own pairing or as a
+	/// double-click the terminal reported; 1 otherwise.
+	/// </param>
+	/// <param name="args">The mouse event.</param>
+	/// <returns>True when the click was handled and the table must do nothing more with it.</returns>
+	/// <remarks>
+	/// <para>
+	/// Called when a left click completes, before the table sorts by a header, changes the selection
+	/// or pairs the click into a double-click, and for a double-click the terminal reports itself.
+	/// By then any edit has been cancelled, the table has the focus, and the press has already moved
+	/// the cursor to the row under it, as TreeControl's clicks do.
+	/// </para>
+	/// <para>
+	/// Returning true suppresses the table's own handling and forgets the click, so two quick clicks
+	/// on, say, a tree's expander toggle it twice rather than activating the row. The table still
+	/// raises <see cref="MouseClick"/> or <see cref="MouseDoubleClick"/>, which report what the mouse
+	/// did, not what the table did with it.
+	/// </para>
+	/// <para>
+	/// Called on the UI thread, never while <see cref="SyncRoot"/> is held. A hook rather than an
+	/// overridable mouse handler, so a derived table takes the clicks it understands and leaves the
+	/// rest — scrollbars, resizing, drag selection — to the table.
+	/// </para>
+	/// </remarks>
+	protected virtual bool TryHandleClick(TableHitTestResult hit, int clickCount, MouseEventArgs args) => false;
+
+	#endregion
+
 	#region Hit Testing
 
 	private int GetRowIndexAtY(int relativeY)
 	{
+		// ONLY THE DATA AREA HOLDS ROWS. The arithmetic below walks down from the top through the
+		// title, border and header, but it knows nothing of what is painted BELOW the rows — the
+		// filter bar and its separator. A click there produced a row offset past the last row, which
+		// only the RowCount check rejected, and that check passes whenever the list is scrolled far
+		// enough that _scrollOffset plus the offset still lands on a real row: clicking "Row 1/25 /
+		// filter" jumped the selection to row 12. The painted bands say where the data actually ends,
+		// so ask them first and let the arithmetic resolve the row only within that band.
+		var bands = _geometry?.Lines;
+		if (bands.HasValue && bands.Value.DataBottom >= 0 && !bands.Value.IsData(relativeY))
+			return -1;
+
 		int dataStartY = 0;
 		bool hasBorder = _borderStyle != BorderStyle.None;
 
@@ -486,28 +659,11 @@ public partial class TableControl
 		return displayIndex;
 	}
 
-	private int GetColumnIndexAtX(int relativeX)
-	{
-		// Use rendered column geometry (populated during PaintDOM, works for both DataSource and in-memory)
-		for (int c = 0; c < _renderedColumnX.Length; c++)
-		{
-			int colStart = _renderedColumnX[c] - ActualX;
-			int colEnd = colStart + _renderedColumnWidths[c];
-			if (relativeX >= colStart && relativeX < colEnd)
-				return c;
-		}
-		return -1;
-	}
+	// The geometry of the last paint (works for both DataSource and in-memory), scrolled as painted.
+	private int GetColumnIndexAtX(int relativeX) => _geometry?.GetColumnAt(relativeX, out _) ?? -1;
 
-	private bool IsClickOnCheckbox(int relativeX)
-	{
-		if (!_checkboxMode || _renderedColumnX == null || _renderedColumnX.Length == 0) return false;
-		// Checkbox is a silent column rendered before the first data column
-		bool hasBorder = _borderStyle != BorderStyle.None;
-		int checkboxStart = _renderedColumnX[0] - ActualX - 4 - (hasBorder ? 1 : 0);
-		int checkboxEnd = checkboxStart + 4;
-		return relativeX >= checkboxStart && relativeX < checkboxEnd;
-	}
+	// Checkbox is a silent column rendered before the first data column
+	private bool IsClickOnCheckbox(int relativeX) => _checkboxMode && _geometry?.IsOnCheckbox(relativeX) == true;
 
 	private bool IsClickOnHeader(MouseEventArgs args) => IsOnHeaderRow(args.Position.Y);
 
@@ -527,6 +683,67 @@ public partial class TableControl
 	/// <summary>True if (x, y) is on the header row.</summary>
 	public bool IsOnHeader(int x, int y) => IsOnHeaderRow(y);
 
+	/// <summary>
+	/// Says what part of the table a position falls on: which zone, and which row, column and offset
+	/// within the cell where there is one.
+	/// </summary>
+	/// <param name="x">The x position, control-relative, as <see cref="MouseEventArgs.Position"/> reports it.</param>
+	/// <param name="y">The y position, control-relative.</param>
+	/// <returns>
+	/// The hit, or <see cref="TableHitTestResult.None"/> for a position on no part of the table and
+	/// for a table that has not been painted yet.
+	/// </returns>
+	/// <remarks>
+	/// <para>
+	/// Answered from where the last paint put everything, the same record the table's own mouse
+	/// handling reads, so it agrees with what is on screen: horizontal scrolling, borders, padded
+	/// separators and the checkbox column are accounted for, and the header need not be shown.
+	/// </para>
+	/// <para>
+	/// The scrollbars are tested first, as the table's own pointer handling tests them, so a
+	/// position on a scrollbar is reported as the scrollbar even where it overlaps a row.
+	/// </para>
+	/// </remarks>
+	public TableHitTestResult HitTest(int x, int y)
+	{
+		var geometry = _geometry;
+		if (geometry == null) return TableHitTestResult.None;
+
+		if (IsOnVerticalScrollbar(x))
+			return new TableHitTestResult(TableHitZone.VerticalScrollbar, -1, -1, -1, -1);
+		if (IsOnHorizontalScrollbar(y))
+			return new TableHitTestResult(TableHitZone.HorizontalScrollbar, -1, -1, -1, -1);
+
+		var lines = geometry.Lines;
+		if (y == lines.Title)
+			return new TableHitTestResult(TableHitZone.Title, -1, -1, -1, -1);
+
+		if (y == lines.Header)
+		{
+			int headerColumn = geometry.GetColumnAt(x, out int headerOffset);
+			return new TableHitTestResult(TableHitZone.Header, -1, -1, headerColumn, headerOffset);
+		}
+
+		if (lines.IsFilterBar(y))
+			return new TableHitTestResult(TableHitZone.FilterBar, -1, -1, -1, -1);
+
+		if (!lines.IsData(y))
+			return TableHitTestResult.None;
+
+		int displayRow = GetRowIndexAtY(y);
+		if (displayRow < 0)
+			return new TableHitTestResult(TableHitZone.EmptyDataArea, -1, -1, -1, -1);
+
+		int dataRow = MapDisplayToData(displayRow);
+		if (_checkboxMode && geometry.IsOnCheckbox(x))
+			return new TableHitTestResult(TableHitZone.Checkbox, displayRow, dataRow, -1, geometry.ToLogical(x));
+
+		int column = geometry.GetColumnAt(x, out int cellOffset);
+		return column >= 0
+			? new TableHitTestResult(TableHitZone.Cell, displayRow, dataRow, column, cellOffset)
+			: new TableHitTestResult(TableHitZone.Row, displayRow, dataRow, -1, -1);
+	}
+
 	/// <summary>Returns the Y coordinate of the header row, for unit-testing header hit detection.</summary>
 	internal int HeaderRowYForTest()
 	{
@@ -536,176 +753,154 @@ public partial class TableControl
 		return hy;
 	}
 
-	private bool IsClickOnVerticalScrollbar(MouseEventArgs args)
+	/// <summary>Returns the Y coordinate of the given display row index, for unit-testing row hit detection.</summary>
+	internal int RowYForTest(int displayIndex)
+	{
+		int dataStartY = Margin.Top;
+		if (!string.IsNullOrEmpty(_title)) dataStartY++;
+		if (_borderStyle != BorderStyle.None) dataStartY++;
+		if (_showHeader) dataStartY++;
+		if (_showHeader && _borderStyle != BorderStyle.None) dataStartY++;
+
+		int effectiveRowIndex = displayIndex - _scrollOffset;
+		int rowOffset = (_showRowSeparators && _borderStyle != BorderStyle.None) ? effectiveRowIndex * 2 : effectiveRowIndex;
+		return dataStartY + rowOffset;
+	}
+
+	private bool IsClickOnVerticalScrollbar(MouseEventArgs args) => IsOnVerticalScrollbar(args.Position.X);
+
+	private bool IsClickOnHorizontalScrollbar(MouseEventArgs args) => IsOnHorizontalScrollbar(args.Position.Y);
+
+	private bool IsOnVerticalScrollbar(int x)
 	{
 		if (!ShouldShowVerticalScrollbar()) return false;
-		int scrollbarX = ActualWidth - Margin.Right - 1;
-		return args.Position.X == scrollbarX;
+		var (barX, _, _) = GetVerticalScrollbarRect();
+		return x == barX;
 	}
 
-	private bool IsClickOnHorizontalScrollbar(MouseEventArgs args)
+	private bool IsOnHorizontalScrollbar(int y)
 	{
-		int maxY = ActualHeight - Margin.Bottom - 1;
-		return ShouldShowHorizontalScrollbar() && args.Position.Y == maxY;
+		if (!ShouldShowHorizontalScrollbar()) return false;
+		var (_, barY, _) = GetHorizontalScrollbarRect();
+		return y == barY;
 	}
 
+	/// <summary>
+	/// Whether a press lands on a column border of the HEADER row, where a resize starts.
+	/// </summary>
+	/// <remarks>
+	/// The header row only. Every row used to count, so with resizing on, a press within a cell of any
+	/// column border on any data row started a resize instead of selecting the row, and a click near a
+	/// border could not reach the row at all. Resizing already required the header to be shown.
+	/// </remarks>
 	private bool IsClickOnColumnBorder(MouseEventArgs args)
 	{
-		if (!_showHeader) return false;
-		for (int c = 0; c < _renderedColumnX.Length; c++)
-		{
-			int colEnd = _renderedColumnX[c] - ActualX + _renderedColumnWidths[c];
-			if (Math.Abs(args.Position.X - colEnd) <= 1)
-				return true;
-		}
-		return false;
+		if (!IsOnHeaderRow(args.Position.Y)) return false;
+		return _geometry?.GetColumnBorderAt(args.Position.X, ControlDefaults.TableColumnResizeHitTolerance) >= 0;
 	}
 
 	#endregion
 
 	#region Scrollbar Interaction
 
-	private int GetScrollbarContentHeight()
-	{
-		int dataStartY = Margin.Top;
-		if (!string.IsNullOrEmpty(_title)) dataStartY++;
-		if (_borderStyle != BorderStyle.None) dataStartY++;
-		if (_showHeader) dataStartY++;
-		if (_showHeader && _borderStyle != BorderStyle.None) dataStartY++;
-
-		int height = ActualHeight - dataStartY - Margin.Bottom;
-		if (_borderStyle != BorderStyle.None) height--; // bottom border
-		if (ShouldShowHorizontalScrollbar()) height--;
-		return Math.Max(0, height);
-	}
-
-	private int GetScrollbarDataStartY()
-	{
-		int dataStartY = Margin.Top;
-		if (!string.IsNullOrEmpty(_title)) dataStartY++;
-		if (_borderStyle != BorderStyle.None) dataStartY++;
-		if (_showHeader) dataStartY++;
-		if (_showHeader && _borderStyle != BorderStyle.None) dataStartY++;
-		return dataStartY;
-	}
-
 	private void HandleVerticalScrollbarThumbPress(MouseEventArgs args)
 	{
-		int contentAreaHeight = GetScrollbarContentHeight();
-		var (_, _, thumbY, thumbHeight) = GetVerticalScrollbarGeometry(contentAreaHeight);
-		int relY = args.Position.Y - GetScrollbarDataStartY();
+		var (_, rectY, rectHeight) = GetVerticalScrollbarRect();
+		var metrics = VerticalScrollbarMetrics(rectHeight);
+		int relY = args.Position.Y - rectY;
 
-		if (relY >= thumbY && relY < thumbY + thumbHeight)
+		if (ScrollbarInput.HitTest(metrics, relY) == ScrollbarHitZone.Thumb)
 		{
 			_vThumbDragging = true;
 			_scrollbarDragStartY = args.Position.Y;
-			_scrollbarDragStartOffset = _scrollOffset;
+			_scrollbarDragStartThumbPos = ScrollbarGeometry.ThumbPosForOffset(metrics);
 		}
 	}
 
 	private void HandleVerticalScrollbarClick(MouseEventArgs args)
 	{
-		int contentAreaHeight = GetScrollbarContentHeight();
-		var (_, trackHeight, thumbY, thumbHeight) = GetVerticalScrollbarGeometry(contentAreaHeight);
-		int relY = args.Position.Y - GetScrollbarDataStartY();
-		int maxOffset = Math.Max(0, RowCount - GetVisibleRowCount());
+		var (_, rectY, rectHeight) = GetVerticalScrollbarRect();
+		var metrics = VerticalScrollbarMetrics(rectHeight);
+		int relY = args.Position.Y - rectY;
 
-		if (relY == 0 && _scrollOffset > 0)
+		var zone = ScrollbarInput.HitTest(metrics, relY);
+
+		// Arrow/track clicks are gated on scrollability, exactly as before: an arrow at an
+		// already-exhausted end, or track on the side with nothing left to page, does nothing.
+		bool canApply = zone switch
 		{
-			// Arrow up
-			ScrollOffset = Math.Max(0, _scrollOffset - 1);
-		}
-		else if (relY == trackHeight - 1 && _scrollOffset < maxOffset)
+			ScrollbarHitZone.UpArrow => _scrollOffset > 0,
+			ScrollbarHitZone.DownArrow => _scrollOffset < ScrollbarGeometry.MaxOffset(metrics),
+			ScrollbarHitZone.TrackAbove => true,
+			ScrollbarHitZone.TrackBelow => true,
+			_ => false,
+		};
+
+		if (canApply)
 		{
-			// Arrow down
-			ScrollOffset = Math.Min(maxOffset, _scrollOffset + 1);
-		}
-		else if (relY < thumbY)
-		{
-			// Track above thumb: page up
-			ScrollOffset = Math.Max(0, _scrollOffset - GetVisibleRowCount());
-		}
-		else if (relY >= thumbY + thumbHeight)
-		{
-			// Track below thumb: page down
-			ScrollOffset = Math.Min(maxOffset, _scrollOffset + GetVisibleRowCount());
+			// Table's arrow step has always been a literal 1 row (not DefaultScrollWheelLines, which
+			// only governs the wheel handlers) — preserved here.
+			int newOffset = ScrollbarInput.OffsetForZone(metrics, zone, smallChange: 1, largeChange: GetVisibleRowCount());
+
+			// Route through the property (not the field) so a click participates in the AutoScroll
+			// detach/re-attach rule like every other user scroll. The setter clamps and invalidates.
+			ScrollOffset = newOffset;
 		}
 	}
 
 	private void HandleVerticalScrollbarDrag(MouseEventArgs args)
 	{
-		int contentAreaHeight = GetScrollbarContentHeight();
-		var (_, _, _, thumbHeight) = GetVerticalScrollbarGeometry(contentAreaHeight);
+		var (_, _, rectHeight) = GetVerticalScrollbarRect();
+		var metrics = VerticalScrollbarMetrics(rectHeight);
 
-		int totalRows = RowCount;
-		int visibleRows = GetVisibleRowCount();
-		int maxOffset = Math.Max(0, totalRows - visibleRows);
-		int trackRange = Math.Max(1, contentAreaHeight - thumbHeight);
+		if (ScrollbarGeometry.MaxOffset(metrics) <= 0) return;
 
-		if (maxOffset <= 0) return;
-
-		int deltaY = args.Position.Y - _scrollbarDragStartY;
-		int newOffset = _scrollbarDragStartOffset + (int)(deltaY * (double)maxOffset / trackRange);
+		int delta = args.Position.Y - _scrollbarDragStartY;
+		int newOffset = ScrollbarInput.OffsetForDrag(metrics, _scrollbarDragStartThumbPos, delta);
 
 		// Route through the property (not the field) so the drag participates in the AutoScroll
 		// detach/re-attach rule like every other user scroll. The setter clamps and invalidates.
 		ScrollOffset = newOffset;
 	}
 
-	private int GetScrollbarContentWidth()
-	{
-		int contentWidth = ActualWidth - Margin.Left - Margin.Right;
-		if (_borderStyle != BorderStyle.None) contentWidth -= 2; // left + right border
-		if (ShouldShowVerticalScrollbar()) contentWidth--;
-		return Math.Max(0, contentWidth);
-	}
-
 	private void HandleHorizontalScrollbarThumbPress(MouseEventArgs args)
 	{
-		int contentWidth = GetScrollbarContentWidth();
+		var (rectX, _, rectWidth) = GetHorizontalScrollbarRect();
 		int totalColumnsWidth = GetTotalColumnsWidth();
-		var (_, _, thumbX, thumbWidth) = GetHorizontalScrollbarGeometry(contentWidth, totalColumnsWidth);
+		var metrics = HorizontalScrollbarMetrics(rectWidth, totalColumnsWidth);
+		int relX = args.Position.X - rectX;
 
-		int relX = args.Position.X - Margin.Left;
-		if (_borderStyle != BorderStyle.None) relX--;
-
-		if (relX >= thumbX && relX < thumbX + thumbWidth)
+		if (ScrollbarInput.HitTest(metrics, relX) == ScrollbarHitZone.Thumb)
 		{
 			_hThumbDragging = true;
 			_scrollbarDragStartX = args.Position.X;
-			_scrollbarDragStartOffset = _horizontalScrollOffset;
+			_hScrollbarDragStartThumbPos = ScrollbarGeometry.ThumbPosForOffset(metrics);
 		}
 	}
 
 	private void HandleHorizontalScrollbarClick(MouseEventArgs args)
 	{
-		int contentWidth = GetScrollbarContentWidth();
+		var (rectX, _, rectWidth) = GetHorizontalScrollbarRect();
 		int totalColumnsWidth = GetTotalColumnsWidth();
-		var (_, trackWidth, thumbX, thumbWidth) = GetHorizontalScrollbarGeometry(contentWidth, totalColumnsWidth);
+		var metrics = HorizontalScrollbarMetrics(rectWidth, totalColumnsWidth);
+		int relX = args.Position.X - rectX;
+		int maxHScroll = ScrollbarGeometry.MaxOffset(metrics);
 
-		int relX = args.Position.X - Margin.Left;
-		if (_borderStyle != BorderStyle.None) relX--; // account for left border
-		int maxHScroll = Math.Max(0, totalColumnsWidth - contentWidth);
+		var zone = ScrollbarInput.HitTest(metrics, relX);
 
-		if (relX == 0 && _horizontalScrollOffset > 0)
+		bool canApply = zone switch
 		{
-			// Arrow left
-			_horizontalScrollOffset = Math.Max(0, _horizontalScrollOffset - 1);
-		}
-		else if (relX == trackWidth - 1 && _horizontalScrollOffset < maxHScroll)
+			ScrollbarHitZone.UpArrow => _horizontalScrollOffset > 0,
+			ScrollbarHitZone.DownArrow => _horizontalScrollOffset < maxHScroll,
+			ScrollbarHitZone.TrackAbove => true,
+			ScrollbarHitZone.TrackBelow => true,
+			_ => false,
+		};
+
+		if (canApply)
 		{
-			// Arrow right
-			_horizontalScrollOffset = Math.Min(maxHScroll, _horizontalScrollOffset + 1);
-		}
-		else if (relX < thumbX)
-		{
-			// Track left of thumb: page left
-			_horizontalScrollOffset = Math.Max(0, _horizontalScrollOffset - contentWidth);
-		}
-		else if (relX >= thumbX + thumbWidth)
-		{
-			// Track right of thumb: page right
-			_horizontalScrollOffset = Math.Min(maxHScroll, _horizontalScrollOffset + contentWidth);
+			// Table's arrow step has always been a literal 1 column - preserved here.
+			_horizontalScrollOffset = ScrollbarInput.OffsetForZone(metrics, zone, smallChange: 1, largeChange: rectWidth);
 		}
 
 		Invalidate(Invalidation.Relayout);
@@ -713,17 +908,15 @@ public partial class TableControl
 
 	private void HandleHorizontalScrollbarDrag(MouseEventArgs args)
 	{
-		int contentWidth = GetScrollbarContentWidth();
+		var (_, _, rectWidth) = GetHorizontalScrollbarRect();
 		int totalColumnsWidth = GetTotalColumnsWidth();
-		var (_, _, _, thumbWidth) = GetHorizontalScrollbarGeometry(contentWidth, totalColumnsWidth);
+		var metrics = HorizontalScrollbarMetrics(rectWidth, totalColumnsWidth);
 
-		int maxHScroll = Math.Max(0, totalColumnsWidth - contentWidth);
-		int trackRange = Math.Max(1, contentWidth - thumbWidth);
-
+		int maxHScroll = ScrollbarGeometry.MaxOffset(metrics);
 		if (maxHScroll <= 0) return;
 
-		int deltaX = args.Position.X - _scrollbarDragStartX;
-		int newOffset = _scrollbarDragStartOffset + (int)(deltaX * (double)maxHScroll / trackRange);
+		int delta = args.Position.X - _scrollbarDragStartX;
+		int newOffset = ScrollbarInput.OffsetForDrag(metrics, _hScrollbarDragStartThumbPos, delta);
 		_horizontalScrollOffset = Math.Clamp(newOffset, 0, maxHScroll);
 		Invalidate(Invalidation.Relayout);
 	}
@@ -734,23 +927,19 @@ public partial class TableControl
 
 	private void BeginColumnResize(MouseEventArgs args)
 	{
-		for (int c = 0; c < _renderedColumnX.Length; c++)
-		{
-			int colEnd = _renderedColumnX[c] - ActualX + _renderedColumnWidths[c];
-			if (Math.Abs(args.Position.X - colEnd) <= 1)
-			{
-				_resizingColumnIndex = c;
-				_resizeDragStartX = args.Position.X;
-				_resizeDragStartWidth = _renderedColumnWidths[c];
-				return;
-			}
-		}
+		var geometry = _geometry;
+		int c = geometry?.GetColumnBorderAt(args.Position.X, ControlDefaults.TableColumnResizeHitTolerance) ?? -1;
+		if (c < 0) return;
+
+		_resizingColumnIndex = c;
+		_resizeDragStartX = args.Position.X;
+		_resizeDragStartWidth = geometry!.GetColumnWidth(c);
 	}
 
 	private void HandleColumnResizeDrag(MouseEventArgs args)
 	{
 		int deltaX = args.Position.X - _resizeDragStartX;
-		int newWidth = Math.Max(3, _resizeDragStartWidth + deltaX); // Minimum 3 chars
+		int newWidth = Math.Max(ControlDefaults.TableMinResizeColumnWidth, _resizeDragStartWidth + deltaX);
 
 		if (_dataSource != null)
 		{

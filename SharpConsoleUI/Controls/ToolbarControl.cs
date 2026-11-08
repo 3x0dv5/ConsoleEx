@@ -945,6 +945,14 @@ namespace SharpConsoleUI.Controls
 			return (null, default);
 		}
 
+		/// <summary>
+		/// Moves focus to the next item, LEAVING THE ROW at either end.
+		/// </summary>
+		/// <remarks>
+		/// EXITING IS THE POINT, not a limitation. A toolbar is a focus SCOPE: an arrow past the last
+		/// item should leave it the way it leaves any other container, and the window's traversal
+		/// takes over from there. `ToolbarFocusScopeTests` pins that in both directions.
+		/// </remarks>
 		private bool NavigateFocus(bool backward)
 		{
 			var focusableItems = GetFocusableItems().ToList();
@@ -1086,5 +1094,15 @@ namespace SharpConsoleUI.Controls
 		}
 
 		#endregion
+
+		/// <inheritdoc/>
+		public override void DescribeState(IStateWriter w)
+		{
+			ArgumentNullException.ThrowIfNull(w);
+			base.DescribeState(w);
+
+			w.Write("itemCount", _items.Count);
+		}
+
 	}
 }

@@ -13,6 +13,7 @@ using SharpConsoleUI.Controls;
 using SharpConsoleUI.Drivers;
 using SharpConsoleUI.Events;
 using SharpConsoleUI.Extensions;
+using SharpConsoleUI.Helpers;
 using SharpConsoleUI.Layout;
 using SharpConsoleUI.Logging;
 
@@ -36,8 +37,21 @@ public sealed class TerminalControl
 	private readonly Thread _readThread;
 	private readonly object _lock = new();
 	private readonly ILogService? _log;
-	private int _disposed = 0;
-	private int _actualX, _actualY, _actualWidth, _actualHeight;
+	// Flipped once by whichever thread tears down, and read from the UI thread by IsDisposed and
+	// by the input/resize guards. volatile so those reads see the flip rather than a cached zero;
+	// the writes go through Interlocked, which is what makes the teardown itself run once.
+	private volatile int _disposed = 0;
+	private int _exitAnnounced = 0;
+	// Laid-out bounds. Written on the UI thread (PaintDOM) and readable from any thread through
+	// IWindowControl.ActualWidth/ActualHeight — and this control hands hosts a background thread of
+	// its own, since ProcessExited is raised on the PTY-read thread. volatile establishes the
+	// publication edge so such a read sees a recent value rather than a hoisted or stale one.
+	// Matches BaseControl, which made the same four fields volatile for the same reason;
+	// TerminalControl does not derive from it, so it did not inherit the fix.
+	private volatile int _actualX;
+	private volatile int _actualY;
+	private volatile int _actualWidth;
+	private volatile int _actualHeight;
 
 	private volatile bool _nudgeReadlineOnResize;
 
@@ -49,6 +63,24 @@ public sealed class TerminalControl
 
 	/// <summary>The OS process ID of the child process running inside the PTY.</summary>
 	public int ProcessId => _pty.ChildProcessId;
+
+	/// <summary>
+	/// The exit status of the process this terminal ran, or null while it is still running
+	/// (or when the status could not be determined). A host that launches one command in a
+	/// terminal reads this to learn whether the command worked — zero is a real answer and
+	/// means success, not "unknown".
+	/// </summary>
+	public int? ExitCode => _pty.ExitCode;
+
+	/// <summary>
+	/// Whether the containing window force-closes itself when the process exits. True by
+	/// default because every existing consumer relies on the window tearing itself down at
+	/// EOF; keeping it open is opt-in via <see cref="Builders.TerminalBuilder.KeepOpenOnExit"/>.
+	/// When false the final screen stays put — scrolling and <see cref="GetTranscript"/> keep
+	/// working after disposal — and closing the window becomes the host's job, typically from
+	/// a <see cref="ProcessExited"/> handler after reading <see cref="ExitCode"/>.
+	/// </summary>
+	public bool CloseWindowOnExit { get; init; } = true;
 
 	/// <summary>Raised on the PTY read thread when the spawned process exits.</summary>
 	public event EventHandler? ProcessExited;
@@ -87,6 +119,7 @@ public sealed class TerminalControl
 		_log?.LogInfo($"TerminalControl: PTY read thread started (childPid={_pty.ChildProcessId})", "Terminal");
 	}
 
+
 	private void ReadLoop()
 	{
 		_log?.LogDebug($"TerminalControl.ReadLoop: entering (pid={_pty.ChildProcessId})", "Terminal");
@@ -103,18 +136,63 @@ public sealed class TerminalControl
 			}
 			Invalidate(Invalidation.Relayout);
 		}
-		_log?.LogInfo($"TerminalControl.ReadLoop: EOF reached (pid={_pty.ChildProcessId}), closing window", "Terminal");
-		// EOF or backend closed — clean up and close the containing window.
-		Dispose();
-		SharpConsoleUI.Core.AsyncEvent.Raise(ProcessExited, ProcessExitedAsync, this, EventArgs.Empty, _log);
+
+		_log?.LogInfo($"TerminalControl.ReadLoop: EOF reached (pid={_pty.ChildProcessId}), closeWindowOnExit={CloseWindowOnExit}", "Terminal");
+
+		// The read ended, so the session is over however it got here — the child exited on its
+		// own, or Dispose signalled it. Teardown therefore finishes HERE, on this thread, in both
+		// cases, which is what lets Dispose return to the UI thread immediately: the blocking
+		// reap of the child runs on the reader, not on the caller.
+		//
+		// Reaping MUST precede the event: the backend's Dispose is where the wait on the child
+		// happens and where ExitCode is captured, so this ordering is what lets a ProcessExited
+		// handler read ExitCode. Raising first would hand every handler null.
+		// Not Dispose(): a host-initiated Dispose has already flipped the guard, so calling it
+		// here would return without reaping. The reap is idempotent in the backend, so it is
+		// invoked directly — this thread is the one that finishes teardown either way.
+		Interlocked.Exchange(ref _disposed, 1);
+		_pty.Dispose();
+
+		RaiseProcessExited();
+	}
+
+	/// <summary>
+	/// Fires <see cref="ProcessExited"/> exactly once and, by default, closes the window.
+	/// </summary>
+	/// <remarks>
+	/// Called only from the reader thread's exit path, and guarded so a second arrival — which a
+	/// future caller could introduce — cannot double-fire the event.
+	/// </remarks>
+	private void RaiseProcessExited()
+	{
+		if (Interlocked.Exchange(ref _exitAnnounced, 1) != 0) return;
+
 		var window = Container as Window;
-		if (window != null)
+		var windowSystem = window?.GetConsoleWindowSystem;
+
+		// The event fires regardless of CloseWindowOnExit: a host keeping the window open still
+		// needs to know the process is gone — this is its cue to read ExitCode/GetTranscript()
+		// and, on its own terms, close the window itself.
+		//
+		// It is marshalled onto the UI thread, because this runs on the PTY read thread and
+		// handlers routinely touch windows and controls. The window close below has always
+		// marshalled; raising the event inline next to it was the inconsistency. Both are
+		// enqueued in one callback so the host sees the event before the window goes away.
+		// Without a window system there is no UI thread to post to, so it is raised inline.
+		if (windowSystem != null)
 		{
-			var windowSystem = window.GetConsoleWindowSystem;
-			if (windowSystem != null)
-				windowSystem.EnqueueOnUIThread(() => window.Close(force: true));
-			else
-				window.Close(force: true);
+			windowSystem.EnqueueOnUIThread(() =>
+			{
+				SharpConsoleUI.Core.AsyncEvent.Raise(ProcessExited, ProcessExitedAsync, this, EventArgs.Empty, _log);
+				if (CloseWindowOnExit)
+					window!.Close(force: true);
+			}, "terminalControl.ProcessExited");
+		}
+		else
+		{
+			SharpConsoleUI.Core.AsyncEvent.Raise(ProcessExited, ProcessExitedAsync, this, EventArgs.Empty, _log);
+			if (CloseWindowOnExit)
+				window?.Close(force: true);
 		}
 	}
 
@@ -127,14 +205,118 @@ public sealed class TerminalControl
 	/// </summary>
 	public void NudgeOnNextResize() => _nudgeReadlineOnResize = true;
 
-	/// <inheritdoc/>
+	/// <summary>
+	/// Every line the terminal has shown, oldest first: scrollback history, then the
+	/// current screen. Trailing whitespace is trimmed from each line and blank lines are
+	/// dropped from the end of the result; interior blank lines are real output and kept.
+	/// <para>
+	/// Remains readable after the process exits — <see cref="Dispose"/> tears down the PTY
+	/// only, and the VT machine with its buffers survives, so a <see cref="ProcessExited"/>
+	/// handler (which fires after disposal) can still collect the transcript. Any future
+	/// change to <see cref="Dispose"/> must preserve that, or such handlers break silently.
+	/// </para>
+	/// </summary>
+	public IReadOnlyList<string> GetTranscript()
+	{
+		lock (_lock)
+		{
+			var lines = new List<string>(_vt.ScrollbackCount + _vt.Height);
+			var sb = new StringBuilder(_vt.Width);
+
+			// GetScrollbackLine(0) is the MOST RECENTLY scrolled-off line, so oldest-first
+			// means walking the indices downward.
+			for (int i = _vt.ScrollbackCount - 1; i >= 0; i--)
+				lines.Add(RenderRow(_vt.GetScrollbackLine(i), sb));
+
+			// Scrollback holds only lines that scrolled OFF the screen; the final screenful —
+			// where a command's outcome almost always is — still lives in the screen buffer.
+			// A transcript of scrollback alone would omit the answer.
+			for (int y = 0; y < _vt.Height; y++)
+			{
+				sb.Clear();
+				for (int x = 0; x < _vt.Width; x++)
+					AppendCell(sb, _vt.Screen.GetCell(x, y));
+				lines.Add(sb.ToString().TrimEnd());
+			}
+
+			// The screen's unused rows are entirely blank; without this the transcript of a
+			// short command ends in a page of empty lines.
+			int end = lines.Count;
+			while (end > 0 && lines[end - 1].Length == 0)
+				end--;
+			lines.RemoveRange(end, lines.Count - end);
+			return lines;
+		}
+	}
+
+	private static string RenderRow(Cell[]? row, StringBuilder sb)
+	{
+		// A null row (index raced out of range, or width changed under the ring buffer)
+		// still occupies its place in time; an empty line keeps the ordering honest.
+		if (row == null) return string.Empty;
+		sb.Clear();
+		for (int x = 0; x < row.Length; x++)
+			AppendCell(sb, row[x]);
+		return sb.ToString().TrimEnd();
+	}
+
+	private static void AppendCell(StringBuilder sb, in Cell cell)
+	{
+		// A wide glyph occupies two cells; appending its continuation would double it.
+		if (cell.IsWideContinuation) return;
+		sb.AppendRune(cell.Character);
+		if (cell.Combiners != null) sb.Append(cell.Combiners);
+	}
+
+	/// <summary>
+	/// Ends the terminal session: the child process is signalled, then reaped, and the PTY is
+	/// closed. Safe to call from any thread and more than once.
+	/// </summary>
+	/// <remarks>
+	/// Returns without waiting for the child when called from the UI thread — hosts dispose
+	/// terminals from <c>OnClosed</c> and key handlers, and a wait there would freeze the whole
+	/// application for as long as the child took to die. The child is signalled synchronously;
+	/// the blocking reap then happens on the PTY read thread, which the signal has just woken.
+	/// <para>
+	/// A host that needs teardown to be complete before continuing — a test, or an app shutting
+	/// down — calls <see cref="WaitForExit(int)"/> afterwards.
+	/// </para>
+	/// </remarks>
 	public void Dispose()
 	{
-		if (Interlocked.Exchange(ref _disposed, 1) == 0)
-		{
-			_log?.LogDebug("TerminalControl.Dispose", "Terminal");
+		if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+		_log?.LogDebug("TerminalControl.Dispose", "Terminal");
+
+		// Wake the reader. On Linux this signals the child's process group, which is the only
+		// thing that unblocks a pending read; on Windows it closes the ConPTY. Either way it
+		// returns at once.
+		_pty.BeginShutdown();
+
+		// The woken reader finishes teardown, which is what keeps this call from blocking. The
+		// one case where nobody else will is a reader that had already exited — then its reap
+		// has either run or is running, and the backend's own guard makes this call a no-op if
+		// it has. Join(0) is a poll, not a wait.
+		if (_readThread.Join(0))
 			_pty.Dispose();
-		}
+	}
+
+	/// <summary>
+	/// Blocks until the terminal session has fully torn down — the child reaped, the PTY closed,
+	/// and the read thread finished — or until <paramref name="timeoutMs"/> elapses.
+	/// </summary>
+	/// <param name="timeoutMs">How long to wait, in milliseconds. Use -1 to wait indefinitely.</param>
+	/// <returns>True if teardown completed; false if the timeout elapsed first.</returns>
+	/// <remarks>
+	/// <see cref="Dispose"/> deliberately does not wait, so that disposing from a UI handler
+	/// cannot freeze the application. This is the explicit opt-in for callers that do need to
+	/// know teardown is finished: an app shutting down, or a test asserting on
+	/// <see cref="ExitCode"/>. Never call it from the UI thread while the terminal is running —
+	/// the read thread cannot finish if the UI thread is blocked waiting for it.
+	/// </remarks>
+	public bool WaitForExit(int timeoutMs = 5000)
+	{
+		if (Thread.CurrentThread == _readThread) return true;
+		return _readThread.Join(timeoutMs);
 	}
 
 	// ── IInteractiveControl / IFocusableControl ──────────────────────────────
@@ -198,6 +380,9 @@ public sealed class TerminalControl
 		var bytes = EncodeKey(key, appCursor);
 		if (bytes.Length == 0) return false;
 
+		// Nothing is left to type at once the session has ended. Scrollback keys above still work
+		// — the final screen stays readable after exit by design — but input has nowhere to go.
+		if (_disposed != 0) return true;
 		_pty.Write(bytes, bytes.Length);
 		return true;
 	}
@@ -316,6 +501,7 @@ public sealed class TerminalControl
 			seq = [0x1B, (byte)'[', (byte)'M',
 				   (byte)(32 + b), (byte)(32 + col), (byte)(32 + row)];
 		}
+		if (_disposed != 0) return;
 		_pty.Write(seq, seq.Length);
 	}
 
@@ -332,7 +518,24 @@ public sealed class TerminalControl
 	/// <inheritdoc/>
 	public Margin Margin { get; set; } = new Margin(0, 0, 0, 0);
 	/// <inheritdoc/>
-	public StickyPosition StickyPosition { get; set; } = StickyPosition.None;
+	public StickyPosition StickyPosition
+	{
+		get => Dock switch
+		{
+			Layout.Dock.Top => StickyPosition.Top,
+			Layout.Dock.Bottom => StickyPosition.Bottom,
+			_ => StickyPosition.None,
+		};
+		set => Dock = value switch
+		{
+			StickyPosition.Top => Layout.Dock.Top,
+			StickyPosition.Bottom => Layout.Dock.Bottom,
+			_ => Layout.Dock.None,
+		};
+	}
+
+	/// <inheritdoc/>
+	public Layout.Dock Dock { get; set; } = Layout.Dock.None;
 	/// <inheritdoc/>
 	public string? Name { get; set; }
 	/// <inheritdoc/>
@@ -381,8 +584,12 @@ public sealed class TerminalControl
 		{
 			if (bounds.Width != _vt.Width || bounds.Height != _vt.Height)
 			{
+				// The VT machine is always resized: its buffers outlive the PTY so the final
+				// screen reflows with the window after the process has gone. Only the PTY side
+				// is skipped once the session has ended — there is no child left to tell.
 				_vt.Resize(bounds.Width, bounds.Height);
-				_pty.Resize(bounds.Height, bounds.Width);
+				if (_disposed == 0)
+					_pty.Resize(bounds.Height, bounds.Width);
 				// Clamp scroll offset after resize
 				_scrollOffset = Math.Min(_scrollOffset, _vt.ScrollbackCount);
 
@@ -390,7 +597,7 @@ public sealed class TerminalControl
 				// won't redraw because SA_RESTART keeps read() blocked through
 				// SIGWINCH. Ctrl-L (clear-screen) unblocks read() and forces
 				// readline to redraw the prompt at the new width.
-				if (_nudgeReadlineOnResize)
+				if (_nudgeReadlineOnResize && _disposed == 0)
 				{
 					_nudgeReadlineOnResize = false;
 					_pty.Write(new byte[] { 0x0c }, 1);

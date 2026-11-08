@@ -129,6 +129,18 @@ public record ConsoleWindowSystemOptions(
 	ConsoleKey? WindowCycleKey = ConsoleKey.T,
 	ConsoleKey? ExitKey = ConsoleKey.Q,
 
+	// Alt+1..9 activates a top-level window by index — the order the taskbar lists them in.
+	// Set false to leave the chord to the application.
+	//
+	// Without this switch an application that wants Alt+digit for its own panes had to register all
+	// nine digits as global shortcuts, including the ones that are out of range, purely to stop the
+	// key falling through to the built-in selector. Note the asymmetry with the window move and
+	// resize chords beside it in InputCoordinator: those are gated on the ACTIVE window's
+	// IsMovable/IsResizable because they act on that window, whereas this one switches between
+	// windows and so belongs to the system rather than to any one of them — which is why it is an
+	// option here and not a Window property.
+	bool AltDigitSelectsWindow = true,
+
 	// Main-loop watchdog configuration. Null uses defaults (new WatchdogOptions()).
 	WatchdogOptions? Watchdog = null,
 
@@ -139,15 +151,79 @@ public record ConsoleWindowSystemOptions(
 	// freezes-then-recovers instead of deadlocking. Set true to opt into the WinForms/WPF model
 	// where `await` resumes on the UI thread — but then handlers MUST use `await` and never block
 	// on async work on the UI thread, or the captured continuation deadlocks against the loop.
-	bool InstallSynchronizationContext = false
+	bool InstallSynchronizationContext = false,
+
+	// Piped-stdin capture configuration. Null uses defaults (new PipedInputOptions()).
+	// Appended last so existing positional arguments keep their meaning.
+	PipedInputOptions? PipedInput = null,
+
+	// Diagnostics socket path. Null (the default) means no socket unless the environment
+	// variable SHARPCONSOLEUI_DIAGNOSTICS_SOCKET asks for one - and that route always prompts
+	// for consent first. Setting this property opens the socket WITHOUT prompting, which is
+	// safe for a different reason: a property cannot be inherited from a shell, a .desktop
+	// file or a systemd unit, so it can only be here because someone wrote it here.
+	// Intended for tests and for an application's own --debug-socket flag.
+	// Appended last so existing positional arguments keep their meaning.
+	string? DiagnosticsSocket = null,
+
+	// Which clock each part of the system runs on, for a test that needs to move
+	// time rather than wait it out. Null means every part uses the real clock, so
+	// production behaviour is unchanged. One container rather than a property per
+	// clock, so adding one later is a property on TimeOptions and not another
+	// positional argument here.
+	// Appended last so existing positional arguments keep their meaning.
+	TimeOptions? Time = null
 )
 {
 	private const string PerfMetricsEnvVar = "SHARPCONSOLEUI_PERF_METRICS";
 
 	/// <summary>
-	/// Gets the minimum time between frames in milliseconds based on TargetFPS.
+	/// The highest number of frames a second the system will render.
 	/// </summary>
-	public int MinFrameTime => TargetFPS > 0 ? 1000 / TargetFPS : 16;
+	/// <value>
+	/// Clamped to <see cref="MaxTargetFPS"/>. Zero or less means no cap at all.
+	/// </value>
+	/// <remarks>
+	/// <para>
+	/// The cap is a bandwidth control before it is a smoothness one. A terminal UI
+	/// writes bytes to a pipe, and over a remote connection an uncapped redraw is
+	/// the difference between a usable session and a saturated link.
+	/// </para>
+	/// <para>
+	/// Clamped rather than accepted, because the interval is derived from it: at
+	/// 1001 the old integer arithmetic produced a zero-millisecond interval, which
+	/// silently removed the cap of someone who had asked for a very high one.
+	/// </para>
+	/// </remarks>
+	public int TargetFPS
+	{
+		get => _targetFps;
+		init => _targetFps = value > MaxTargetFPS ? MaxTargetFPS : value;
+	}
+
+	// Initialised FROM the positional parameter, which is the one place it is in
+	// scope. A plain `= 60` here compiles with only a warning (CS8907, parameter
+	// unread) and makes every positional caller silently render at 60 whatever
+	// they asked for - the clamp was never the only thing at stake.
+	private readonly int _targetFps = TargetFPS > MaxTargetFPS ? MaxTargetFPS : TargetFPS;
+
+	/// <summary>The highest rate <see cref="TargetFPS"/> accepts.</summary>
+	/// <remarks>
+	/// A thousand frames a second is already far past what a terminal can show or
+	/// a link can carry; the limit exists so the interval stays a usable number.
+	/// </remarks>
+	public const int MaxTargetFPS = 1000;
+
+	/// <summary>
+	/// The minimum time between frames in milliseconds, from <see cref="TargetFPS"/>.
+	/// </summary>
+	/// <value>Zero when there is no cap.</value>
+	/// <remarks>
+	/// A double, not an int. Integer division made 144 fps ask for 6 ms, which is
+	/// 166 fps - the rate nobody configured. Zero or less means no cap, rather than
+	/// the 16 ms a fallback used to produce, so asking for no limit IS no limit.
+	/// </remarks>
+	public double MinFrameTime => _targetFps > 0 ? 1000.0 / _targetFps : 0.0;
 
 	/// <summary>
 	/// Gets the default configuration with frame rate limiting enabled at 60 FPS.

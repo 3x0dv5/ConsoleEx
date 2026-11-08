@@ -9,6 +9,7 @@
 using SharpConsoleUI.Controls;
 using SharpConsoleUI.Themes;
 using Xunit;
+using SharpConsoleUI.Tests.Infrastructure;
 
 namespace SharpConsoleUI.Tests;
 
@@ -166,5 +167,347 @@ public class ChatTranscriptControlTests
 		Assert.Equal(false, chat.BodySelectionEnabledForTest(sys));
 		Assert.Equal(true, chat.BodySelectionEnabledForTest(asst));
 		Assert.Equal(true, chat.BodySelectionEnabledForTest(usr));
+	}
+
+	#region RestyleMessages — a theme switch must reach messages already on screen
+
+	/* A role style is copied into a message's panel when the message is BUILT, and the body is
+	   rendered once from the MarkdownStyle in force at that moment. So after a theme switch the
+	   blocks already in the transcript keep the old theme's colours while new ones get the new
+	   theme — which is what showed up in cxagent. SetRoleStyle alone cannot fix it, and a host
+	   cannot re-add the old messages because the control exposes no way to read their content
+	   back. RestyleMessages re-applies the CURRENT role style to every existing entry. */
+
+	[Fact]
+	public void RestyleMessages_AppliesTheNewBackgroundToAnExistingMessage()
+	{
+		var chat = Build();
+		var before = new Color(10, 20, 30);
+		var after = new Color(200, 100, 50);
+
+		chat.SetRoleStyle(ChatRole.User, new ChatRoleStyle { Background = before });
+		var id = chat.AddMessage(ChatRole.User, "hello");
+		Assert.Equal(before, chat.BackgroundForTest(id));
+
+		chat.SetRoleStyle(ChatRole.User, new ChatRoleStyle { Background = after });
+		chat.RestyleMessages();
+
+		Assert.Equal(after, chat.BackgroundForTest(id));
+	}
+
+	[Fact]
+	public void RestyleMessages_ClearsABackgroundTheNewStyleDoesNotSet()
+	{
+		var chat = Build();
+		chat.SetRoleStyle(ChatRole.User, new ChatRoleStyle { Background = new Color(10, 20, 30) });
+		var id = chat.AddMessage(ChatRole.User, "hello");
+		Assert.NotNull(chat.BackgroundForTest(id));
+
+		// A role that drops its background must LOSE it, not keep the old one: leaving the stale
+		// colour in place is the same bug seen from the other side.
+		chat.SetRoleStyle(ChatRole.User, new ChatRoleStyle());
+		chat.RestyleMessages();
+
+		Assert.Null(chat.BackgroundForTest(id));
+	}
+
+	[Fact]
+	public void RestyleMessages_LeavesTheExpandedStateAlone()
+	{
+		var chat = Build();
+		chat.SetRoleStyle(ChatRole.User, new ChatRoleStyle { Collapsible = true });
+		var collapsed = chat.AddMessage(ChatRole.User, "first");
+		var expanded = chat.AddMessage(ChatRole.User, "second");
+
+		// What the USER did, which a restyle must not undo.
+		chat.PanelForTest(collapsed).IsExpanded = false;
+		chat.PanelForTest(expanded).IsExpanded = true;
+
+		// A style that would have started every message collapsed, to prove StartCollapsed is not
+		// re-applied over the user's own toggle.
+		chat.SetRoleStyle(ChatRole.User, new ChatRoleStyle { Collapsible = true, StartCollapsed = true });
+		chat.RestyleMessages();
+
+		Assert.False(chat.PanelForTest(collapsed).IsExpanded);
+		Assert.True(chat.PanelForTest(expanded).IsExpanded);
+	}
+
+	[Fact]
+	public void RestyleMessages_KeepsAPerMessageMarkdownOverride()
+	{
+		var chat = Build();
+		chat.SetRoleStyle(ChatRole.Assistant, new ChatRoleStyle { Markdown = true });
+		var id = chat.AddMessage(ChatRole.Assistant, "**bold**");
+
+		// Forced to markup for this message only; the role still says markdown.
+		chat.SetMarkdownMode(id, false);
+		Assert.False(chat.EffectiveMarkdownForTest(id));
+
+		chat.SetRoleStyle(ChatRole.Assistant, new ChatRoleStyle { Markdown = true });
+		chat.RestyleMessages();
+
+		// The override is per-message state, not style state, so a restyle must not revert it.
+		Assert.False(chat.MarkdownOverrideForTest(id));
+		Assert.False(chat.EffectiveMarkdownForTest(id));
+	}
+
+	[Fact]
+	public void RestyleMessages_LeavesAThinkingMessageThinking()
+	{
+		var chat = Build();
+		var id = chat.AddMessage(ChatRole.Assistant, "", thinking: true);
+
+		chat.SetRoleStyle(ChatRole.Assistant, new ChatRoleStyle { Background = new Color(1, 2, 3) });
+		chat.RestyleMessages();
+
+		// A thinking message has a spinner and no body, so there is nothing to re-render — but the
+		// panel still restyles, and the spinner must survive to be cleared by the first token.
+		Assert.Equal(new Color(1, 2, 3), chat.BackgroundForTest(id));
+		Assert.True(chat.IsThinking(id));
+
+		chat.Append(id, "first token");
+		Assert.False(chat.IsThinking(id));
+		Assert.Equal("first token", chat.BodyTextForTest(id));
+	}
+
+	/* MARKDOWN COLOURS ARE NOT ASSERTABLE FROM HERE, and that is a property of the design rather
+	   than a gap in the test. SetMarkdown stores the content as a "[markdown]…[/]" TAG; the tag is
+	   resolved against MarkdownStyle.Default by MarkupParser at PAINT time, so the control never
+	   holds the colours and RenderedBodyTextForTest returns the same string whatever the style is.
+	   Changing the style and re-rendering therefore cannot change anything observable at this level
+	   — which is also why a restyle picks up a new MarkdownStyle for free: nothing is baked in.
+	   The colour mapping itself is covered at the parser level (MarkdownStyleTests,
+	   MarkdownToMarkupTests). What IS checkable here is that the body is genuinely re-rendered from
+	   the buffer rather than left alone, which is the part RestyleMessages is responsible for. */
+
+	[Fact]
+	public void RestyleMessages_RerendersTheBodyFromTheBuffer()
+	{
+		var chat = Build();
+		chat.SetRoleStyle(ChatRole.Assistant, new ChatRoleStyle { Markdown = true });
+		var id = chat.AddMessage(ChatRole.Assistant, "> quoted");
+
+		// Prove the re-render happens by taking the body out of sync with the buffer first: with the
+		// message forced to plain markup, the stored body carries no markdown tag.
+		chat.SetMarkdownMode(id, false);
+		string? asMarkup = chat.RenderedBodyTextForTest(id);
+		Assert.NotNull(asMarkup);
+		Assert.DoesNotContain("[markdown]", asMarkup!, System.StringComparison.Ordinal);
+
+		// Hand the decision back to the role WITHOUT re-rendering: SetMarkdownMode(id, null) would
+		// render on its own, which would let a RestyleMessages that never calls RenderBody still pass.
+		// Changing the ROLE's Markdown flag touches no message, so only the restyle can act on it.
+		chat.SetMarkdownMode(id, false);
+		chat.SetRoleStyle(ChatRole.Assistant, new ChatRoleStyle { Markdown = true });
+		chat.SetMarkdownModeWithoutRenderForTest(id, null);
+		Assert.DoesNotContain("[markdown]", chat.RenderedBodyTextForTest(id)!, System.StringComparison.Ordinal);
+
+		chat.RestyleMessages();
+
+		string? restyled = chat.RenderedBodyTextForTest(id);
+		Assert.NotNull(restyled);
+		Assert.Contains("[markdown]", restyled!, System.StringComparison.Ordinal);
+		Assert.Contains("quoted", restyled!, System.StringComparison.Ordinal);
+
+		// And the buffer — the source of truth — was not disturbed by any of it.
+		Assert.Equal("> quoted", chat.BodyTextForTest(id));
+	}
+
+	#endregion
+
+	/// <summary>
+	/// A colour opened on one line of a markup body still colours the next. Each line of the body
+	/// was parsed on its own, so "[red]a\nb[/]" rendered "b" in the default colour.
+	/// </summary>
+	[Fact]
+	public void AMarkupBody_CarriesAColourAcrossALineBreak()
+	{
+		var chat = Build();
+		chat.SetRoleStyle(ChatRole.Tool, new ChatRoleStyle { Markdown = false });
+		var id = chat.AddMessage(ChatRole.Tool, "[red]a\nb[/]");
+
+		var rows = chat.BodyForTest(id)!.EnsureParsedForTest(80).Rows;
+		var b = rows.SelectMany(r => r).First(c => c.Character.Value == 'b');
+
+		Assert.Equal(Color.Red, b.Foreground);
+	}
+
+	// --- per-message rail colour and background -------------------------------------------
+
+	[Fact]
+	public void SetMessageRailColor_ColoursThatMessagesRail_Only()
+	{
+		var chat = Build();
+		var a = chat.AddMessage(ChatRole.Tool, "a");
+		var b = chat.AddMessage(ChatRole.Tool, "b");
+		var before = chat.RailColorForTest(b);
+
+		chat.SetMessageRailColor(a, Color.Orange1);
+
+		Assert.Equal(Color.Orange1, chat.RailColorForTest(a));
+		Assert.Equal(Color.Orange1, chat.GetMessageRailColor(a));
+		Assert.Equal(before, chat.RailColorForTest(b));
+	}
+
+	[Fact]
+	public void SetMessageRailColor_WinsOverTheTranscriptWideColour_AndNullInherits()
+	{
+		var chat = Build();
+		chat.MessageRailColor = Color.Blue;
+		var a = chat.AddMessage(ChatRole.Tool, "a");
+
+		chat.SetMessageRailColor(a, Color.Orange1);
+		Assert.Equal(Color.Orange1, chat.RailColorForTest(a));
+
+		chat.SetMessageRailColor(a, null);
+		Assert.Equal(Color.Blue, chat.RailColorForTest(a));
+		Assert.Null(chat.GetMessageRailColor(a));
+	}
+
+	[Fact]
+	public void SetMessageBackground_SetsThatMessagesSurface_AndSurvivesARestyle()
+	{
+		var chat = Build();
+		chat.SetRoleStyle(ChatRole.Tool, new ChatRoleStyle { Background = new Color(1, 2, 3) });
+		var a = chat.AddMessage(ChatRole.Tool, "a");
+		var b = chat.AddMessage(ChatRole.Tool, "b");
+
+		chat.SetMessageBackground(a, new Color(9, 9, 9));
+		chat.RestyleMessages();
+
+		Assert.Equal(new Color(9, 9, 9), chat.PanelForTest(a).BackgroundColor);
+		Assert.Equal(new Color(9, 9, 9), chat.GetMessageBackground(a));
+		Assert.Equal(new Color(1, 2, 3), chat.PanelForTest(b).BackgroundColor);
+	}
+
+	[Fact]
+	public void SetMessageBackground_Null_ReturnsToTheRolesBackground()
+	{
+		var chat = Build();
+		chat.SetRoleStyle(ChatRole.Tool, new ChatRoleStyle { Background = new Color(1, 2, 3) });
+		var a = chat.AddMessage(ChatRole.Tool, "a");
+
+		chat.SetMessageBackground(a, new Color(9, 9, 9));
+		chat.SetMessageBackground(a, null);
+
+		Assert.Equal(new Color(1, 2, 3), chat.PanelForTest(a).BackgroundColor);
+		Assert.Null(chat.GetMessageBackground(a));
+	}
+
+	/// <summary>
+	/// Setting the background a message already has must not repaint. The sibling
+	/// SetMessageRailColor guards on equality and this one did not, so a host refreshing its
+	/// surfaces on every frame paid for a repaint per message per frame (CLAUDE.md rule 5).
+	/// </summary>
+	[Fact]
+	public void SetMessageBackground_ToTheSameColour_DoesNotRepaint()
+	{
+		var chat = Build();
+		var id = chat.AddMessage(ChatRole.Tool, "a");
+		var rc = new RecordingContainer();
+		chat.Container = rc;
+
+		chat.SetMessageBackground(id, new Color(9, 9, 9));
+		int afterFirst = rc.InvalidateCount;
+		Assert.True(afterFirst > 0, "the first, real change must repaint");
+
+		chat.SetMessageBackground(id, new Color(9, 9, 9));
+
+		Assert.Equal(afterFirst, rc.InvalidateCount);
+		Assert.Equal(new Color(9, 9, 9), chat.GetMessageBackground(id));
+	}
+
+	/// <summary>The guard must not swallow a real change, in either direction.</summary>
+	[Fact]
+	public void SetMessageBackground_StillRepaints_OnARealChange()
+	{
+		var chat = Build();
+		var id = chat.AddMessage(ChatRole.Tool, "a");
+		var rc = new RecordingContainer();
+		chat.Container = rc;
+
+		chat.SetMessageBackground(id, new Color(9, 9, 9));
+		int afterSet = rc.InvalidateCount;
+
+		chat.SetMessageBackground(id, new Color(4, 4, 4));
+		Assert.True(rc.InvalidateCount > afterSet, "a different colour must repaint");
+
+		int afterChange = rc.InvalidateCount;
+		chat.SetMessageBackground(id, null);
+		Assert.True(rc.InvalidateCount > afterChange, "returning to the role's must repaint");
+		Assert.Null(chat.GetMessageBackground(id));
+	}
+
+	// --- role-level rail ---------------------------------------------------------------------
+
+	[Fact]
+	public void ARolesRailColor_ColoursItsMessagesRails_UnderAMessagesOwn()
+	{
+		var chat = Build();
+		chat.MessageRailColor = Color.Blue;
+		chat.SetRoleStyle(ChatRole.Thinking, new ChatRoleStyle { RailColor = Color.Orange1 });
+		var a = chat.AddMessage(ChatRole.Thinking, "a");
+		var b = chat.AddMessage(ChatRole.Thinking, "b");
+
+		chat.SetMessageRailColor(b, Color.Red);
+
+		Assert.Equal(Color.Orange1, chat.RailColorForTest(a));
+		Assert.Equal(Color.Red, chat.RailColorForTest(b));
+	}
+
+	[Fact]
+	public void ARolesRail_RailsItsMessages_WithoutAFooter_UnlessTheMessageSaysNo()
+	{
+		var chat = Build();
+		chat.SetRoleStyle(ChatRole.Thinking, new ChatRoleStyle { Rail = true });
+		var a = chat.AddMessage(ChatRole.Thinking, "a");
+		var b = chat.AddMessage(ChatRole.Thinking, "b");
+		var plain = chat.AddMessage(ChatRole.Assistant, "c");
+
+		chat.SetMessageRail(b, false);
+
+		Assert.True(chat.HasMessageRail(a));
+		Assert.False(chat.HasMessageRail(b));
+		Assert.False(chat.HasMessageRail(plain));
+	}
+
+	[Fact]
+	public void ARolesRail_FollowsARestyle()
+	{
+		var chat = Build();
+		var a = chat.AddMessage(ChatRole.Thinking, "a");
+		chat.SetRoleStyle(ChatRole.Thinking, new ChatRoleStyle { Rail = true });
+		chat.RestyleMessages();
+		Assert.True(chat.HasMessageRail(a));
+	}
+
+	// --- the Thinking role -------------------------------------------------------------------
+
+	[Fact]
+	public void TheThinkingRole_HasADefaultStyle_ThatFoldsLikeATool()
+	{
+		var chat = Build();
+		var style = chat.GetRoleStyle(ChatRole.Thinking);
+		var tool = chat.GetRoleStyle(ChatRole.Tool);
+		Assert.Equal(tool.Collapsible, style.Collapsible);
+		Assert.Equal(tool.StartCollapsed, style.StartCollapsed);
+		var id = chat.AddMessage(ChatRole.Thinking, "weighing it");
+		Assert.Equal(ChatRole.Thinking, chat.GetRole(id));
+	}
+
+	/// <summary>A header the host set is the host's: a restyle re-themes the role's headers, not that.</summary>
+	[Fact]
+	public void RestyleMessages_KeepsAHeaderSetWithSetHeader()
+	{
+		var chat = Build();
+		var set = chat.AddMessage(ChatRole.Tool, "a");
+		var plain = chat.AddMessage(ChatRole.Tool, "b");
+		chat.SetHeader(set, "glob · **/prices.py");
+
+		chat.SetRoleStyle(ChatRole.Tool, new ChatRoleStyle { Header = static (_, _) => "Tools" });
+		chat.RestyleMessages();
+
+		Assert.Equal("glob · **/prices.py", chat.PanelForTest(set).Title);
+		Assert.Equal("Tools", chat.PanelForTest(plain).Title);
 	}
 }

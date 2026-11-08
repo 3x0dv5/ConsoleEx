@@ -226,6 +226,78 @@ namespace SharpConsoleUI.Controls
 		/// <inheritdoc/>
 		public IReadOnlyList<(IWindowControl Control, GridPlacement Placement)> OrderedCells => BuildOrderedCells();
 
+		private readonly List<IWindowControl> _docked = new();
+
+		/// <inheritdoc/>
+		public IReadOnlyList<IWindowControl> DockedChildren
+		{
+			get { lock (_cellsLock) return _docked.ToList(); }
+		}
+
+		/// <summary>
+		/// Docks a child to one of the grid's edges. The child claims a strip off the grid's
+		/// rectangle and the tracks are sized against what remains, so docking never shifts a
+		/// cell coordinate: <c>grid[1, 0]</c> means the same cell however many children are docked.
+		/// </summary>
+		/// <param name="control">The control to dock.</param>
+		/// <param name="edge">
+		/// The edge to claim. <see cref="Layout.Dock.None"/> is not a docked child - use
+		/// <see cref="Place"/> to put a control in a cell.
+		/// </param>
+		/// <returns>This grid, to allow fluent chaining.</returns>
+		/// <exception cref="ArgumentNullException">Thrown when <paramref name="control"/> is null.</exception>
+		/// <exception cref="ArgumentOutOfRangeException">
+		/// Thrown when <paramref name="edge"/> is <see cref="Layout.Dock.None"/>.
+		/// </exception>
+		/// <remarks>
+		/// Named <c>DockChild</c> rather than <c>Dock</c> because every control already HAS a
+		/// <see cref="IWindowControl.Dock"/> property - the edge this grid claims in ITS own
+		/// parent. A method of the same name shadows that property, and a nested grid could then
+		/// no longer be docked at all.
+		/// </remarks>
+		/// <remarks>
+		/// Edges are claimed in declaration order, each shrinking the rectangle left for the rest,
+		/// which is what lets a top bar span the full width while a sidebar declared after it runs
+		/// only to the bar's underside. Far edges (Bottom, Right) reverse within a run so author
+		/// order reads the way the screen reads - the same rule the window root uses.
+		/// </remarks>
+		public GridControl DockChild(IWindowControl control, Layout.Dock edge)
+		{
+			ArgumentNullException.ThrowIfNull(control);
+			if (edge == Layout.Dock.None)
+				throw new ArgumentOutOfRangeException(nameof(edge),
+					"Dock.None is not an edge. Use Place(control, row, col) for a cell.");
+
+			// Set the edge BEFORE registering: the grid rebuilds its tree on add, and an edge
+			// assigned afterwards would arrive a pass late.
+			control.Dock = edge;
+
+			lock (_cellsLock)
+				_docked.Add(control);
+
+			control.Container = this;
+			RebuildAndInvalidate();
+			return this;
+		}
+
+		/// <summary>Removes a docked child. Returns true when it was docked.</summary>
+		/// <param name="control">The control to undock.</param>
+		/// <returns><c>true</c> when the control was docked and has been removed.</returns>
+		public bool Undock(IWindowControl control)
+		{
+			ArgumentNullException.ThrowIfNull(control);
+
+			lock (_cellsLock)
+			{
+				if (!_docked.Remove(control))
+					return false;
+			}
+
+			control.Dock = Layout.Dock.None;
+			RebuildAndInvalidate();
+			return true;
+		}
+
 		#endregion
 
 		/// <summary>
@@ -768,5 +840,19 @@ namespace SharpConsoleUI.Controls
 			_cells.Any(c =>
 				row >= c.Placement.Row && row < c.Placement.Row + c.Placement.RowSpan &&
 				col >= c.Placement.Col && col < c.Placement.Col + c.Placement.ColSpan);
+
+		/// <inheritdoc/>
+		public override void DescribeState(IStateWriter w)
+		{
+			ArgumentNullException.ThrowIfNull(w);
+			base.DescribeState(w);
+
+			// The grid's shape, which is what "why is my control not where I put it"
+			// usually comes down to.
+			w.Write("rows", RowDefinitions.Count);
+			w.Write("columns", ColumnDefinitions.Count);
+			w.Write("childCount", Children.Count);
+		}
+
 	}
 }

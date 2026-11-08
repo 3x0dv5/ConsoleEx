@@ -2,13 +2,18 @@
 
 A scrollable container that hosts child controls with automatic vertical/horizontal scrolling, mouse wheel support, and visual scrollbars.
 
+<!-- gallery -->
+
+![ScrollablePanelControl](../images/controls/ScrollablePanelControl.png)
+
+
 ## Overview
 
 ScrollablePanelControl is a container control that stacks child controls vertically and provides scrolling when the combined content exceeds the visible viewport. It is the standard building block for grouping multiple controls into a single, scrollable region — for example the body of a tab, a form, a log view, or a side panel in an IDE-style layout.
 
 The panel manages its children's focus lifecycle as an opaque focus scope: Tab and Shift+Tab move focus between focusable children, Escape drops into "scroll mode" where the arrow keys, Page Up/Down, and Home/End scroll the viewport. When a child gains focus it is automatically scrolled into view. The panel also supports mouse-wheel scrolling, draggable scrollbars, an optional border with a header, and an `AutoScroll` mode that keeps the view pinned to the bottom as new content arrives (useful for live logs and chat-style output).
 
-The panel exposes rich state about its scroll position (`VerticalScrollOffset`, `CanScrollUp`/`CanScrollDown`, `TotalContentHeight`, `ViewportHeight`, etc.) and a `Scrolled` event so callers can react to scrolling. Children are added via `AddControl` (or the builder's `.AddControl()`), and the panel can be created with the `Controls.ScrollablePanel()` / `ScrollablePanelBuilder` fluent API.
+The panel exposes rich state about its scroll position (`VerticalScrollOffset`, `CanScrollUp`/`CanScrollDown`, `TotalContentHeight`, `ViewportHeight`, etc.) and events so callers can react to scrolling. Use `Scrolled` when you need the complete scroll state, or `VerticalScrollOffsetChanged` when a vertical virtualization layer only needs the old and new line offsets. Children are added via `AddControl` (or the builder's `.AddControl()`), and the panel can be created with the `Controls.ScrollablePanel()` / `ScrollablePanelBuilder` fluent API.
 
 See also: [TabControl](TabControl.md), [HorizontalGridControl](HorizontalGridControl.md)
 
@@ -41,6 +46,7 @@ Create a builder with `Controls.ScrollablePanel()` or `new ScrollablePanelBuilde
 .WithVerticalScroll(ScrollMode mode = ScrollMode.Scroll)     // Vertical scroll mode (default: Scroll)
 .WithHorizontalScroll(ScrollMode mode = ScrollMode.Scroll)   // Horizontal scroll mode (default: None)
 .WithMouseWheel(bool enable = true)                          // Enable/disable mouse-wheel scrolling
+.WithMouseWheelScrollSpeed(int speed)                        // Lines scrolled per wheel notch (min 1)
 .WithAutoScroll(bool enabled = true)                         // Auto-scroll to bottom as content is added
 ```
 
@@ -104,6 +110,7 @@ Create a builder with `Controls.ScrollablePanel()` or `new ScrollablePanelBuilde
 | `VerticalScrollMode` | `ScrollMode` | `Scroll` | Vertical scroll behavior (`None`/`Scroll`/`Wrap`) |
 | `HorizontalScrollMode` | `ScrollMode` | `None` | Horizontal scroll behavior (`None`/`Scroll`/`Wrap`) |
 | `EnableMouseWheel` | `bool` | `true` | Whether mouse-wheel scrolling is enabled |
+| `MouseWheelScrollSpeed` | `int` | `ControlDefaults.DefaultScrollWheelLines` (1) | Lines scrolled per wheel notch; values below 1 clamp to 1 |
 | `AutoScroll` | `bool` | `false` | Auto-scroll to bottom when content is added if currently at/near bottom |
 | `VerticalScrollOffset` | `int` | `0` | Current vertical scroll offset in lines (read-only) |
 | `HorizontalScrollOffset` | `int` | `0` | Current horizontal scroll offset in characters (read-only) |
@@ -135,6 +142,7 @@ Create a builder with `Controls.ScrollablePanel()` or `new ScrollablePanelBuilde
 | Event | Arguments | Description |
 |-------|-----------|-------------|
 | `Scrolled` | `ScrollEventArgs` | Raised when the panel is scrolled (carries `Direction`, `VerticalOffset`, `HorizontalOffset`) |
+| `VerticalScrollOffsetChanged` | `ScrollOffsetChangedEventArgs` | Raised on the UI thread after the vertical offset changes; carries `PreviousOffset` and `Offset`. Not raised when the clamped offset is unchanged. |
 | `GotFocus` | `EventArgs` | Raised when the panel gains focus |
 | `LostFocus` | `EventArgs` | Raised when the panel loses focus |
 | `MouseClick` | `MouseEventArgs` | Mouse click (interface requirement) |
@@ -143,6 +151,18 @@ Create a builder with `Controls.ScrollablePanel()` or `new ScrollablePanelBuilde
 | `MouseEnter` | `MouseEventArgs` | Mouse enters the control area (interface requirement) |
 | `MouseLeave` | `MouseEventArgs` | Mouse leaves the control area (interface requirement) |
 | `MouseMove` | `MouseEventArgs` | Mouse moves over the control (interface requirement) |
+
+For a virtualized transcript or log, subscribe to the offset-specific event and update only the visible range:
+
+```csharp
+panel.VerticalScrollOffsetChanged += (_, args) =>
+{
+    var firstVisibleLine = args.Offset;
+    virtualizedView.RefreshVisibleRange(firstVisibleLine);
+};
+```
+
+The event is raised only when the effective, clamped vertical offset changes. Subscribers are called on the UI thread, so background producers must marshal mutations through `EnqueueOnUIThread` or `InvokeAsync` before changing controls.
 
 ## Methods
 
@@ -188,7 +208,17 @@ The panel acts as an opaque focus scope. Keys are first delegated to the focused
 
 ScrollablePanelControl implements `IMouseAwareControl` and always wants mouse events.
 
-- **Mouse wheel up/down**: Forwarded to the child under the cursor first; if unhandled, scrolls the panel viewport (when `EnableMouseWheel` is true). Scrolls by `ControlDefaults.DefaultScrollWheelLines` per notch.
+- **Mouse wheel up/down**: Forwarded to the child under the cursor first; if unhandled, scrolls the panel viewport (when `EnableMouseWheel` is true). Scrolls by `MouseWheelScrollSpeed` lines per notch, which defaults to `ControlDefaults.DefaultScrollWheelLines`.
+
+```csharp
+// Change the wheel step everywhere, once at startup:
+ControlDefaults.DefaultScrollWheelLines = 3;
+
+// Or override it for just this panel:
+var panel = Controls.ScrollablePanel()
+    .WithMouseWheelScrollSpeed(5)
+    .Build();
+```
 - **Scrollbar drag**: Click and drag the scrollbar thumb to scroll; clicking the track jumps the view.
 - **Click on a child**: Focuses the clicked child and routes the click to it.
 - **Click on empty space**: Enters scroll mode (focuses the panel itself).

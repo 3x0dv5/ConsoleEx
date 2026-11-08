@@ -2,11 +2,12 @@
 
 This document provides an overview of all example applications demonstrating SharpConsoleUI capabilities.
 
-## Video Demo
+## Videos
 
-[![SharpConsoleUI Video Demo](https://img.youtube.com/vi/sl5C9jrJknM/maxresdefault.jpg)](https://www.youtube.com/watch?v=sl5C9jrJknM)
-
-*Watch SharpConsoleUI examples in action on YouTube*
+| | |
+|:---:|:---:|
+| [![cxshell — a desktop in the terminal](https://img.youtube.com/vi/LOH_yuFBHss/mqdefault.jpg)](https://www.youtube.com/watch?v=LOH_yuFBHss)<br>**[cxshell — a desktop in the terminal](https://www.youtube.com/watch?v=LOH_yuFBHss)**<br>A full desktop environment: Start menu, taskbar, app manager, and other TUI applications running live inside its windows. | [![DemoApp showcase](https://img.youtube.com/vi/Oz8Yo50GfOs/mqdefault.jpg)](https://www.youtube.com/watch?v=Oz8Yo50GfOs)<br>**[DemoApp showcase](https://www.youtube.com/watch?v=Oz8Yo50GfOs)**<br>A tour of the bundled DemoApp — windows, controls, markup, compositor effects and dialogs. |
+| [![Chronicle Workbench](https://img.youtube.com/vi/4jStrJD_EFU/mqdefault.jpg)](https://www.youtube.com/watch?v=4jStrJD_EFU)<br>**[Cratis Chronicle Workbench](https://www.youtube.com/watch?v=4jStrJD_EFU)**<br>A third-party product built on SharpConsoleUI — live event-store browsing for the [Chronicle](https://github.com/Cratis/Chronicle) platform. | [![SharpConsoleUI examples](https://img.youtube.com/vi/sl5C9jrJknM/mqdefault.jpg)](https://www.youtube.com/watch?v=sl5C9jrJknM)<br>**[Examples in action](https://www.youtube.com/watch?v=sl5C9jrJknM)**<br>The original walkthrough of the example projects. |
 
 ## Quick Start
 
@@ -20,6 +21,63 @@ dotnet run --project Examples/<ExampleName>
 ## Real-World Applications
 
 Production applications built with SharpConsoleUI.
+
+### cxagent
+A terminal AI coding agent — say what you want, watch it work.
+
+![cxagent](images/examples/cxagent-session.png)
+
+**Project:** [github.com/nickprotop/cxagent](https://github.com/nickprotop/cxagent)
+
+Give it a goal in plain language and it reads your files, works out what to change, and changes them — in one context, with the real bytes in front of it. Anything outside the working folder asks permission first. Bring your own model: Ollama, any OpenAI-compatible endpoint, or Anthropic.
+
+**Key Features:**
+- Single-agent loop with permission-gated file, shell and HTTP tools
+- Sub-agents (explore, review, test, planner) that report back into the parent transcript
+- Live session panel: turns, tool calls, per-model and per-agent token accounting, git state
+- Built-in diff view for uncommitted and untracked changes
+- Usage stats broken down by project, model, agent type, and what filled the context
+- MCP tool support and loadable skills
+
+**SharpConsoleUI features on show:**
+- A transcript of collapsible tool-call rows (`expand…`) beside a sticky live status panel
+- Modal permission prompts with `Allow once` / `Always allow` / `Deny` buttons over the running transcript
+- Markdown rendered inline in the transcript — headings, bullet lists, tables and syntax-colored code
+- `FigletControl` banner, horizontal bar charts, and a status bar carrying live context percentage
+
+| Permission prompt | Diff view | Usage stats |
+|-------------------|-----------|-------------|
+| ![Permission](images/examples/cxagent-permission.png) | ![Diff](images/examples/cxagent-diff.png) | ![Stats](images/examples/cxagent-stats.png) |
+
+---
+
+### cxshell
+A complete desktop environment, running in a terminal.
+
+![cxshell desktop](images/examples/cxshell-desktop.png)
+
+**Project:** [github.com/nickprotop/cxshell](https://github.com/nickprotop/cxshell)
+
+A Start menu, taskbar, system tray and movable windows, with an app manager that installs and updates terminal applications. Other TUI apps run *inside* its windows — the screenshot above has LazyDotIDE, cxtop and cxgpu each hosted in their own draggable window, live at the same time. Made for SSH: a real desktop on a remote machine without a single pixel of X11.
+
+**Key Features:**
+- Start menu, taskbar with window list, system tray with clock, network and battery
+- App Manager: catalog-based install, update detection, sandboxed builds, script installers
+- Built-in apps for files, settings and a terminal
+- Multi-page settings dialog (colors, background, keyboard, mouse, tray, network)
+- Runs over SSH; no browser, no X11
+
+**SharpConsoleUI features on show:**
+- The window manager itself: overlapping windows with drag, resize, minimize, maximize and z-order
+- `TerminalControl` hosting full external TUI applications inside a window, each with its own PTY
+- Independent async render loops per window — several live monitors updating at once without blocking each other
+- Portal flyouts for the Start menu and tray, and modal dialogs over the running desktop
+
+| Desktop with hosted apps | App Manager |
+|--------------------------|-------------|
+| ![Desktop](images/examples/cxshell-desktop.png) | ![App Manager](images/examples/cxshell-appmanager.png) |
+
+---
 
 ### cxnet
 Real-time network throughput monitor for the terminal.
@@ -70,6 +128,57 @@ Live gauges and Braille sparkline history for utilization, memory, temperature, 
 
 ---
 
+### cxtop
+htop/btop-inspired system monitor for the terminal.
+
+![cxtop](images/examples/cxtop-screenshot.png)
+
+**Project:** [github.com/nickprotop/cxtop](https://github.com/nickprotop/cxtop)
+
+Live CPU, memory, network and storage metrics with a hardware identity dashboard, sparkline history, and a sortable process list with per-process actions. Cross-platform.
+
+**SharpConsoleUI features on show:**
+- Tabbed views (Processes, Memory, CPU, Network, Storage) over a shared header of live gauges
+- A sortable, mouse-selectable process table with a detail pane beside it
+- Sparkline history driven by an async per-window render loop
+- Double-click actions and a status bar carrying live system totals
+
+---
+
+### CXFiles
+Explorer-style terminal file manager.
+
+![CXFiles](images/examples/cxfiles-screenshot.png)
+
+**Project:** [github.com/nickprotop/cxfiles](https://github.com/nickprotop/cxfiles)
+
+Three-pane layout with a folder tree, file list and detail panel, plus tabs, image preview through the Kitty graphics protocol, a properties dialog and trash support.
+
+**SharpConsoleUI features on show:**
+- `TreeControl` folder tree beside a `TableControl` file list, split by draggable splitters
+- Tabs for multiple locations open at once
+- Inline image preview via the Kitty graphics protocol
+- Modal properties and confirmation dialogs
+
+---
+
+### CXPost
+Terminal email client.
+
+![CXPost](images/examples/cxpost-dashboard.png)
+
+**Project:** [github.com/nickprotop/cxpost](https://github.com/nickprotop/cxpost)
+
+Multi-account IMAP/SMTP with conversation threading, HTML message rendering, attachment handling and an offline cache.
+
+**SharpConsoleUI features on show:**
+- Threaded conversation view built on `TreeControl`, beside a scrollable message pane
+- HTML email rendered into terminal cells
+- Multi-account switching through portal flyouts
+- Compose and attachment dialogs over the running mailbox
+
+---
+
 ### ServerHub
 Production-ready Linux server control panel.
 
@@ -86,6 +195,13 @@ Terminal-based control panel for Linux servers and homelabs with 14 bundled widg
 - Widget browser with search and filtering
 - Custom widget support (any language)
 - Context-aware actions system
+
+**SharpConsoleUI features on show:**
+- `SparklineControl` and `LineGraphControl` history across the monitoring widgets
+- A widget grid that reflows with terminal width, each widget its own composed panel
+- Modal dialogs throughout, for widget config, actions and confirmations
+- `PromptControl` and `DropdownControl` inputs in the widget browser's search and filters
+- Live metric polling on an async window thread, with toast notifications for threshold alerts
 
 | Main Dashboard | Network Traffic | Widget Browser |
 |----------------|-----------------|----------------|
@@ -110,6 +226,13 @@ Keyboard-driven TUI for browsing projects, checking for updates, installing/remo
 - CPM (Central Package Management) migration wizard
 - Operation history with undo support
 
+**SharpConsoleUI features on show:**
+- `TabControl` views over a `ScrollablePanelControl` package list, with a `ToolbarControl` and a status bar
+- `DropdownControl` pickers for sources and update strategies, in portal flyouts
+- Modal dialogs (`AsModal`) for confirmations and the CPM wizard, plus the built-in folder picker
+- Toast notifications and a `ProgressBarControl` for restore/update operations
+- A long-running package scan on an async window thread, leaving the UI responsive
+
 | Dashboard | Search NuGet.org | Dependency Tree |
 |-----------|-----------------|-----------------|
 | ![Dashboard](images/examples/lazynuget-dashboard.png) | ![Search](images/examples/lazynuget-search.png) | ![Deps](images/examples/lazynuget-deps.png) |
@@ -132,6 +255,13 @@ Console-based .NET IDE with LSP-powered IntelliSense, built-in terminal, and git
 - Multi-file editing with tab navigation
 - Works over SSH and in containers
 
+**SharpConsoleUI features on show:**
+- `MultilineEditControl` driven by `ISyntaxHighlighter` implementations — the framework's syntax-highlighting seam
+- `TerminalControl`, the PTY-backed terminal emulator, hosted as a panel inside the IDE
+- `TreeControl` file explorer beside the editor, split by draggable `SplitterControl`s
+- LSP completion surfaced through portal overlays; `TabControl` for open files
+- Modal git dialogs (commit, discard-confirm) over the running editor
+
 | Editor + IntelliSense | Git Integration |
 |----------------------|-----------------|
 | ![IntelliSense](images/examples/lazydotide-intellisense.png) | ![Git](images/examples/lazydotide-git.png) |
@@ -142,10 +272,45 @@ Console-based .NET IDE with LSP-powered IntelliSense, built-in terminal, and git
 
 The best visual demonstrations of SharpConsoleUI capabilities, ordered by impact.
 
-### DemoApp
-The flagship demo — six independent windows running simultaneously.
+### WebHost — a terminal UI in a browser, with no terminal
 
-![DemoApp](images/examples/demoapp.png)
+![DemoApp running in a browser](images/examples/webhost-browser.png)
+
+```bash
+dotnet run --project Examples/WebHost     # then http://127.0.0.1:5088
+```
+
+That screenshot is a **web browser**. The application inside it is DemoApp —
+[the same one below](#demoapp), unmodified — running on `HeadlessConsoleDriver` with no
+terminal anywhere. Each frame is rendered to PNG and served over HTTP; clicks and keystrokes
+go back through the same input dispatch a real keypress takes.
+
+Both windows in the shot were opened by clicking in the browser. Window management, focus,
+hit-testing and the taskbar all behave exactly as they do on a tty, because they are the
+same code reaching the same decisions — only the final surface changed.
+
+**Key Features:**
+- DemoApp is not adapted: the host calls the same two methods `DemoApp.Main` calls
+- The web layer reaches the application **only** through its diagnostics socket, so it would
+  work unchanged against an app in another process that someone else started
+- Browser clicks translated to cell coordinates, keys to tmux notation (`Down`, `C-c`, `S-Tab`)
+- The browser window can resize the application, which a real terminal driver cannot allow
+- Unchanged frames cost ~29 bytes instead of 34 KB, so polling an idle UI is nearly free
+
+**Loopback only.** It grants full control of the application, not a read-only view. See the
+[example's README](../Examples/WebHost/README.md) and
+[Drivers](DRIVERS.md) for the driver story behind it.
+
+### DemoApp
+The flagship demo — every control in the library, in windows you can open at once.
+
+![DemoApp](images/examples/demoapp-windows-live.png)
+
+Nine windows at once, every one of them live: a FIGlet clock ticking, a 10,000-row
+virtual DataGrid, braille system charts redrawing four feeds, the markup reference,
+and a resizable grid dashboard — composited over a gradient desktop with a taskbar
+along the bottom. Nothing here is a mock-up or a still; it is one frame of the running
+application.
 
 ```bash
 dotnet run --project Examples/DemoApp
@@ -159,15 +324,15 @@ dotnet run --project Examples/DemoApp
 - `ImageControl` rendering images directly in the terminal
 - Full markup syntax showcase with colors, decorations, and gradients
 - **Markdown** page — the `[markdown]` tag rendering headings, lists, tables, blockquotes, and syntax-highlighted code blocks as native markup
-- **IDE Layout** page — `MultilineEditControl` with built-in syntax highlighting (`SyntaxHighlighters.For("csharp")` / `"markdown"`)
+- **IDE Layout** page — `MultilineEditControl` with syntax highlighting (`SyntaxHighlighters.For("csharp")` / `"markdown"`)
 - Async window threads with `CancellationToken`
 - Theme switching and window taskbar navigation
 
 **Controls:** Ctrl+O to open demo windows, Alt+1-6 to switch
 
-| Markup, Gradients & International Text | File Explorer, DataGrid & Package Manager | NavigationView Launcher |
-|----------------------------------------|--------------------------------------------|-------------------------|
-| ![Markup Demo](images/examples/demoapp-markup.png) | ![Windows Demo](images/examples/demoapp-windows.png) | ![NavigationView](images/examples/demoapp-navigationview.png) |
+| Launcher & Demo Windows | Markup, Gradients & International Text | File Explorer, DataGrid & Package Manager | NavigationView Launcher |
+|-------------------------|----------------------------------------|--------------------------------------------|-------------------------|
+| ![DemoApp](images/examples/demoapp.png) | ![Markup Demo](images/examples/demoapp-markup.png) | ![Windows Demo](images/examples/demoapp-windows.png) | ![NavigationView](images/examples/demoapp-navigationview.png) |
 
 ---
 
@@ -242,7 +407,7 @@ dotnet run --project Examples/DemoApp
 # Navigate to Rendering → Alpha Blending
 ```
 
-Five zones demonstrate every level of the alpha pipeline against a continuously cycling full-spectrum gradient (three hues 120° apart rotating through the colour wheel every ~12 s):
+Five zones demonstrate every level of the alpha pipeline against a continuously cycling full-spectrum gradient (three hues 120° apart rotating through the color wheel every ~12 s):
 
 | Zone | What it shows |
 |------|--------------|
@@ -254,7 +419,7 @@ Five zones demonstrate every level of the alpha pipeline against a continuously 
 
 **APIs Demonstrated:**
 - `Color.Blend()` — Porter-Duff "over" compositing
-- `ColorGradient.FromColors()` with time-varying hues for a smooth colour-wheel cycle
+- `ColorGradient.FromColors()` with time-varying hues for a smooth color-wheel cycle
 - `ScrollablePanel` with semi-transparent `BackgroundColor` (glass effect)
 - `SliderControl` wired to a live `MarkupControl` preview
 - Markup inline alpha: `[#RRGGBBAA]text[/]`
@@ -313,30 +478,205 @@ dotnet run --project Examples/AgentStudio
 ```
 
 **Key Features:**
-- Modern TUI design patterns
-- Advanced `NetConsoleDriverOptions` configuration
-- Hidden status bars for immersive experience
-- Custom window class implementation
+- `ChatTranscriptControl` transcript of prompts, tool calls and streamed replies
+- Command palette modal (Ctrl+P) with a searchable command list
+- Session Info sidebar with live `ProgressBarControl` token and latency meters
+- Session manager modal (Ctrl+J) built with `AsModal()`
+- Advanced `NetConsoleDriverOptions` configuration and a custom window class
+
+**SharpConsoleUI features on show:**
+- `ChatTranscriptControl` — a composite control that arranges markup, wrapping and scroll for a message log
+- Modal overlays floating above the live transcript, dismissed with Escape
+- Markdown and syntax-colored code rendered inline in transcript messages, with bordered result tables
+- A status bar carrying model and keybinding hints while the driver hides the chrome
+
+---
+
+### SpaceInvaders
+A polished arcade remake built only from SharpConsoleUI parts: half-block pixel art, particles, screen shake and a data-bound HUD.
+
+![Space Invaders](images/examples/spaceinvaders.png)
+
+| Title screen | Wave transition (CRT on) | Pause overlay |
+|--------------|--------------------------|---------------|
+| ![Title](images/examples/spaceinvaders-title.png) | ![Wave](images/examples/spaceinvaders-wave.png) | ![Pause](images/examples/spaceinvaders-pause.png) |
+
+Gradient FIGlet lettering rasterised into pixels, invaders flying in on an easing curve, and
+the `PostBufferPaint` CRT filter and pause desaturation applied to the composed frame.
+
+```bash
+dotnet run --project Examples/SpaceInvaders
+```
+
+**Key Features:**
+- Half-block pixel rendering: each terminal cell shows two near-square pixels, giving real sprites and shields that erode pixel by pixel
+- Classic marching formation that speeds up as it thins out, a mystery UFO, three bomb types, and a combo multiplier
+- Particle shatter explosions, floating score pop-ups, screen shake, hit-stop slow motion, a warp starfield between waves, and a game-over desaturation
+- A keyboard model that works around the OS auto-repeat delay (terminals report no key releases). K cycles three modes: STEP (the default: one press moves one step, holding keeps moving), GLIDE (no pause while holding) and LATCH. The game learns the OS repeat delay as you play
+- Mouse steering with no lag, and fire on button press (not release)
+- High score saved between runs
+
+**SharpConsoleUI features on show:**
+- `CanvasControl` subclass (`AutoSize`, `BeginPaint`/`EndPaint`) that re-implements `IMouseAwareControl` to catch `Button1Pressed`
+- Game loop registered with `ConsoleWindowSystem.Animations` as an `IAnimation`: the render loop advances it once per composed frame, on the UI thread, so game state, key handlers and bindings share that thread with no locks and the game keeps no clock of its own
+- Because it runs on the animation clock, the diagnostics socket can freeze the game and step it by hand while the UI keeps rendering (see [Animations](ANIMATIONS.md#uncapped-delta))
+- `PreviewKeyPressed` key capture, `TargetFPS: 120` frame cap, `Frameless()` maximised window with a gradient background
+- FIGlet fonts (`FigletFont`/`FigletRenderer`) rasterised into gradient pixel lettering; `EasingFunctions.Bounce` fly-ins
+- `PostBufferPaint` compositor hook for the damage flash (`ColorBlendHelper.ApplyColorOverlay`) and an optional CRT scanline filter
+- HUD made of `FigletControl`, `ProgressBarControl`, `BarGraphControl` (animated, smooth gradients) and `SparklineControl`, all updated through `.Bind()` from an `INotifyPropertyChanged` model
+- `ToastService` announcements, `WindowAnimations.FadeIn`, clickable `StatusBarControl` items
+
+**Controls:** ←/→ or A/D to move, ↓/S to stop, Space/↑ to fire, mouse to steer and click to fire, P/Esc to pause, K for keyboard mode, C for CRT, R to restart, Q to quit
 
 ---
 
 ### SnakeGame
-Classic Snake game demonstrating direct frame buffer manipulation.
+Snake rebuilt the way SpaceInvaders is: half-block pixel art, interpolated motion, particles and a data-bound HUD.
 
 ![Snake Game](images/examples/snakegame.png)
 
+| Title screen | CRT filter on | Pause overlay |
+|--------------|---------------|---------------|
+| ![Title](images/examples/snakegame-title.png) | ![CRT](images/examples/snakegame-crt.png) | ![Pause](images/examples/snakegame-pause.png) |
+
+The snake slides between grid cells instead of teleporting a cell at a time, fruit pops in on an
+easing curve, and the `PostBufferPaint` hook carries the eat flash and the optional CRT filter.
+
 ```bash
 dotnet run --project Examples/SnakeGame
+
+# Drive it from outside: open a diagnostics socket, or run with no terminal at all
+dotnet run --project Examples/SnakeGame -- --socket
+dotnet run --project Examples/SnakeGame -- --headless --socket --width 120 --height 36
 ```
 
 **Key Features:**
-- Direct `CharacterBuffer` manipulation via `PostBufferPaint`
-- Real-time game loop with `System.Timers.Timer`
-- Sidebar layout using `HorizontalGridControl`
-- Keyboard input handling (arrows/WASD)
-- Game state management (playing, paused, game over)
+- Half-block pixel rendering: each terminal cell shows two near-square pixels, so segments are round and the arena has a visible checkerboard
+- **Interpolated motion** — the snake lives on a grid but is drawn between ticks, which is the single biggest difference from classic terminal Snake
+- **A buffered turn queue** — two presses inside one tick both land, instead of the second silently overwriting the first. That lost press is the most common complaint about terminal Snake, and it is an input bug rather than a timing one
+- A combo multiplier that decays on a visible timer, timed bonus fruit, and a one-per-run shield that turns the snake to a survivable heading rather than merely postponing the same death
+- Portal or solid walls, switchable mid-run; portal walls shimmer so the rule is readable off the board
+- Particle bursts, floating score pop-ups, screen shake, hit-stop slow motion, and a death animation that dissolves the body and leaves a skull
+- High score saved between runs
 
-**Controls:** Arrow keys or WASD to move, P to pause, R to restart, Esc to quit
+**SharpConsoleUI features on show:**
+- `CanvasControl` subclass (`AutoSize`, `BeginPaint`/`EndPaint`) that re-implements `IMouseAwareControl` to catch `Button1Pressed`
+- Game loop registered with `ConsoleWindowSystem.Animations` as an `IAnimation`: the render loop advances it once per composed frame, on the UI thread, so game state, key handlers and bindings share that thread with no locks and the game keeps no clock of its own
+- Because it runs on the animation clock, the diagnostics socket can freeze the game and step it by hand while the UI keeps rendering (see [Animations](ANIMATIONS.md#uncapped-delta))
+- `PreviewKeyPressed` key capture, `TargetFPS: 120` frame cap, `Frameless()` maximised window with a gradient background
+- `EasingFunctions.Elastic` fruit pop-in; `ColorGradient` particle palettes
+- `PostBufferPaint` compositor hook for the eat flash (`ColorBlendHelper.ApplyColorOverlay`) and an optional CRT scanline filter
+- HUD made of `FigletControl`, `ProgressBarControl`, `BarGraphControl` (animated, smooth gradients) and `SparklineControl`, all updated through `.Bind()` from an `INotifyPropertyChanged` model
+- `ToastService` announcements, `WindowAnimations.FadeIn`, clickable `StatusBarControl` items
+- `--socket` / `--headless`: the diagnostics socket and `HeadlessConsoleDriver`, so the game can be played and screenshotted by another process with no terminal involved
+
+**Controls:** Arrows or WASD to turn, mouse to steer, P/Space to pause, T for walls, C for CRT, R to restart, Q/Esc to quit
+
+---
+
+### Breakout
+The third arcade game, and the one written to show a game loop that is not a loop: it runs on the window system's animation manager.
+
+![Breakout](images/examples/breakout.png)
+
+| Title screen | CRT filter on | Pause overlay |
+|--------------|---------------|---------------|
+| ![Title](images/examples/breakout-title.png) | ![CRT](images/examples/breakout-crt.png) | ![Pause](images/examples/breakout-pause.png) |
+
+SnakeGame and SpaceInvaders used to pace themselves: a loop on the window thread, `Task.Delay`
+to a frame deadline, and a `Stopwatch` nothing else could see. All three now register an
+`IAnimation` with `ConsoleWindowSystem.Animations` instead, so the render loop advances them
+once per composed frame and no game owns a clock of its own.
+
+```bash
+dotnet run --project Examples/Breakout
+
+# Drive it from outside: open a diagnostics socket, or run with no terminal at all
+dotnet run --project Examples/Breakout -- --socket
+dotnet run --project Examples/Breakout -- --headless --socket --width 120 --height 36
+```
+
+Because the game runs on the animation clock, that clock can be frozen and advanced by hand:
+
+```bash
+cxdbg clock --target animation --fake            # the simulation stops
+cxdbg clock --target animation --advance 1000    # exactly 120 steps at a 1/120 step
+cxdbg image --path shot.png                      # the UI rendered throughout
+```
+
+The render loop keeps composing frames while the simulation stands still, so the window stays
+responsive rather than looking hung. The HUD's LOOP panel reports the frames and steps as they
+diverge.
+
+**Key Features:**
+- Ball physics with a sub-step sweep, so a fast ball cannot tunnel through a brick between frames
+- The paddle steers by where the ball lands on it: edges angle it away, the middle sends it straight back
+- Four power-ups that fall from broken bricks (wide paddle, slow ball, multi-ball, extra life), armoured two-hit bricks from level 3, and a combo multiplier
+- An attract mode that plays itself rather than showing a static title
+- Particle debris coloured from the brick that broke, score pop-ups, screen shake and a floor that glows red as the ball nears it
+- High score saved between runs
+
+**SharpConsoleUI features on show:**
+- Game loop as an `IAnimation` with `WantsUncappedDelta`, registered through `TryAdd` so a refused registration is an error rather than a game that silently never starts (see [Animations](ANIMATIONS.md#uncapped-delta))
+- `CanvasControl` with half-block pixel rendering and `BeginPaint`/`EndPaint`
+- `PreviewKeyPressed` key capture, `Frameless()` maximised window with a gradient background
+- FIGlet lettering rasterised into pixels for the title and game-over banners
+- `PostBufferPaint` compositor hook for the damage flash and an optional CRT scanline filter
+- HUD made of `FigletControl`, `ProgressBarControl`, `BarGraphControl` and `SparklineControl`, all updated through `.Bind()` from an `INotifyPropertyChanged` model
+- `ToastService` announcements, `WindowAnimations.FadeIn`, clickable `StatusBarControl` items
+- `--socket` / `--headless`: the diagnostics socket and `HeadlessConsoleDriver`
+
+**Controls:** ←/→ or A/D to move, mouse to steer, Space to serve, P/Esc to pause, C for CRT, R to restart, Q to quit
+
+---
+
+### Tetris
+The fourth arcade game, and the one that had to fit a fixed-proportion board into whatever
+terminal it was given.
+
+![Tetris](images/examples/tetris.png)
+
+| Title screen | Pause overlay |
+|--------------|---------------|
+| ![Title](images/examples/tetris-title.png) | ![Pause](images/examples/tetris-pause.png) |
+
+Guideline rules: SRS rotation with wall kicks, a seven-bag randomiser, hold, a ghost piece,
+lock delay with a reset cap, and back-to-back scoring. Like the other three it registers an
+`IAnimation` with `ConsoleWindowSystem.Animations` rather than running a loop of its own.
+
+```bash
+dotnet run --project Examples/Tetris
+
+# Drive it from outside: open a diagnostics socket, or run with no terminal at all
+dotnet run --project Examples/Tetris -- --socket
+dotnet run --project Examples/Tetris -- --headless --socket --width 130 --height 38
+```
+
+A pixel on the half-block surface is a whole column wide and half a row tall, so a square
+board cell needs twice as many pixels across as down. The well scales that 2:1 unit up or down
+by whatever both axes can afford, so a tall window gets a tall board rather than a fixed small
+one adrift in empty space, and the pair always scales together, which is what keeps the cells
+square instead of squashing one axis.
+
+**Key Features:**
+- SRS rotation with wall kicks, so a piece rotating against a wall or the stack shifts into the gap rather than refusing
+- A seven-bag randomiser: every piece appears once before any repeats, which removes the droughts pure random produces
+- Lock delay with a reset cap: a piece resting on the stack can still be moved, but not indefinitely
+- Ghost piece, hold slot, soft and hard drop, back-to-back and combo scoring
+- Delayed auto shift: holding a direction slides the piece smoothly from the first cell, and a tap always moves exactly one cell
+- Particle debris coloured from the cleared row, screen shake, a white flash on a tetris, and score pop-ups
+- High score saved between runs
+
+**SharpConsoleUI features on show:**
+- Game loop as an `IAnimation` with `WantsUncappedDelta`, registered through `TryAdd` (see [Animations](ANIMATIONS.md#uncapped-delta))
+- `CanvasControl` with half-block pixel rendering through `PixelSurface`, and `BeginPaint`/`EndPaint`
+- Pixel-font lettering rasterised for the title banner, glow-masked over the well
+- `PreviewKeyPressed` key capture, `Frameless()` maximised window
+- HUD made of `ProgressBarControl` and `SparklineControl`, updated through `.Bind()` from an `INotifyPropertyChanged` model
+- `ToastService` announcements and clickable `StatusBarControl` items
+- `--socket` / `--headless`: the diagnostics socket and `HeadlessConsoleDriver`, so the game can be played and screenshotted by another process with no terminal involved
+
+**Controls:** ←/→ to move, ↑/X to rotate, Z to rotate counter-clockwise, ↓ to soft drop, Space to hard drop, C to hold, P to pause, R to restart, Q to quit
 
 ---
 
@@ -352,7 +692,7 @@ dotnet run --project Examples/TextEditorExample
 **Key Features:**
 - Multiline edit control with scrolling
 - File browser dialog integration
-- Syntax highlighting via the built-in highlighters (`SyntaxHighlighters.For(...)` — C#, JSON, XML, and more)
+- Syntax highlighting via TextMate grammars (`SyntaxHighlighters.For(...)` — ~64 languages, themed by the app)
 - Save/load functionality
 - Line numbers and cursor position
 
@@ -373,14 +713,14 @@ dotnet run --project Examples/DemoApp
 ```
 
 **Key Features:**
-- Load PNG, JPEG, BMP, GIF, WebP, TIFF files via file picker dialog
+- Load PNG, JPEG, BMP, GIF, TGA files via file picker dialog
 - Half-block rendering (2 vertical pixels per character cell)
 - Four scale modes: Fit, Fill, Stretch, None
 - Resizable window with live image rescaling
 - Keyboard shortcuts: Ctrl+O to open, S to cycle scale, Esc to close
 
 **APIs Demonstrated:**
-- `PixelBuffer.FromFile()` — decode image files via SixLabors.ImageSharp
+- `PixelBuffer.FromFile()` — decode image files via StbImageSharp
 - `ImageControl` with `ScaleMode` switching
 - `FileDialogs.ShowFilePickerAsync()` with format filter
 - `HorizontalGridControl` for toolbar layout
@@ -477,7 +817,7 @@ ASCII art font showcase demonstrating Figlet font rendering.
 ![Figlet Showcase](images/examples/figletshowcase.png)
 
 ```bash
-dotnet run --project Examples/FigleShowcaseExample
+dotnet run --project Examples/FigletShowcaseExample
 ```
 
 **Key Features:**
@@ -539,8 +879,10 @@ These examples demonstrate specific features without full screenshots.
 | Alpha Blending Demo | ✅ | | ✅ | | | |
 | HighFreqDemo | ✅ | | ✅ | | | |
 | CompositorEffectsExample | ✅ | ✅ | | ✅ | | |
-| AgentStudio | | | | | | |
-| SnakeGame | | ✅ | | | | ✅ |
+| AgentStudio | ✅ | | ✅ | | | |
+| SpaceInvaders | | ✅ | ✅ | | | ✅ |
+| SnakeGame | | ✅ | ✅ | | | ✅ |
+| Breakout | | ✅ | ✅ | | | ✅ |
 | TextEditorExample | | | | | | |
 | MultiDashboard | ✅ | | | | | |
 | FigletShowcaseExample | | | | | | |
@@ -569,9 +911,9 @@ These examples demonstrate specific features without full screenshots.
 | `MenuControl` | MenuDemo, HighFreqDemo |
 | `TableControl` | DemoApp, TableDemo |
 | `PanelControl` | StartMenuDemo, PanelDemo, HighFreqDemo |
-| `SparklineControl` | HighFreqDemo, NavigationViewDemo |
+| `SparklineControl` | HighFreqDemo, NavigationViewDemo, SpaceInvaders, Breakout |
 | `LineGraphControl` | DemoApp |
-| `BarGraphControl` | HighFreqDemo, NavigationViewDemo |
+| `BarGraphControl` | HighFreqDemo, NavigationViewDemo, SpaceInvaders, Breakout |
 | `NavigationView` | DemoApp, NavigationViewDemo |
 | `ProgressBarControl` | DemoApp, NavigationViewDemo |
 | `PromptControl` | DemoApp (Command Window) |
@@ -579,7 +921,7 @@ These examples demonstrate specific features without full screenshots.
 | `LogViewerControl` | DemoApp |
 | `TabControl` | TabControlDemo |
 | `ImageControl` | DemoApp (Image Rendering, Image Viewer) |
-| `CanvasControl` | CanvasDemo, DemoApp |
+| `CanvasControl` | CanvasDemo, DemoApp, SpaceInvaders, Breakout |
 | `HorizontalGridControl` | Most examples |
 | `SliderControl` | DemoApp, Alpha Blending Demo |
 | `RangeSliderControl` | DemoApp |
@@ -642,12 +984,12 @@ canvas.CanvasMouseClick += (sender, e) => {
 ### Buffer Paint Hooks
 ```csharp
 // PreBufferPaint - Custom backgrounds
-window.Renderer.PreBufferPaint += (buffer, dirty, clip) => {
+window.PreBufferPaint += (buffer, dirty, clip) => {
     // Render background before controls
 };
 
 // PostBufferPaint - Post-processing effects
-window.Renderer.PostBufferPaint += (buffer, dirty, clip) => {
+window.PostBufferPaint += (buffer, dirty, clip) => {
     // Apply effects after controls render
 };
 ```

@@ -2,6 +2,11 @@
 
 Scrollable list control with single selection and keyboard/mouse navigation.
 
+<!-- gallery -->
+
+![ListControl](../images/controls/ListControl.png)
+
+
 ## Overview
 
 ListControl displays a scrollable list of items with selection support. Users can navigate with keyboard or mouse, select items, and activate items (double-click or Enter).
@@ -14,6 +19,9 @@ ListControl displays a scrollable list of items with selection support. Users ca
 | `SelectedIndex` | `int` | `-1` | Index of selected item (-1 = none) |
 | `SelectedItem` | `ListItem?` | `null` | Currently selected item |
 | `MaxVisibleItems` | `int` | `10` | Number of visible items |
+| `MouseWheelScrollSpeed` | `int` | `ControlDefaults.DefaultScrollWheelLines` (1) | Items scrolled per mouse wheel notch; values below 1 clamp to 1 |
+| `ActivateOnSingleClick` | `bool` | `false` | One click activates as well as selects, for a list used as a menu |
+| `DoubleClickActivates` | `bool` | `true` | Whether a double click activates. Gates the double-click path only - turning it off does not make single clicks activate |
 | `IsEnabled` | `bool` | `true` | Enable/disable list |
 | `BackgroundColor` | `Color?` | `null` | Background color (uses theme if null) |
 | `ForegroundColor` | `Color?` | `null` | Text color (uses theme if null) |
@@ -42,6 +50,7 @@ var list = Controls.List()
     .AddItem("Elderberry")
     .WithHeight(10)
     .WithColors(Color.White, Color.Grey15)
+    .WithMouseWheelScrollSpeed(2)
     .WithName("fruitList")
     .OnItemActivated((sender, item, window) =>
     {
@@ -109,9 +118,28 @@ window.AddControl(list);
 
 | Action | Result |
 |--------|--------|
-| **Left Click** | Select item and give focus |
-| **Double Click** | Activate item (fire ItemActivated) |
-| **Scroll Wheel** | Scroll list up/down |
+| **Left Click** | Select item and give focus. Also activates when `ActivateOnSingleClick` is set |
+| **Double Click** | Activate item (fire `ItemActivated`), unless `ActivateOnSingleClick` is set - then the first click of the pair already did it |
+| **Scroll Wheel** | Scroll list up/down by `MouseWheelScrollSpeed` items |
+
+### Lists used as menus
+
+A list activates on a double click, which is right for a file list and wrong for a
+menu — nobody double clicks a start menu. Set `ActivateOnSingleClick` and one click
+both selects and activates:
+
+```csharp
+var menu = new ListControl { ActivateOnSingleClick = true };
+menu.ItemActivated += (_, item) => Run(item);
+```
+
+The two properties are independent, and the pairing is worth knowing:
+
+| `ActivateOnSingleClick` | `DoubleClickActivates` | Result |
+|---|---|---|
+| `false` | `true` (default) | Double click activates. A single click only selects |
+| `true` | either | One click activates. A double click still activates **once** |
+| `false` | `false` | Nothing activates by mouse; keyboard `Enter` still does |
 
 ## ListItem
 
@@ -429,6 +457,7 @@ if (list != null && list.SelectedItem != null)
 5. **Clear and rebuild**: For filtering, clear Items and rebuild list
 6. **Call Invalidate**: After modifying Items collection
 7. **Check selection**: Always check SelectedIndex >= 0 before accessing SelectedItem
+8. **Adjust the wheel step**: `MouseWheelScrollSpeed` (or `.WithMouseWheelScrollSpeed()`) defaults to `ControlDefaults.DefaultScrollWheelLines`, so setting that once at startup changes the wheel step for every list that hasn't overridden it: `ControlDefaults.DefaultScrollWheelLines = 3;`
 
 ## Common Patterns
 

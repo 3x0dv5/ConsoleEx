@@ -3,6 +3,11 @@
 A horizontal divider line with an optional title — and, when you want it, a progress bar in
 disguise.
 
+<!-- gallery -->
+
+![RuleControl](../images/controls/RuleControl.png)
+
+
 ## Overview
 
 `RuleControl` draws a horizontal line across its container, optionally with a title embedded in it.
@@ -104,7 +109,7 @@ void SetIndeterminate(ColorGradient gradient, TimeSpan? cycleDuration = null);
 void ClearProgress(TimeSpan? fadeDuration = null);
 ```
 
-| Method | Behaviour |
+| Method | Behavior |
 |--------|-----------|
 | `SetProgress` | Fills the rule left-to-right with the gradient up to `ratio` (clamped to `[0,1]`). Cancels any shimmer or clear animation |
 | `SetIndeterminate` | Sweeps a gradient segment across the rule in a loop. `cycleDuration` defaults to **1500 ms** |
@@ -113,7 +118,7 @@ void ClearProgress(TimeSpan? fadeDuration = null);
 ## Events
 
 None. `RuleControl` implements `INotifyPropertyChanged` via `BaseControl` — see
-[Data Binding](../binding.md).
+[Data Binding](../BINDING.md).
 
 ## Keyboard and mouse support
 
@@ -138,7 +143,7 @@ window.AddControl(timeoutInput);
 window.AddControl(Controls.Separator());   // a RuleControl with an empty title
 ```
 
-### Centred title with a muted color
+### Centered title with a muted color
 
 ```csharp
 var rule = Controls.RuleBuilder()

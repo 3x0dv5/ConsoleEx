@@ -31,7 +31,17 @@ namespace SharpConsoleUI.Controls
 			}
 
 			if (!TryGetChildSlotBounds(child, out int top, out int height))
-				return; // Not our child (or not visible)
+			{
+				// Not a direct child. It may still live INSIDE one, which is what a caller normally has
+				// - they hold the control they want seen, not the panel's immediate child. Walk up to
+				// find which of our children contains it and reveal its row there. Revealing the whole
+				// containing child would not be enough: one that already spans the viewport is left in
+				// place by the tall-child guard, so a target further down it never appears (#91).
+				var owner = ResolveDirectChild(child);
+				if (owner != null && !ReferenceEquals(owner, child))
+					Helpers.FocusScrollHelper.RevealNestedTarget(this, owner, child);
+				return;
+			}
 
 			ScrollRangeIntoView(top, height);
 		}
@@ -39,7 +49,7 @@ namespace SharpConsoleUI.Controls
 		/// <summary>
 		/// Scrolls so that a sub-region of <paramref name="child"/> is visible. The region is given in the
 		/// child's own content coordinates: <paramref name="childRelativeTop"/> rows from the child's top,
-		/// spanning <paramref name="regionHeight"/> rows. Mirrors <see cref="ScrollChildIntoView"/>'s clamp,
+		/// spanning <paramref name="regionHeight"/> rows. Mirrors <see cref="ScrollChildIntoView(IWindowControl)"/>'s clamp,
 		/// applied to the region instead of the whole child — used to bring a focused element's row into view
 		/// when the child itself does not scroll.
 		/// </summary>
@@ -60,6 +70,29 @@ namespace SharpConsoleUI.Controls
 
 
 			ScrollRangeIntoView(top + Math.Max(0, childRelativeTop), Math.Max(1, regionHeight));
+		}
+
+		/// <summary>
+		/// Walks up from <paramref name="target"/> to the child of THIS panel that contains it.
+		/// Returns the target itself when it is already a direct child, or null when it does not live
+		/// under this panel.
+		/// </summary>
+		private IWindowControl? ResolveDirectChild(IWindowControl target)
+		{
+			var own = Children;
+
+			IWindowControl? current = target;
+			while (current != null)
+			{
+				for (int i = 0; i < own.Count; i++)
+				{
+					if (ReferenceEquals(own[i], current))
+						return current;
+				}
+				current = Core.FocusManager.ResolveParentWindowControl(current);
+			}
+
+			return null;
 		}
 
 		/// <summary>
@@ -138,7 +171,10 @@ namespace SharpConsoleUI.Controls
 			SyncMetricsFromArrangedBounds();
 
 			int oldOffset = _verticalScrollOffset;
-			int maxOffset = Math.Max(0, _contentHeight - _viewportHeight);
+			// Clamp against VisibleContentHeight (viewport minus the horizontal scrollbar row), which is
+			// what every caller already targets. Clamping against the full _viewportHeight stopped one row
+			// short whenever the horizontal scrollbar was shown, hiding the last line under it (#80).
+			int maxOffset = MaxVerticalScrollOffset;
 			SetVerticalScrollOffset(Math.Clamp(_verticalScrollOffset + lines, 0, maxOffset), "ScrollVerticalBy");
 
 			// AutoScroll state tracking
@@ -146,9 +182,12 @@ namespace SharpConsoleUI.Controls
 			{
 				_autoScroll = false;  // Detach: user scrolled up
 			}
-			else if (!_autoScroll && lines > 0 && _verticalScrollOffset >= maxOffset)
+			else if (!_autoScroll && _autoScrollEverEnabled && lines > 0 && _verticalScrollOffset >= maxOffset)
 			{
-				_autoScroll = true;   // Re-attach: user scrolled to bottom
+				// Re-attach: user scrolled back to the bottom. Gated on _autoScrollEverEnabled so this
+				// RESTORES a mode the panel already had rather than switching it on for a panel that
+				// never opted in.
+				_autoScroll = true;
 			}
 
 			if (oldOffset != _verticalScrollOffset)
@@ -161,7 +200,7 @@ namespace SharpConsoleUI.Controls
 		private void ScrollVerticalTo(int offset)
 		{
 			int oldOffset = _verticalScrollOffset;
-			SetVerticalScrollOffset(Math.Clamp(offset, 0, Math.Max(0, _contentHeight - _viewportHeight)), "ScrollVerticalTo");
+			SetVerticalScrollOffset(Math.Clamp(offset, 0, MaxVerticalScrollOffset), "ScrollVerticalTo");
 
 			if (oldOffset != _verticalScrollOffset)
 			{
@@ -257,16 +296,15 @@ namespace SharpConsoleUI.Controls
 		public void ScrollToBottom()
 		{
 			// Re-sync metrics from the arranged bounds so VisibleContentHeight reflects the real
-			// on-screen viewport (not a MEASURE-pass content-sized value). No-op when detached.
-			SyncMetricsFromArrangedBounds();
-
-			if (!RefreshContentHeightIfLaidOut())
+			// on-screen viewport. A successful sync already measured the current content height;
+			// only detached/unarranged panels need the fallback measurement.
+			if (!TrySyncMetricsFromArrangedBounds() && !RefreshContentHeightIfLaidOut())
 			{
 				// Viewport not laid out yet — defer to the first valid paint.
 				_pendingScrollToBottom = true;
 				return;
 			}
-			ScrollVerticalTo(Math.Max(0, _contentHeight - VisibleContentHeight));
+			ScrollVerticalTo(MaxVerticalScrollOffset);
 		}
 
 		/// <summary>

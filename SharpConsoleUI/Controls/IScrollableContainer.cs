@@ -29,7 +29,7 @@ namespace SharpConsoleUI.Controls
 		/// Scrolls so that a sub-region of <paramref name="child"/> is visible. The region is given in the
 		/// child's own content coordinates: <paramref name="childRelativeTop"/> rows from the child's top,
 		/// spanning <paramref name="regionHeight"/> rows. Used to bring a focused element's row into view when
-		/// the child itself does not scroll. Default implementation degrades to <see cref="ScrollChildIntoView"/>.
+		/// the child itself does not scroll. Default implementation degrades to <see cref="ScrollChildIntoView(IWindowControl)"/>.
 		/// </summary>
 		/// <param name="child">The (direct) child whose sub-region should be made visible.</param>
 		/// <param name="childRelativeTop">Row offset of the region from the child's top edge. A negative value is clamped to 0.</param>

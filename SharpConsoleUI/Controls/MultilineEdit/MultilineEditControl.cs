@@ -108,6 +108,7 @@ namespace SharpConsoleUI.Controls
 		private bool _skipUpdateScrollPositionsInRender = false;
 		private ScrollbarVisibility _verticalScrollbarVisibility = ScrollbarVisibility.Auto;
 		private int _verticalScrollOffset = 0;
+		private int _mouseWheelScrollSpeed = ControlDefaults.DefaultScrollWheelLines;
 		private int _viewportHeight;
 		private WrapMode _wrapMode = WrapMode.Wrap;
 		private int _lastDragRelativeY = 0;
@@ -321,6 +322,34 @@ namespace SharpConsoleUI.Controls
 		{
 			get
 			{
+				// The contract is the minimum width needed to DISPLAY the content, and this control
+				// scrolls: it displays any document at any width, so the longest line is not a
+				// minimum — it is a preference the control never asserts (MeasureDOM accepts
+				// whatever width it is handed). Reporting the longest line here made layout treat
+				// it as a hard requirement: a 436-character source line floored a flex grid column
+				// at 436 inside a 98-wide grid, pushing the sibling columns off-screen and putting
+				// every narrower splitter position out of reach.
+				//
+				// What the control genuinely cannot render below is its own chrome — the gutter and
+				// a vertical scrollbar — plus room for a little text.
+				int gutterWidth = GetGutterWidth();
+				bool needsVerticalScrollbar = _verticalScrollbarVisibility == ScrollbarVisibility.Always;
+				int scrollbarWidth = needsVerticalScrollbar ? 1 : 0;
+
+				return gutterWidth + scrollbarWidth + ControlDefaults.MultilineEditMinimumTextColumns
+					+ Margin.Left + Margin.Right;
+			}
+		}
+
+		/// <summary>
+		/// Gets the width of the widest line in the document, in display columns. This is what the
+		/// content would occupy if it were never wrapped or scrolled — a preference, not a
+		/// constraint; see <see cref="ContentWidth"/> for the minimum the control needs.
+		/// </summary>
+		public int LongestLineWidth
+		{
+			get
+			{
 				List<string> linesSnapshot;
 				lock (_contentLock) { linesSnapshot = _lines.ToList(); }
 				int maxLength = 0;
@@ -329,7 +358,7 @@ namespace SharpConsoleUI.Controls
 					int lineWidth = UnicodeWidth.GetStringWidth(line);
 					if (lineWidth > maxLength) maxLength = lineWidth;
 				}
-				return maxLength + Margin.Left + Margin.Right;
+				return maxLength;
 			}
 		}
 
@@ -493,6 +522,17 @@ namespace SharpConsoleUI.Controls
 				OnPropertyChanged();
 				Invalidate(Invalidation.Repaint);
 			}
+		}
+
+		/// <summary>
+		/// Gets or sets the number of lines scrolled per mouse wheel notch.
+		/// Values below 1 are clamped to 1.
+		/// Default: <see cref="ControlDefaults.DefaultScrollWheelLines"/>.
+		/// </summary>
+		public int MouseWheelScrollSpeed
+		{
+			get => _mouseWheelScrollSpeed;
+			set { _mouseWheelScrollSpeed = Math.Max(1, value); OnPropertyChanged(); }
 		}
 
 		/// <summary>
@@ -950,6 +990,13 @@ namespace SharpConsoleUI.Controls
 			get => _syntaxHighlighter;
 			set
 			{
+				// Assigning the SAME highlighter is a no-op: dropping the token cache here would
+				// force a full re-tokenize of the file on the next paint. Callers that mutate a
+				// highlighter in place (for example layering LSP semantic tokens over it) should
+				// call RefreshSyntaxHighlighting() to say so explicitly.
+				if (ReferenceEquals(_syntaxHighlighter, value))
+					return;
+
 				lock (_contentLock)
 				{
 					_syntaxHighlighter = value;
@@ -959,6 +1006,24 @@ namespace SharpConsoleUI.Controls
 				OnPropertyChanged();
 				Invalidate(Invalidation.Repaint);
 			}
+		}
+
+		/// <summary>
+		/// Discards cached syntax tokens and repaints, re-tokenizing the visible lines.
+		/// </summary>
+		/// <remarks>
+		/// Call this when the current highlighter's own output has changed but the instance has
+		/// not — for example after pushing new LSP semantic tokens into a decorating highlighter.
+		/// Assigning <see cref="SyntaxHighlighter"/> to the value it already holds does nothing.
+		/// </remarks>
+		public void RefreshSyntaxHighlighting()
+		{
+			lock (_contentLock)
+			{
+				_syntaxTokenCache = null;
+				_lineStateCache = null;
+			}
+			Invalidate(Invalidation.Repaint);
 		}
 
 		/// <inheritdoc/>
@@ -1070,5 +1135,15 @@ namespace SharpConsoleUI.Controls
 		}
 
 		#endregion
+
+		/// <inheritdoc/>
+		public override void DescribeState(IStateWriter w)
+		{
+			base.DescribeState(w);
+			// The length, not the text: an editor can hold a megabyte, and a probe
+			// asking "what is on screen" should not be handed all of it.
+			w.Editing(IsEditing, Content?.Length ?? 0);
+		}
+
 	}
 }

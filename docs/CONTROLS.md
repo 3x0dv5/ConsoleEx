@@ -1,19 +1,9 @@
 # Controls Reference
 
-SharpConsoleUI provides 41 built-in UI controls for building rich console applications.
+SharpConsoleUI's built-in controls, what each one is for, and how to write your own.
 
 > **New to SharpConsoleUI?** Start with the [Tutorials](tutorials/README.md) — step-by-step guides that build real apps from scratch.
 
-## Table of Contents
-
-- [Overview](#overview)
-- [Basic Input Controls](#basic-input-controls)
-- [Selection Controls](#selection-controls)
-- [Display Controls](#display-controls)
-- [Drawing Controls](#drawing-controls)
-- [Layout Controls](#layout-controls)
-- [Utility Controls](#utility-controls)
-- [Interfaces](#interfaces)
 
 ## Overview
 
@@ -55,9 +45,9 @@ Controls for user input and interaction.
 | **[ButtonControl](controls/ButtonControl.md)** | Clickable button with text | Click events, keyboard/mouse support |
 | **[CheckboxControl](controls/CheckboxControl.md)** | Toggle checkbox with label | Checked/unchecked state, change events |
 | **[DatePickerControl](controls/DatePickerControl.md)** | Locale-aware date picker | Segmented editing, calendar popup, min/max dates |
-| **[PromptControl](controls/PromptControl.md)** | Single-line text input | Enter key events, input validation, max length |
+| **[PromptControl](controls/PromptControl.md)** | Text input, single-line or wrapping | Enter key events, optional multiline with grow-to-fit, placeholder, max length, read-only, history, tab completion, atomic tokens |
 | **[TimePickerControl](controls/TimePickerControl.md)** | Locale-aware time picker | 12h/24h modes, seconds toggle, min/max times |
-| **[MultilineEditControl](controls/MultilineEditControl.md)** | Multi-line text editor | [Syntax highlighting](SYNTAX_HIGHLIGHTING.md) (13 built-in languages via `SyntaxHighlighters.For(...)`), pluggable gutter, find/replace, undo/redo, word wrap |
+| **[MultilineEditControl](controls/MultilineEditControl.md)** | Multi-line text editor | [Syntax highlighting](SYNTAX_HIGHLIGHTING.md) (~64 languages via TextMate grammars, `SyntaxHighlighters.For(...)`), pluggable gutter, find/replace, undo/redo, word wrap |
 | **[SliderControl](controls/SliderControl.md)** | Value slider with thumb | Horizontal/vertical, step/large-step, keyboard/mouse drag |
 | **[RangeSliderControl](controls/RangeSliderControl.md)** | Dual-thumb range slider | MinRange enforcement, tab to switch thumbs, range events |
 | **[FormControl](controls/FormControl.md)** | Labeled-input form | Two-column grid (label \| editor), typed field overloads (text/multiline/checkbox/dropdown/radio/slider), custom `AddField`, sections with collapse, row packing, validation, `GetValues`/`Submit`/`Submitted`, declarative [XML loader](FORM_XML.md) |
@@ -71,6 +61,7 @@ Controls for selecting items from lists or hierarchies.
 | **[ListControl](controls/ListControl.md)** | Scrollable list with selection | Single selection, item activation, keyboard navigation |
 | **[TableControl](controls/TableControl.md)** | Interactive data grid | Virtual data, sorting, filtering (AND/OR), inline editing, multi-select, cell navigation, scrollbars |
 | **[TreeControl](controls/TreeControl.md)** | Hierarchical tree view | Expand/collapse nodes, selection, keyboard navigation |
+| **[TreeTableControl](controls/TreeTableControl.md)** | Table whose rows nest | Expandable rows with every table feature, tree-aware sorting, filtering and checkboxes, lazy loading |
 | **[DropdownControl](controls/DropdownControl.md)** | Dropdown selection list | Click to expand, keyboard navigation, portal rendering |
 | **[RadioControl](controls/RadioControl.md)** | Single-select radio group | Typed `RadioGroup<T>` coordination, `Required`/`AllowDeselect` policies, label wrap, cross-layout grouping |
 | **[MenuControl](controls/MenuControl.md)** | Menu bar with dropdowns | Horizontal/vertical menus, submenus, separators, keyboard shortcuts |
@@ -83,13 +74,14 @@ Controls for displaying formatted content.
 |---------|-------------|---------|
 | **[MarkupControl](controls/MarkupControl.md)** | Rich text with markup | Colors, bold, italic, **clickable & keyboard-navigable links** (`[link=url]`); renders Markdown (incl. links) via the [`[markdown]` tag](MARKUP_SYNTAX.md#markdown), optional border/header |
 | **[HtmlControl](controls/HtmlControl.md)** | HTML content renderer | Parse & render HTML with images, links, tables, keyboard navigation |
-| **[FigleControl](controls/FigleControl.md)** | ASCII art text (Figlet) | Large stylized text, multiple fonts |
+| **[FigletControl](controls/FigletControl.md)** | ASCII art text (Figlet) | Large stylized text, multiple fonts |
 | **[ChatTranscriptControl](controls/ChatTranscriptControl.md)** | Agent/chat transcript | Role-tagged messages (User/Assistant/System/Tool/Error), token-by-token streaming, collapsible tool messages, thinking indicator, gradient headers, alpha bubbles |
 | **[LogViewerControl](controls/LogViewerControl.md)** | Log message viewer | Auto-scroll, filtering, severity colors |
 | **[SpectreRenderableControl](controls/SpectreRenderableControl.md)** | Wrapper for Spectre widgets | Display Tables, Trees, Panels, Charts, etc. |
-| **[PanelControl](controls/PanelControl.md)** | Bordered container panel | Hosts child controls (a non-collapsible CollapsiblePanel); headers, border styles, padding, mouse. For bordered *text*, use [MarkupControl](controls/MarkupControl.md) with `.WithBorder()`. |
+| **[PanelControl](controls/PanelControl.md)** | Bordered container panel | Hosts child controls; headers, border styles, padding, mouse. For bordered *text*, use [MarkupControl](controls/MarkupControl.md) with `.WithBorder()`. |
 | **[RuleControl](controls/RuleControl.md)** | Horizontal rule/separator | Optional title with alignment, colors, border styles; doubles as an inline progress bar (`SetProgress`/`SetIndeterminate`). Backs both `Controls.Rule(title)` and `Controls.Separator()` |
 | **[SparklineControl](controls/SparklineControl.md)** | Time-series sparkline graph | Block, braille, or bidirectional modes; borders; titles |
+| **[ChartControl](controls/ChartControl.md)** | Full chart: line, area, bar, scatter | Real axes with nice-number ticks, gridlines, legend, split view, gradients by X or value, hover readout, selection, zoom |
 | **[LineGraphControl](controls/LineGraphControl.md)** | Multi-series line graph | Braille and ASCII rendering modes, gradients, Y-axis labels, live updates |
 | **[BarGraphControl](controls/BarGraphControl.md)** | Horizontal bar graph | Gradient color thresholds, labels, value display |
 | **[ProgressBarControl](controls/ProgressBarControl.md)** | Task progress indicator | Determinate fill with percentage, or indeterminate pulsing animation |
@@ -101,22 +93,27 @@ Controls for custom graphics and free-form drawing.
 
 | Control | Description | Details |
 |---------|-------------|---------|
-| **[CanvasControl](controls/CanvasControl.md)** | Free-form drawing surface | 30+ drawing primitives, retained & immediate modes, thread-safe async painting |
-| **[ImageControl](controls/ImageControl.md)** | Image display with Kitty graphics | Full-resolution via Kitty/WezTerm/Ghostty with half-block fallback; PNG/JPEG/BMP/GIF/WebP/TIFF; async loading |
+| **[CanvasControl](controls/CanvasControl.md)** | Free-form drawing surface | 30+ cell primitives plus `PixelSurface` for pixel art at double vertical resolution, retained & immediate modes, thread-safe async painting |
+| **[ImageControl](controls/ImageControl.md)** | Image display with Kitty graphics | Full-resolution via Kitty/WezTerm/Ghostty with half-block fallback; PNG/JPEG/BMP/GIF/TGA; async loading |
 | **[VideoControl](controls/VideoControl.md)** | Terminal video player | Kitty graphics + half-block/ASCII/braille fallbacks (auto-detected); FFmpeg decode; overlay bar; dynamic resize; looping |
+| **[SurfaceViewControl](controls/SurfaceViewControl.md)** | Another app's screen, as cells | Shows a cell grid from a diagnostics socket, a remote host or a recording; scrolls a viewport over it; reports the surface cell a click landed on |
 
 ## Layout Controls
 
 Controls for organizing other controls.
 
+For laying out a window itself - edges, a scrolling body, and replacing the root layout -
+see [Window layout](WINDOW_LAYOUT.md) and [Docking](DOCKING.md).
+
 | Control | Description | Details |
 |---------|-------------|---------|
 | **ColumnContainer** | Vertical stack container | Stack controls vertically, padding, alignment |
 | **[ScrollablePanelControl](controls/ScrollablePanelControl.md)** | Scrollable content area | Vertical scrolling, contains multiple controls |
+| **[ScrollbarControl](controls/ScrollbarControl.md)** | Standalone scrollbar | Decoupled from any single view; `ValueChanged`/`UserValueChanged` let one bar drive several views (e.g. a side-by-side diff) with no echo |
 | **[HorizontalGridControl](controls/HorizontalGridControl.md)** | Multi-column layout | Variable-width columns, alignment, splitters |
-| **[GridControl](controls/GridControl.md)** | WinUI-style 2D grid | Fixed/Auto/Star rows & columns, row/col spans, gaps, per-cell styling, any control per cell |
+| **[GridControl](controls/GridControl.md)** | WinUI-style 2D grid | Fixed/Auto/Star rows & columns, row/col spans, gaps, per-cell styling, any control per cell, [docked edges](controls/GridControl.md#docking) outside the tracks |
 | **[FlowControl](controls/FlowControl.md)** | Renders a flow inline in a region | Embeds `Flow.Run`/`Flow.Wizard` in a pane (vs. a modal); idle/done placeholder; normal focus scope |
-| **[WizardControl](controls/WizardControl.md)** | Runs a multi-step wizard inline | A `FlowControl` named/presetted for wizards (the discoverable door); `wizard.Run(Flow.Wizard<T>()...)`; inline, not modal |
+| **[WizardControl](controls/WizardControl.md)** | Runs a multi-step wizard inline | A `FlowControl` preconfigured for wizards, so the feature is findable by name; `wizard.Run(Flow.Wizard<T>()...)`; inline, not modal |
 | **[HorizontalSplitterControl](controls/HorizontalSplitterControl.md)** | Draggable horizontal divider | Resizes the control above against the one below; mouse drag + Up/Down (Shift for 5-row jumps), min-height floors, `SplitterMoved` |
 | **SplitterControl** | Vertical column divider | Internal to [HorizontalGridControl](controls/HorizontalGridControl.md) — created by `AddSplitter`/`AddSplitterBefore`. For grid splitters use [GridControl](controls/GridControl.md#splitters) |
 | **[TabControl](controls/TabControl.md)** | Multi-page tab container | Tab headers, keyboard/mouse switching, state preservation |
@@ -243,7 +240,7 @@ public interface IMouseAwareControl : IWindowControl
     event EventHandler<MouseEventArgs>? MouseEnter;
     event EventHandler<MouseEventArgs>? MouseLeave;
     event EventHandler<MouseEventArgs>? MouseMove;
-    void ProcessMouseEvent(MouseEventArgs e);
+    bool ProcessMouseEvent(MouseEventArgs args);
 }
 ```
 
@@ -298,6 +295,13 @@ PopulateForm(window);
 ```
 
 `ColumnContainer` and `Window` keep their existing native names (`AddContent`/`Contents` on `ColumnContainer`; `RemoveContent`/`GetControls()` on `Window`); the `IControlHost` members are implemented via explicit interface forwarding so the public APIs are unchanged.
+
+`ColumnContainer.RemoveContent` **disposes** the control it removes, which is
+what you want when it is going away for good. To take a control out and put it
+back later — swapping pages in and out of one slot, say — use `DetachContent`
+instead: same removal, no disposal, so the control is still usable afterwards.
+Removing a page with `RemoveContent` and re-adding it later gives you a disposed
+control that renders blank.
 
 ## Quick Reference
 
@@ -361,8 +365,8 @@ window.AddControl(Controls.Prompt("Email:").WithName("email").Build());
 window.AddControl(Controls.Button("Submit")
     .OnClick((s, e, w) =>
     {
-        var name = w.FindControl<PromptControl>("name")?.Text;
-        var email = w.FindControl<PromptControl>("email")?.Text;
+        var name = w.FindControl<PromptControl>("name")?.Input;
+        var email = w.FindControl<PromptControl>("email")?.Input;
         // Process form...
     })
     .Build());
@@ -418,6 +422,7 @@ Browse detailed documentation for specific controls:
 
 ### Advanced Controls
 - [TableControl](controls/TableControl.md) - Interactive data grid with virtual data
+- [TreeTableControl](controls/TreeTableControl.md) - Table whose rows nest, with tree-aware sorting, filtering and checkboxes
 - [TabControl](controls/TabControl.md) - Multi-page tab container
 - [CollapsiblePanel](controls/CollapsiblePanel.md) - Click-to-expand container for progressive disclosure
 - [NavigationView](controls/NavigationView.md) - Sidebar navigation with content area
@@ -425,7 +430,7 @@ Browse detailed documentation for specific controls:
 - [TerminalControl](controls/TerminalControl.md) - Embedded PTY terminal (Linux)
 
 ### Cross-Cutting Features
-- [Syntax Highlighting](SYNTAX_HIGHLIGHTING.md) - 13 built-in highlighters + registry, used by MultilineEditControl and Markdown code blocks
+- [Syntax Highlighting](SYNTAX_HIGHLIGHTING.md) - ~64 languages via TextMate grammars, themed by your app, used by MultilineEditControl and Markdown code blocks
 - [Markup Syntax](MARKUP_SYNTAX.md) - Colors, decorations, spinners, and the `[markdown]` tag
 
 ---

@@ -14,6 +14,7 @@ using SharpConsoleUI.Drivers;
 using SharpConsoleUI.Events;
 using SharpConsoleUI.Extensions;
 using SharpConsoleUI.Helpers;
+using SharpConsoleUI.Helpers.Scrollbar;
 using SharpConsoleUI.Layout;
 using SharpConsoleUI.Parsing;
 using SharpConsoleUI.Themes;
@@ -114,8 +115,21 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	private bool _cellNavigationEnabled = false;
 	private bool _multiSelectEnabled = false;
 	private bool _checkboxMode = false;
+	private bool _rightClickExtendsSelection = false;
 	private bool _clearSelectionOnEmptyClick = false;
 	private HashSet<int> _selectedRowIndices = new();
+	// Anchor for keyboard Shift+Up/Down range selection - the row a shift-extended range grows from/to.
+	// Reset to the cursor row on every non-shift cursor move so a fresh Shift+arrow always starts from
+	// wherever the cursor currently is (matches Explorer/Excel range-select semantics).
+	private int _selectionAnchorRowIndex = -1;
+	// True from a plain (no modifier) Button1 press on a data row through its release - lets a
+	// click-and-drag extend the multi-select range live, as a mouse-only stand-in for Shift+Click
+	// (terminals routinely swallow Shift+Click for their own text selection - see #Shift-click bug).
+	private bool _isRowDragSelecting = false;
+	// Non-null while a Ctrl+drag is in progress: the selection snapshot taken on press, so each Move
+	// can recompute the live preview as (snapshot ∪ anchor..pointer range) instead of accumulating rows
+	// the pointer has since backtracked past. Null when no Ctrl+drag is active.
+	private HashSet<int>? _ctrlDragBaseSelection = null;
 
 	/// <summary>
 	/// When true, a left-click in the data area that does not hit any row
@@ -139,6 +153,8 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	private int _horizontalScrollOffset = 0;
 	private ScrollbarVisibility _verticalScrollbarVisibility = ScrollbarVisibility.Auto;
 	private ScrollbarVisibility _horizontalScrollbarVisibility = ScrollbarVisibility.Auto;
+	private int _minScrollbarThumbSize = ControlDefaults.DefaultMinScrollbarThumbSize;
+	private int _mouseWheelScrollSpeed = ControlDefaults.DefaultScrollWheelLines;
 
 	// Mouse gesture capture: a fresh Button1 press captures one sub-region; every subsequent resent
 	// press/drag routes to it without re-hit-testing (SGR re-sends Button1Pressed on motion). Replaces
@@ -150,23 +166,47 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	private bool _vThumbDragging = false;
 	private bool _hThumbDragging = false;
 
-	// Scrollbar dragging state
+	// Scrollbar dragging state. *ThumbPos anchors the drag on the thumb's track position (not the
+	// scroll offset) so ScrollbarInput.OffsetForDrag can invert cursor movement back to an offset that
+	// round-trips - the same anchor ScrollablePanelControl uses.
 	private int _scrollbarDragStartY = 0;
 	private int _scrollbarDragStartX = 0;
-	private int _scrollbarDragStartOffset = 0;
+	private int _scrollbarDragStartThumbPos = 0;
+	private int _hScrollbarDragStartThumbPos = 0;
 
 	// Sorting
 	private bool _sortingEnabled = false;
 	private int _sortColumnIndex = -1;
 	private SortDirection _sortDirection = SortDirection.None;
-	private int[]? _sortIndexMap; // maps display index -> data index when sorted
+	// Whether the data source sorted itself and has not been asked to drop that order since
+	private bool _sourceSorted;
+	// Whether the data source took a filter from the table and has not been asked to drop it since
+	private bool _sourceFiltered;
+	// Above zero while the table is calling into the data source to sort or filter it
+	private int _sourceCallDepth;
 
 	// Filtering
 	internal bool _filteringEnabled = false;
 	internal FilterMode _filterMode = FilterMode.None;
 	internal string _filterBuffer = string.Empty;
 	internal int _filterCursorPosition = 0;
-	internal int[]? _filterIndexMap; // maps display index -> data index when filtered (may include sort)
+
+	// Which data rows are displayed, in what order: one map for sort and filter together
+	private readonly TableRowView _rowView = new();
+	// Above zero while ComputeDisplayRows or ResolveHidden/RemovedSelectedRow runs, when the rows must not change
+	private int _displayRowsHookDepth;
+
+	/// <summary>
+	/// True when a filter display map is active that the TABLE built and can therefore rebuild.
+	/// </summary>
+	/// <remarks>
+	/// The condition sorting uses to decide between recomputing the combined filter+sort map and
+	/// asking the source to sort itself. A map that came from the source is deliberately excluded:
+	/// recomputing would rescan rows client-side and overwrite what the source chose to show, so
+	/// such a table sorts the way a self-narrowing source already does — through
+	/// <see cref="ITableDataSource.Sort"/>.
+	/// </remarks>
+	private bool HasClientFilterMap => _rowView.HasClientFilterMap && _activeFilter != null;
 	internal int _unfilteredRowCount = 0;
 	internal CompoundFilterExpression? _activeFilter;
 	internal bool _fuzzyFilterEnabled = false;
@@ -214,13 +254,13 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 
 	// Performance caches
 	private readonly TextMeasurementCache _measurementCache;
-	private int[]? _cachedColumnWidths;
-	private int _cachedColumnWidthsForWidth = -1;
-	private int _cachedColumnWidthsScrollOffset = -1;
+	private readonly TableColumnWidthCalculator _widthCalculator;
 
-	// Rendered column geometry (always populated during PaintDOM for hit testing)
-	private int[] _renderedColumnX = Array.Empty<int>();
-	private int[] _renderedColumnWidths = Array.Empty<int>();
+	// GetCellPrefixMarkup as the width sources ask it, created once rather than on every measure
+	private readonly Func<int, int, string?> _cellPrefixOf;
+
+	// Where the last paint put the columns, for hit testing; null before the first paint
+	private TableGeometry? _geometry;
 
 	// Column width overrides (for resize in DataSource mode)
 	private readonly Dictionary<int, int> _columnWidthOverrides = new();
@@ -228,11 +268,6 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	// Mouse support
 	private bool _wantsMouseEvents = true;
 
-	// Double-click detection
-	private readonly object _clickLock = new();
-	private DateTime _lastClickTime = DateTime.MinValue;
-	private int _lastClickRowIndex = -1;
-	private int _doubleClickThresholdMs = ControlDefaults.DefaultDoubleClickThresholdMs;
 
 	// Auto-highlight on focus
 	private bool _autoHighlightOnFocus = true;
@@ -247,6 +282,8 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	public TableControl()
 	{
 		_measurementCache = new TextMeasurementCache(MarkupParser.StripLength);
+		_widthCalculator = new TableColumnWidthCalculator(_measurementCache);
+		_cellPrefixOf = GetCellPrefixMarkup;
 	}
 
 	#endregion
@@ -333,7 +370,7 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	{
 		get
 		{
-			if (_filterIndexMap != null) return _filterIndexMap.Length;
+			if (_rowView.Map != null) return _rowView.Map.Length;
 			if (_dataSource != null) return _dataSource.RowCount;
 			lock (_tableLock) { return _rows.Count; }
 		}
@@ -464,6 +501,7 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 
 			InvalidateColumnWidths();
 			_measurementCache.InvalidateCache();
+			bool hadSelection = _selectedRowIndex != -1;
 			_selectedRowIndex = -1;
 			_selectedColumnIndex = -1;
 			_hoveredRowIndex = -1;
@@ -471,23 +509,77 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 			_horizontalScrollOffset = 0;
 			_sortColumnIndex = -1;
 			_sortDirection = SortDirection.None;
-			_sortIndexMap = null;
-			_filterIndexMap = null;
+			_sourceSorted = false;
+			_sourceFiltered = false;
+			_rowView.Clear();
+			EndRowGestures();
 			_filterMode = FilterMode.None;
 			_filterBuffer = string.Empty;
 			_activeFilter = null;
+
+			// Back to the table's own rows: ComputeDisplayRows decides which are displayed, as after
+			// any other change to what is shown, so a derived table hiding rows of its own is asked.
+			if (_dataSource == null)
+				RebuildDisplayMap();
+
+			// Swapping the source replaces every row, so a selection carried over from the old one
+			// names nothing. Raised after the map is rebuilt, so a handler reads the new table.
+			if (hadSelection)
+				RaiseSelectedRowChanged();
 			Invalidate(Invalidation.Relayout);
 		}
 	}
 
+	/// <summary>
+	/// Follows a change to the data source's rows: a filter map built over them is brought up to
+	/// date, and the selection and scroll are kept within the rows there are.
+	/// </summary>
+	/// <remarks>
+	/// A FILTER MAP NAMES SOURCE ROWS BY INDEX, so a source that adds, removes or reorders rows
+	/// leaves it pointing at the wrong ones: rows that no longer match stay shown, new matches stay
+	/// hidden, and an index past the end can be read. A client-side filter is scanned again; display
+	/// rows the source supplied are asked for again. A change the source raises while the table
+	/// itself is calling into it, sorting or filtering, is left to that call, which brings the map
+	/// up to date when it returns.
+	/// </remarks>
 	private void OnDataSourceCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
 	{
+		if (_sourceCallDepth == 0)
+			RefreshSourceFilterMap();
+		FollowSourceAnimations(e);
+
 		if (e.Action == NotifyCollectionChangedAction.Reset)
 		{
-			_selectedRowIndex = RowCount > 0 ? 0 : -1;
 			_selectedRowIndices.Clear();
 			_hoveredRowIndex = -1;
-			_scrollOffset = 0;
+			EndRowGestures();
+			// A Reset says every row was replaced, so the selected row is not the row it was.
+			//
+			// NO SELECTION STAYS NO SELECTION. A follow-the-tail view — a log pane whose buffer is at
+			// capacity, where every append evicts a row and rebuilds — never selects anything, and
+			// moving its cursor to row 0 invents a selection the user never made. That is visible:
+			// LogViewerControl opens its detail pane on SelectedRowChanged, which shrinks the table.
+			// The scroll offset is left alone for the same reason, and clamped instead, so a viewport
+			// the user scrolled to survives the rebuild.
+			//
+			// The guard is here, not in the helper: a FILTER does seat the cursor from nothing
+			// (arrow-down after typing a filter has always landed on the second match), while a Reset
+			// must not, because an evicting buffer rebuilds through this same path on every append.
+			if (_selectedRowIndex >= 0)
+				ResetSelectionToFirstRow(resetScroll: false);
+			_scrollOffset = Math.Clamp(_scrollOffset, 0, Math.Max(0, RowCount - GetVisibleRowCount()));
+		}
+		else
+		{
+			int rowCount = RowCount;
+			int oldIndex = _selectedRowIndex;
+			if (_selectedRowIndex >= rowCount)
+				_selectedRowIndex = rowCount - 1;
+			_selectedRowIndices.RemoveWhere(index => index >= rowCount);
+			_scrollOffset = Math.Clamp(_scrollOffset, 0, Math.Max(0, rowCount - GetVisibleRowCount()));
+			// Rows removed off the end can drag the cursor onto a different row.
+			if (_selectedRowIndex != oldIndex)
+				RaiseSelectedRowChanged();
 		}
 		InvalidateColumnWidths();
 		_measurementCache.InvalidateCache();
@@ -558,6 +650,7 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 		{
 			var column = new TableColumn(header, alignment, width) { Owner = this };
 			_columns.Add(column);
+			_rowView.RecordReset();
 		}
 		InvalidateColumnWidths();
 		_measurementCache.InvalidateCache();
@@ -571,7 +664,7 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	{
 		if (_dataSource != null)
 			throw new InvalidOperationException("Cannot add columns when DataSource is set.");
-		lock (_tableLock) { column.Owner = this; _columns.Add(column); }
+		lock (_tableLock) { column.Owner = this; _columns.Add(column); _rowView.RecordReset(); }
 		InvalidateColumnWidths();
 		_measurementCache.InvalidateCache();
 		Invalidate(Invalidation.Relayout);
@@ -588,6 +681,7 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 			{
 				_columns[index].Owner = null;
 				_columns.RemoveAt(index);
+				_rowView.RecordReset();
 			}
 			else
 				return;
@@ -607,6 +701,7 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 			foreach (var column in _columns)
 				column.Owner = null;
 			_columns.Clear();
+			_rowView.RecordReset();
 		}
 		InvalidateColumnWidths();
 		_measurementCache.InvalidateCache();
@@ -641,278 +736,6 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 			else
 				return;
 		}
-		Invalidate(Invalidation.Relayout);
-	}
-
-	#endregion
-
-	#region Public Methods - Row Management
-
-	/// <summary>
-	/// Adds a row with the specified cells.
-	/// </summary>
-	public void AddRow(params string[] cells)
-	{
-		if (_dataSource != null)
-			throw new InvalidOperationException("Cannot add rows when DataSource is set.");
-		lock (_tableLock) { _rows.Add(new TableRow(cells) { Owner = this }); }
-		_sortIndexMap = null;
-		_filterIndexMap = null;
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCache();
-		Invalidate(Invalidation.Relayout);
-	}
-
-	/// <summary>
-	/// Adds a row to the table.
-	/// </summary>
-	public void AddRow(TableRow row)
-	{
-		if (_dataSource != null)
-			throw new InvalidOperationException("Cannot add rows when DataSource is set.");
-		lock (_tableLock) { row.Owner = this; _rows.Add(row); }
-		_sortIndexMap = null;
-		_filterIndexMap = null;
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCache();
-		Invalidate(Invalidation.Relayout);
-	}
-
-	/// <summary>
-	/// Adds multiple rows to the table.
-	/// </summary>
-	public void AddRows(IEnumerable<TableRow> rows)
-	{
-		if (_dataSource != null)
-			throw new InvalidOperationException("Cannot add rows when DataSource is set.");
-		lock (_tableLock)
-		{
-			foreach (var row in rows)
-			{
-				row.Owner = this;
-				_rows.Add(row);
-			}
-		}
-		_sortIndexMap = null;
-		_filterIndexMap = null;
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCache();
-		Invalidate(Invalidation.Relayout);
-	}
-
-	/// <summary>
-	/// Inserts a row with the specified cells at the given index.
-	/// Index is clamped to [0, RowCount].
-	/// </summary>
-	/// <param name="index">The zero-based index at which to insert.</param>
-	/// <param name="cells">The cell values for the new row.</param>
-	public void InsertRow(int index, params string[] cells)
-	{
-		InsertRow(index, new TableRow(cells));
-	}
-
-	/// <summary>
-	/// Inserts a row at the given index.
-	/// Index is clamped to [0, RowCount].
-	/// </summary>
-	/// <param name="index">The zero-based index at which to insert.</param>
-	/// <param name="row">The row to insert.</param>
-	public void InsertRow(int index, TableRow row)
-	{
-		if (_dataSource != null)
-			throw new InvalidOperationException("Cannot insert rows when DataSource is set.");
-
-		lock (_tableLock)
-		{
-			index = Math.Clamp(index, 0, _rows.Count);
-			row.Owner = this;
-			_rows.Insert(index, row);
-		}
-
-		AdjustSelectionAfterInsert(index, 1);
-		_sortIndexMap = null;
-		_filterIndexMap = null;
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCache();
-		Invalidate(Invalidation.Relayout);
-	}
-
-	/// <summary>
-	/// Inserts multiple rows starting at the given index.
-	/// Index is clamped to [0, RowCount].
-	/// </summary>
-	/// <param name="index">The zero-based index at which to begin inserting.</param>
-	/// <param name="rows">The rows to insert.</param>
-	public void InsertRows(int index, IEnumerable<TableRow> rows)
-	{
-		if (_dataSource != null)
-			throw new InvalidOperationException("Cannot insert rows when DataSource is set.");
-
-		var rowList = rows.ToList();
-		if (rowList.Count == 0) return;
-
-		lock (_tableLock)
-		{
-			index = Math.Clamp(index, 0, _rows.Count);
-			foreach (var row in rowList) row.Owner = this;
-			_rows.InsertRange(index, rowList);
-		}
-
-		AdjustSelectionAfterInsert(index, rowList.Count);
-		_sortIndexMap = null;
-		_filterIndexMap = null;
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCache();
-		Invalidate(Invalidation.Relayout);
-	}
-
-	/// <summary>
-	/// Shifts selection indices forward after rows are inserted.
-	/// </summary>
-	private void AdjustSelectionAfterInsert(int insertIndex, int count)
-	{
-		if (_selectedRowIndex >= insertIndex)
-		{
-			_selectedRowIndex += count;
-		}
-
-		if (_selectedRowIndices.Count > 0)
-		{
-			var adjusted = new HashSet<int>();
-			foreach (var idx in _selectedRowIndices)
-			{
-				adjusted.Add(idx >= insertIndex ? idx + count : idx);
-			}
-			_selectedRowIndices = adjusted;
-		}
-	}
-
-	/// <summary>
-	/// Removes the row at the specified index.
-	/// </summary>
-	public void RemoveRow(int index)
-	{
-		lock (_tableLock)
-		{
-			if (index >= 0 && index < _rows.Count)
-			{
-				_rows[index].Owner = null;
-				_rows.RemoveAt(index);
-			}
-			else
-				return;
-		}
-
-		// Adjust selection
-		if (_selectedRowIndex >= 0)
-		{
-			int rowCount;
-			lock (_tableLock) { rowCount = _rows.Count; }
-			if (_selectedRowIndex == index)
-			{
-				_selectedRowIndex = rowCount > 0 ? Math.Min(_selectedRowIndex, rowCount - 1) : -1;
-				SelectedRowChanged?.Invoke(this, _selectedRowIndex);
-			}
-			else if (_selectedRowIndex > index)
-			{
-				_selectedRowIndex--;
-			}
-		}
-
-		_sortIndexMap = null;
-		_filterIndexMap = null;
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCache();
-		Invalidate(Invalidation.Relayout);
-	}
-
-	/// <summary>
-	/// Clears all rows.
-	/// </summary>
-	public void ClearRows()
-	{
-		lock (_tableLock)
-		{
-			foreach (var row in _rows) row.Owner = null;
-			_rows.Clear();
-		}
-		_selectedRowIndex = -1;
-		_selectedColumnIndex = -1;
-		_hoveredRowIndex = -1;
-		_scrollOffset = 0;
-		_horizontalScrollOffset = 0;
-		_selectedRowIndices.Clear();
-		_sortIndexMap = null;
-		_filterIndexMap = null;
-		_filterMode = FilterMode.None;
-		_filterBuffer = string.Empty;
-		_activeFilter = null;
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCache();
-		SelectedRowChanged?.Invoke(this, -1);
-		Invalidate(Invalidation.Relayout);
-	}
-
-	/// <summary>
-	/// Updates a cell value.
-	/// </summary>
-	public void UpdateCell(int row, int column, string value)
-	{
-		lock (_tableLock)
-		{
-			if (row >= 0 && row < _rows.Count && column >= 0 && column < _rows[row].Cells.Count)
-				_rows[row].Cells[column] = value;
-			else
-				return;
-		}
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCachedEntry(value);
-		Invalidate(Invalidation.Relayout);
-	}
-
-	/// <summary>
-	/// Gets a cell value.
-	/// </summary>
-	public string GetCell(int row, int column)
-	{
-		if (_dataSource != null)
-			return _dataSource.GetCellValue(row, column);
-
-		lock (_tableLock)
-		{
-			if (row >= 0 && row < _rows.Count && column >= 0 && column < _rows[row].Cells.Count)
-				return _rows[row].Cells[column];
-			return string.Empty;
-		}
-	}
-
-	/// <summary>
-	/// Gets a row.
-	/// </summary>
-	public TableRow GetRow(int index)
-	{
-		lock (_tableLock)
-		{
-			if (index >= 0 && index < _rows.Count)
-				return _rows[index];
-			throw new ArgumentOutOfRangeException(nameof(index));
-		}
-	}
-
-	/// <summary>
-	/// Sets all rows at once.
-	/// </summary>
-	public void SetData(IEnumerable<TableRow> rows)
-	{
-		lock (_tableLock)
-		{
-			foreach (var oldRow in _rows) oldRow.Owner = null;
-			_rows = new List<TableRow>(rows);
-			foreach (var row in _rows) row.Owner = this;
-		}
-		_sortIndexMap = null;
-		InvalidateColumnWidths();
-		_measurementCache.InvalidateCache();
 		Invalidate(Invalidation.Relayout);
 	}
 
@@ -1051,27 +874,49 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 		return theme?.TableHoverForegroundColor ?? Color.White;
 	}
 
-	internal Color ResolveScrollbarThumbColor()
+	/// <summary>
+	/// Resolves the table's scrollbar thumb/track colours via the shared engine, reading
+	/// <see cref="ITheme.TableScrollbarThumbColor"/>/<see cref="ITheme.TableScrollbarTrackColor"/>
+	/// (Table's own theme keys, which have no unfocused variants) instead of the general
+	/// <c>Scrollbar*</c> family every other scrollable control uses.
+	/// </summary>
+	/// <remarks>
+	/// Accepted behaviour change from the pre-retrofit code: Table previously read the same
+	/// (focused) theme colour regardless of focus, falling back to a focus-aware hardcoded pair only
+	/// when no theme was set. The shared resolver is focus-aware for the fallback tier only, since the
+	/// two Table theme keys have no unfocused counterpart.
+	/// </remarks>
+	private ScrollbarPalette ResolveScrollbarPalette(Color bgColor)
 	{
 		var theme = Container?.GetConsoleWindowSystem?.Theme;
-		return theme?.TableScrollbarThumbColor ?? ((ComputeHasFocus()) ? Color.Cyan1 : Color.Grey);
-	}
+		bool hasFocus = ComputeHasFocus();
 
-	internal Color ResolveScrollbarTrackColor()
-	{
-		var theme = Container?.GetConsoleWindowSystem?.Theme;
-		return theme?.TableScrollbarTrackColor ?? ((ComputeHasFocus()) ? Color.Grey : Color.Grey23);
+		return ScrollbarPaletteResolver.Resolve(new ScrollbarPaletteRequest(
+			ThumbOverride: null,
+			TrackOverride: null,
+			Theme: theme,
+			HasFocus: hasFocus,
+			IsEnabled: IsEnabled,
+			Background: bgColor,
+			UseTableThemeKeys: true));
 	}
 
 	#endregion
 
 	#region Column Width Calculation
 
-	private void InvalidateColumnWidths()
+	/// <summary>
+	/// Drops the cached column widths and text measurements, so the next layout measures the columns
+	/// again.
+	/// </summary>
+	/// <remarks>
+	/// The table invalidates them itself whenever a row, a cell or a column changes. A derived table
+	/// calls this when something ELSE it draws into a cell changes width — a prefix that grew because
+	/// a row moved deeper, say — which the table cannot see.
+	/// </remarks>
+	protected void InvalidateColumnWidths()
 	{
-		_cachedColumnWidths = null;
-		_cachedColumnWidthsForWidth = -1;
-		_cachedColumnWidthsScrollOffset = -1;
+		_widthCalculator.Invalidate();
 		_measurementCache.InvalidateCache();
 	}
 
@@ -1083,7 +928,12 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	internal void OnColumnDisplayChanged(TableColumn column, bool widthAffecting, Invalidation mode)
 	{
 		if (DataSource != null) return; // in-memory columns unused in data-source mode
-		if (widthAffecting) InvalidateColumnWidths();
+		if (widthAffecting)
+		{
+			InvalidateColumnWidths();
+			// A renamed header changes what a column-specific filter matches.
+			lock (_tableLock) { _rowView.RecordReset(); }
+		}
 		Container?.Invalidate(mode);
 	}
 
@@ -1092,251 +942,79 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	/// busts the cached column widths when the change affects sizing, then invalidates the container
 	/// with the given mode. No-ops in DataSource mode, where in-memory rows are unused.
 	/// </summary>
+	/// <remarks>
+	/// A cell change does not re-sort or re-filter on its own, as it never has; but it does mean the
+	/// display rows can no longer be updated incrementally from the last result, so the next change
+	/// to the rows recomputes them. It is also passed on to <see cref="OnRowContentChanged"/>.
+	/// </remarks>
 	internal void OnRowDisplayChanged(TableRow row, bool widthAffecting, Invalidation mode)
 	{
 		if (DataSource != null) return; // in-memory rows unused in data-source mode
-		if (widthAffecting) InvalidateColumnWidths();
+		if (widthAffecting)
+		{
+			InvalidateColumnWidths();
+			lock (_tableLock) { _rowView.RecordReset(); }
+		}
 		Container?.Invalidate(mode);
+
+		if (widthAffecting)
+			OnRowContentChanged(row);
 	}
 
 	/// <summary>
-	/// Computes column widths for the given total available width.
+	/// Called after one of the table's rows changed its cells: a cell set, added or removed, the
+	/// cells replaced, or an inline edit committed.
+	/// </summary>
+	/// <param name="row">The row whose cells changed.</param>
+	/// <remarks>
+	/// <para>
+	/// The table does not re-sort or re-filter when a cell changes, so a row being edited does not
+	/// jump away under the cursor. A derived table whose order or visibility depends on a row's
+	/// content can decide otherwise here — typically by calling <see cref="RefreshDisplayRows"/>,
+	/// which keeps the selection on its row. The default does nothing.
+	/// </para>
+	/// <para>
+	/// Called on the thread that changed the cells, which by the library's threading rule is the UI
+	/// thread. The table never changes a cell while holding <see cref="SyncRoot"/>, so this is not
+	/// called with it held unless the code changing the cells holds it. A change to a row's colours,
+	/// enabled state or check mark is not a content change and does not call this.
+	/// </para>
+	/// </remarks>
+	protected virtual void OnRowContentChanged(TableRow row)
+	{
+	}
+
+	/// <summary>
+	/// Computes the widths of the table's own columns for the given total available width.
 	/// Uses sample-based measurement for auto-width columns (visible rows + small buffer).
 	/// </summary>
-	internal int[] ComputeColumnWidths(int availableWidth, List<TableColumn> cols, List<TableRow>? rows, int scrollOffset = 0, int visibleRowCount = 50)
-	{
-		int colCount = cols.Count;
-		if (colCount == 0) return Array.Empty<int>();
-
-		// Check cache - invalidate on significant scroll change
-		int scrollBucket = scrollOffset / Math.Max(1, visibleRowCount / 2);
-		if (_cachedColumnWidths != null && _cachedColumnWidthsForWidth == availableWidth && _cachedColumnWidthsScrollOffset == scrollBucket)
-			return _cachedColumnWidths;
-
-		bool hasBorder = _borderStyle != BorderStyle.None;
-		int separatorOverhead = hasBorder ? (colCount + 1)
-			: (_columnSeparator.HasValue ? Math.Max(0, colCount - 1) * SeparatorWidth : 0);
-		int contentWidth = availableWidth - separatorOverhead;
-		if (contentWidth < colCount) contentWidth = colCount;
-
-		var widths = new int[colCount];
-		int autoCount = 0;
-
-		// Determine sample range for auto-width columns
-		int sampleStart = Math.Max(0, scrollOffset);
-		int sampleEnd = Math.Min(rows?.Count ?? 0, scrollOffset + Math.Max(50, visibleRowCount));
-
-		for (int c = 0; c < colCount; c++)
-		{
-			if (cols[c].Width.HasValue)
-			{
-				widths[c] = cols[c].Width!.Value;
-			}
-			else
-			{
-				// Sample-based measurement: header + visible rows + buffer
-				int maxW = _measurementCache.GetCachedLength(cols[c].Header);
-
-				if (rows != null)
-				{
-					for (int r = sampleStart; r < sampleEnd; r++)
-					{
-						if (c < rows[r].Cells.Count)
-						{
-							int cellW = _measurementCache.GetCachedLength(rows[r].Cells[c]);
-							if (cellW > maxW) maxW = cellW;
-						}
-					}
-				}
-
-				widths[c] = maxW;
-				autoCount++;
-			}
-		}
-
-		// Distribute remaining space
-		int totalNatural = 0;
-		for (int c = 0; c < colCount; c++) totalNatural += widths[c];
-
-		if (HorizontalAlignment == HorizontalAlignment.Stretch && totalNatural < contentWidth)
-		{
-			int remaining = contentWidth - totalNatural;
-			int distributeCount = autoCount > 0 ? autoCount : colCount;
-			int perCol = remaining / distributeCount;
-			int extraCols = remaining % distributeCount;
-
-			for (int c = 0; c < colCount; c++)
-			{
-				bool isAutoCol = !cols[c].Width.HasValue;
-				if (autoCount > 0 && !isAutoCol) continue;
-
-				widths[c] += perCol;
-				if (extraCols > 0) { widths[c]++; extraCols--; }
-			}
-		}
-		else if (totalNatural > contentWidth)
-		{
-			// Shrink only auto-width columns first; preserve fixed-width columns
-			int fixedTotal = 0;
-			int autoTotal = 0;
-			for (int c = 0; c < colCount; c++)
-			{
-				if (cols[c].Width.HasValue)
-					fixedTotal += widths[c];
-				else
-					autoTotal += widths[c];
-			}
-
-			int autoTarget = contentWidth - fixedTotal;
-			if (autoTarget > 0 && autoTotal > 0)
-			{
-				double ratio = (double)autoTarget / autoTotal;
-				int assigned = fixedTotal;
-				int lastAutoCol = -1;
-				for (int c = 0; c < colCount; c++)
-				{
-					if (cols[c].Width.HasValue) continue;
-					widths[c] = Math.Max(1, (int)(widths[c] * ratio));
-					assigned += widths[c];
-					lastAutoCol = c;
-				}
-				if (lastAutoCol >= 0)
-					widths[lastAutoCol] = Math.Max(1, widths[lastAutoCol] + (contentWidth - assigned));
-			}
-			else
-			{
-				// Not enough space even for fixed columns — shrink everything
-				double ratio = (double)contentWidth / totalNatural;
-				int assigned = 0;
-				for (int c = 0; c < colCount - 1; c++)
-				{
-					widths[c] = Math.Max(1, (int)(widths[c] * ratio));
-					assigned += widths[c];
-				}
-				widths[colCount - 1] = Math.Max(1, contentWidth - assigned);
-			}
-		}
-
-		// Cache results
-		_cachedColumnWidths = widths;
-		_cachedColumnWidthsForWidth = availableWidth;
-		_cachedColumnWidthsScrollOffset = scrollBucket;
-
-		return widths;
-	}
+	/// <param name="availableWidth">Cells available to the columns and their separators.</param>
+	/// <param name="cols">The columns to size.</param>
+	/// <param name="rows">The data rows to sample.</param>
+	/// <param name="scrollOffset">The first displayed row on screen, where sampling starts.</param>
+	/// <param name="visibleRowCount">How many rows are on screen.</param>
+	/// <param name="displayRows">
+	/// The display map to sample through, so the rows measured are the rows shown; null samples
+	/// <paramref name="rows"/> in data order.
+	/// </param>
+	internal int[] ComputeColumnWidths(int availableWidth, List<TableColumn> cols, List<TableRow>? rows, int scrollOffset = 0, int visibleRowCount = ControlDefaults.TableColumnWidthSampleRows, int[]? displayRows = null)
+		=> _widthCalculator.Compute(new TableColumnWidthSource(cols, rows, displayRows, _cellPrefixOf),
+			CreateWidthLayout(availableWidth, scrollOffset, visibleRowCount), useCache: true);
 
 	/// <summary>
-	/// Computes column widths for DataSource mode.
+	/// Computes column widths for DataSource mode, sampling the rows displayed.
 	/// </summary>
-	internal int[] ComputeColumnWidthsFromDataSource(int availableWidth, int scrollOffset = 0, int visibleRowCount = 50)
+	internal int[] ComputeColumnWidthsFromDataSource(int availableWidth, int scrollOffset = 0, int visibleRowCount = ControlDefaults.TableColumnWidthSampleRows)
 	{
 		if (_dataSource == null) return Array.Empty<int>();
 
-		int colCount = _dataSource.ColumnCount;
-		if (colCount == 0) return Array.Empty<int>();
-
-		bool hasBorder = _borderStyle != BorderStyle.None;
-		int borderOverhead = hasBorder ? (colCount + 1)
-			: (_columnSeparator.HasValue ? Math.Max(0, colCount - 1) * SeparatorWidth : 0);
-		int contentWidth = availableWidth - borderOverhead;
-		if (contentWidth < colCount) contentWidth = colCount;
-
-		var widths = new int[colCount];
-		int autoCount = 0;
-
-		int sampleStart = Math.Max(0, scrollOffset);
-		int sampleEnd = Math.Min(_dataSource.RowCount, scrollOffset + Math.Max(50, visibleRowCount));
-
-		for (int c = 0; c < colCount; c++)
-		{
-			// Check for user resize override first
-			if (_columnWidthOverrides.TryGetValue(c, out int overrideWidth))
-			{
-				widths[c] = overrideWidth;
-			}
-			else if (_dataSource.GetColumnWidth(c) is int colWidth)
-			{
-				widths[c] = colWidth;
-			}
-			else
-			{
-				int maxW = _measurementCache.GetCachedLength(_dataSource.GetColumnHeader(c));
-				for (int r = sampleStart; r < sampleEnd; r++)
-				{
-					int cellW = _measurementCache.GetCachedLength(_dataSource.GetCellValue(r, c));
-					if (cellW > maxW) maxW = cellW;
-				}
-				widths[c] = maxW;
-				autoCount++;
-			}
-		}
-
-		int totalNatural = 0;
-		for (int c = 0; c < colCount; c++) totalNatural += widths[c];
-
-		if (HorizontalAlignment == HorizontalAlignment.Stretch && totalNatural < contentWidth)
-		{
-			int remaining = contentWidth - totalNatural;
-			int distributeCount = autoCount > 0 ? autoCount : colCount;
-			int perCol = remaining / distributeCount;
-			int extraCols = remaining % distributeCount;
-
-			for (int c = 0; c < colCount; c++)
-			{
-				int? dsColWidth = _dataSource.GetColumnWidth(c);
-				bool isAutoCol = !dsColWidth.HasValue && !_columnWidthOverrides.ContainsKey(c);
-				if (autoCount > 0 && !isAutoCol) continue;
-				widths[c] += perCol;
-				if (extraCols > 0) { widths[c]++; extraCols--; }
-			}
-		}
-		else if (totalNatural > contentWidth)
-		{
-			// Shrink only auto-width columns first; preserve fixed/overridden columns
-			int fixedTotal = 0;
-			int autoTotal = 0;
-			for (int c = 0; c < colCount; c++)
-			{
-				bool isFixed = _columnWidthOverrides.ContainsKey(c) || _dataSource.GetColumnWidth(c).HasValue;
-				if (isFixed)
-					fixedTotal += widths[c];
-				else
-					autoTotal += widths[c];
-			}
-
-			int autoTarget = contentWidth - fixedTotal;
-			if (autoTarget > 0 && autoTotal > 0)
-			{
-				double ratio = (double)autoTarget / autoTotal;
-				int assigned = fixedTotal;
-				int lastAutoCol = -1;
-				for (int c = 0; c < colCount; c++)
-				{
-					bool isFixed = _columnWidthOverrides.ContainsKey(c) || _dataSource.GetColumnWidth(c).HasValue;
-					if (isFixed) continue;
-					widths[c] = Math.Max(1, (int)(widths[c] * ratio));
-					assigned += widths[c];
-					lastAutoCol = c;
-				}
-				if (lastAutoCol >= 0)
-					widths[lastAutoCol] = Math.Max(1, widths[lastAutoCol] + (contentWidth - assigned));
-			}
-			else
-			{
-				// Not enough space even for fixed columns — shrink everything
-				double ratio = (double)contentWidth / totalNatural;
-				int assigned = 0;
-				for (int c = 0; c < colCount - 1; c++)
-				{
-					widths[c] = Math.Max(1, (int)(widths[c] * ratio));
-					assigned += widths[c];
-				}
-				widths[colCount - 1] = Math.Max(1, contentWidth - assigned);
-			}
-		}
-
-		return widths;
+		return _widthCalculator.Compute(new TableDataSourceWidthSource(_dataSource, _columnWidthOverrides, _rowView.Map, _cellPrefixOf),
+			CreateWidthLayout(availableWidth, scrollOffset, visibleRowCount), useCache: false);
 	}
+
+	private TableWidthLayout CreateWidthLayout(int availableWidth, int scrollOffset, int visibleRowCount)
+		=> new(availableWidth, _borderStyle != BorderStyle.None, _columnSeparator, SeparatorWidth,
+			HorizontalAlignment == HorizontalAlignment.Stretch, scrollOffset, visibleRowCount);
 
 	#endregion
 
@@ -1345,35 +1023,12 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	/// <summary>
 	/// Maps a display row index to the actual data row index, accounting for sorting.
 	/// </summary>
-	internal int MapDisplayToData(int displayIndex)
-	{
-		if (_filterIndexMap != null && displayIndex >= 0 && displayIndex < _filterIndexMap.Length)
-			return _filterIndexMap[displayIndex];
-		if (_sortIndexMap != null && displayIndex >= 0 && displayIndex < _sortIndexMap.Length)
-			return _sortIndexMap[displayIndex];
-		return displayIndex;
-	}
+	internal int MapDisplayToData(int displayIndex) => _rowView.MapDisplayToData(displayIndex);
 
 	/// <summary>
 	/// Maps a data row index to the display row index, accounting for filtering and sorting.
 	/// </summary>
-	internal int MapDataToDisplay(int dataIndex)
-	{
-		if (_filterIndexMap != null)
-		{
-			for (int i = 0; i < _filterIndexMap.Length; i++)
-			{
-				if (_filterIndexMap[i] == dataIndex) return i;
-			}
-			return dataIndex;
-		}
-		if (_sortIndexMap == null) return dataIndex;
-		for (int i = 0; i < _sortIndexMap.Length; i++)
-		{
-			if (_sortIndexMap[i] == dataIndex) return i;
-		}
-		return dataIndex;
-	}
+	internal int MapDataToDisplay(int dataIndex) => _rowView.MapDataToDisplay(dataIndex);
 
 	internal BoxChars GetBoxChars()
 	{
@@ -1405,13 +1060,14 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	internal int GetTotalColumnsWidth()
 	{
 		// Use rendered column widths (works for both DataSource and in-memory)
-		if (_renderedColumnWidths.Length > 0)
+		var geometry = _geometry;
+		if (geometry != null && geometry.ColumnCount > 0)
 		{
 			int total = 0;
-			foreach (int w in _renderedColumnWidths) total += w;
+			for (int c = 0; c < geometry.ColumnCount; c++) total += geometry.GetColumnWidth(c);
 			bool hasBorder = _borderStyle != BorderStyle.None;
-			if (hasBorder) total += _renderedColumnWidths.Length + 1;
-			else if (_columnSeparator.HasValue) total += Math.Max(0, _renderedColumnWidths.Length - 1) * SeparatorWidth;
+			if (hasBorder) total += geometry.ColumnCount + 1;
+			else if (_columnSeparator.HasValue) total += Math.Max(0, geometry.ColumnCount - 1) * SeparatorWidth;
 			return total;
 		}
 
@@ -1506,6 +1162,8 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 		_gesture.Reset();
 		_vThumbDragging = false;
 		_hThumbDragging = false;
+		_isRowDragSelecting = false;
+		_ctrlDragBaseSelection = null;
 
 		if (_dataSource != null)
 			_dataSource.CollectionChanged -= OnDataSourceCollectionChanged;
@@ -1540,4 +1198,20 @@ public partial class TableControl : BaseControl, IInteractiveControl, IFocusable
 	public static Builders.TableControlBuilder Create() => new Builders.TableControlBuilder();
 
 	#endregion
+	/// <inheritdoc/>
+	public override void DescribeState(IStateWriter w)
+	{
+		ArgumentNullException.ThrowIfNull(w);
+		base.DescribeState(w);
+
+		w.Selection(SelectedRowIndex, RowCount);
+		w.Scroll(_scrollOffset, GetVisibleRowCount(), RowCount);
+
+		// The shape, because a table that looks empty is usually a table with no
+		// columns rather than no rows, and the two are not distinguishable on
+		// screen.
+		w.Write("columnCount", Columns.Count);
+		w.Write("editing", _isEditing);
+	}
+
 }

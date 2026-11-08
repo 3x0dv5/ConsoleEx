@@ -7,8 +7,15 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!-- Keeps its own SharpConsoleUI version. publish.sh rewrites it on every
+         release, and this project is copied out of the repository, where the
+         central list does not exist. -->
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
   <ItemGroup>
-    <PackageReference Include="SharpConsoleUI" Version="2.5.14" />
+    <PackageReference Include="SharpConsoleUI" Version="2.10.9" />
   </ItemGroup>
 
 </Project>

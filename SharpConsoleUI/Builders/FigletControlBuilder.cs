@@ -1,0 +1,333 @@
+// -----------------------------------------------------------------------
+// ConsoleEx - A simple console window system for .NET Core
+//
+// Author: Nikolaos Protopapas
+// Email: nikolaos.protopapas@gmail.com
+// License: MIT
+// -----------------------------------------------------------------------
+
+using SharpConsoleUI.Controls;
+using SharpConsoleUI.DataBinding;
+using SharpConsoleUI.Layout;
+using SharpConsoleUI.Parsing;
+
+namespace SharpConsoleUI.Builders;
+
+/// <summary>
+/// Fluent builder for Figlet ASCII art controls
+/// </summary>
+public class FigletControlBuilder : IControlBuilder<FigletControl>
+{
+	private string? _text;
+	private Color? _color;
+	private HorizontalAlignment _horizontalAlignment = HorizontalAlignment.Left;
+	private VerticalAlignment _verticalAlignment = VerticalAlignment.Top;
+	private Margin _margin = new(0, 0, 0, 0);
+	private bool _visible = true;
+	private int? _width;
+	private string? _name;
+	private object? _tag;
+	private StickyPosition _stickyPosition = StickyPosition.None;
+	private bool _rightPadded = true;
+	private FigletSize _size = FigletSize.Default;
+	private FigletFont? _customFont;
+	private string? _fontPath;
+	private WrapMode _wrapMode = WrapMode.NoWrap;
+	private Themes.ColorRole _role = Themes.ColorRole.Default;
+	private Themes.ThemeMode? _colorRoleMode;
+	private bool _outline = false;
+
+	/// <summary>
+	/// Sets the control's semantic colour role (drives the banner colour).
+	/// </summary>
+	/// <param name="role">The semantic role determining the banner colour.</param>
+	/// <param name="mode">Optional <see cref="Themes.ThemeMode"/> override for dark/light role-colour derivation. When null, the active theme's mode is used.</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithColorRole(Themes.ColorRole role, Themes.ThemeMode? mode = null)
+	{
+		_role = role;
+		_colorRoleMode = mode;
+		return this;
+	}
+
+	/// <summary>
+	/// Renders the role accent in outline style.
+	/// </summary>
+	/// <param name="outline">Whether to use outline style.</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder Outline(bool outline = true)
+	{
+		_outline = outline;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the FIGlet text to render
+	/// </summary>
+	/// <param name="text">The text to render as ASCII art</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithText(string text)
+	{
+		_text = text;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the FIGlet text color
+	/// </summary>
+	/// <param name="color">The text color</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithColor(Color color)
+	{
+		_color = color;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the horizontal alignment
+	/// </summary>
+	/// <param name="alignment">The horizontal alignment</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithAlignment(HorizontalAlignment alignment)
+	{
+		_horizontalAlignment = alignment;
+		return this;
+	}
+
+	/// <summary>
+	/// Centers the FIGlet text horizontally
+	/// </summary>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder Centered()
+	{
+		_horizontalAlignment = HorizontalAlignment.Center;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the vertical alignment
+	/// </summary>
+	/// <param name="alignment">The vertical alignment</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithVerticalAlignment(VerticalAlignment alignment)
+	{
+		_verticalAlignment = alignment;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the margin
+	/// </summary>
+	/// <param name="left">Left margin</param>
+	/// <param name="top">Top margin</param>
+	/// <param name="right">Right margin</param>
+	/// <param name="bottom">Bottom margin</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithMargin(int left, int top, int right, int bottom)
+	{
+		_margin = new Margin(left, top, right, bottom);
+		return this;
+	}
+
+	/// <summary>
+	/// Sets uniform margin
+	/// </summary>
+	/// <param name="margin">The margin value for all sides</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithMargin(int margin)
+	{
+		_margin = new Margin(margin, margin, margin, margin);
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the width
+	/// </summary>
+	/// <param name="width">The control width</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithWidth(int width)
+	{
+		_width = width;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the visibility
+	/// </summary>
+	/// <param name="visible">Whether the control is visible</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder Visible(bool visible = true)
+	{
+		_visible = visible;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the control name for lookup
+	/// </summary>
+	/// <param name="name">The control name</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithName(string name)
+	{
+		_name = name;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets a tag object
+	/// </summary>
+	/// <param name="tag">The tag object</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithTag(object tag)
+	{
+		_tag = tag;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the sticky position
+	/// </summary>
+	/// <param name="position">The sticky position</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithStickyPosition(StickyPosition position)
+	{
+		_stickyPosition = position;
+		return this;
+	}
+
+	/// <summary>
+	/// Makes the control stick to the top of the window
+	/// </summary>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder StickyTop()
+	{
+		_stickyPosition = StickyPosition.Top;
+		return this;
+	}
+
+	/// <summary>
+	/// Makes the control stick to the bottom of the window
+	/// </summary>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder StickyBottom()
+	{
+		_stickyPosition = StickyPosition.Bottom;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets whether the right side should be padded
+	/// </summary>
+	/// <param name="rightPadded">Whether to pad the right side</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithRightPadded(bool rightPadded)
+	{
+		_rightPadded = rightPadded;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the FIGlet text size
+	/// </summary>
+	/// <param name="size">The font size</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithSize(FigletSize size)
+	{
+		_size = size;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the FIGlet text to use small font
+	/// </summary>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder Small()
+	{
+		_size = FigletSize.Small;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the FIGlet text to use large font
+	/// </summary>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder Large()
+	{
+		_size = FigletSize.Large;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets a custom FigletFont instance
+	/// </summary>
+	/// <param name="font">The custom font</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithCustomFont(FigletFont font)
+	{
+		_customFont = font;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the path to a custom .flf font file
+	/// </summary>
+	/// <param name="fontPath">Path to the .flf font file</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithFontPath(string fontPath)
+	{
+		_fontPath = fontPath;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the wrap mode for FIGlet text when it exceeds available width.
+	/// </summary>
+	/// <param name="wrapMode">The wrap mode to apply.</param>
+	/// <returns>The builder for chaining</returns>
+	public FigletControlBuilder WithWrapMode(WrapMode wrapMode)
+	{
+		_wrapMode = wrapMode;
+		return this;
+	}
+
+	/// <summary>
+	/// Builds the Figlet control
+	/// </summary>
+	/// <returns>The configured Figlet control</returns>
+	public FigletControl Build()
+	{
+		var control = new FigletControl
+		{
+			Text = _text,
+			HorizontalAlignment = _horizontalAlignment,
+			VerticalAlignment = _verticalAlignment,
+			Margin = _margin,
+			Visible = _visible,
+			Width = _width,
+			Name = _name,
+			Tag = _tag,
+			StickyPosition = _stickyPosition,
+			RightPadded = _rightPadded,
+			Size = _size,
+			CustomFont = _customFont,
+			FontPath = _fontPath,
+			WrapMode = _wrapMode,
+			ColorRole = _role,
+			ColorRoleMode = _colorRoleMode,
+			Outline = _outline
+		};
+
+		if (_color.HasValue)
+			control.Color = _color.Value;
+
+		BindingHelper.ApplyDeferredBindings(this, control);
+		return control;
+	}
+
+	/// <summary>
+	/// Implicit conversion to FigletControl
+	/// </summary>
+	/// <param name="builder">The builder</param>
+	/// <returns>The built Figlet control</returns>
+	public static implicit operator FigletControl(FigletControlBuilder builder) => builder.Build();
+}

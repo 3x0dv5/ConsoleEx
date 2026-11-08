@@ -7,6 +7,7 @@
 // -----------------------------------------------------------------------
 
 using System.Drawing;
+using SharpConsoleUI.Configuration;
 using SharpConsoleUI.Controls;
 using SharpConsoleUI.Drivers;
 using SharpConsoleUI.Events;
@@ -233,7 +234,10 @@ namespace SharpConsoleUI.Windows
 						if (leftControl is Controls.IMouseAwareControl leavingControl && leavingControl.WantsMouseEvents)
 						{
 							var leavePosition = GetControlRelativePosition(leftControl, args.WindowPosition);
-							var leaveArgs = args.WithPosition(leavePosition).WithFlags(MouseFlags.MouseLeave);
+							// Replace the flags rather than adding to them: a synthesized hover notification must not
+							// carry the triggering event's wheel/button flags, or a wheel notch that changes the
+							// hovered control is handled twice — once here, once as the real notch (#82).
+							var leaveArgs = args.WithPosition(leavePosition).WithReplacedFlags(MouseFlags.MouseLeave);
 							leavingControl.ProcessMouseEvent(leaveArgs);
 						}
 					}
@@ -246,7 +250,7 @@ namespace SharpConsoleUI.Windows
 						if (enteredControl is Controls.IMouseAwareControl enteringControl && enteringControl.WantsMouseEvents)
 						{
 							var enterPosition = GetControlRelativePosition(enteredControl, args.WindowPosition);
-							var enterArgs = args.WithPosition(enterPosition).WithFlags(MouseFlags.MouseEnter);
+							var enterArgs = args.WithPosition(enterPosition).WithReplacedFlags(MouseFlags.MouseEnter);
 							enteringControl.ProcessMouseEvent(enterArgs);
 						}
 					}
@@ -431,13 +435,13 @@ namespace SharpConsoleUI.Windows
 				{
 					if (args.HasFlag(MouseFlags.WheeledUp))
 					{
-						_window._renderer.ScrollBy(-3);
+						_window._renderer.ScrollBy(-ControlDefaults.DefaultWindowScrollWheelLines);
 						_window.Invalidate(Invalidation.Relayout);
 						return true;
 					}
 					else if (args.HasFlag(MouseFlags.WheeledDown))
 					{
-						_window._renderer.ScrollBy(3);
+						_window._renderer.ScrollBy(ControlDefaults.DefaultWindowScrollWheelLines);
 						_window.Invalidate(Invalidation.Relayout);
 						return true;
 					}
@@ -1028,32 +1032,11 @@ namespace SharpConsoleUI.Windows
 				{
 					if (current.Container is Controls.IScrollableContainer scrollable)
 					{
-						if (ReferenceEquals(current, focusedContent))
-						{
-							scrollable.ScrollChildIntoView(current);
-						}
-						else
-						{
-							// Focused leaf is nested deeper than the scroller's direct child: reveal the
-							// leaf's actual row within the scroller, not the whole (possibly tall) intermediate.
-							// Resolve the offset from the layout subtree (works when the leaf is off-viewport
-							// and was never painted); fall back to a paint-relative translation.
-							int rowInChild;
-							int focusedHeight;
-							if (Helpers.FocusScrollHelper.TryGetFocusedRowInDirectChild(current, focusedContent, out rowInChild, out focusedHeight))
-							{
-								scrollable.ScrollChildRegionIntoView(current, rowInChild, focusedHeight);
-							}
-							else
-							{
-								// Subtree resolution failed (self-scrolling child, or a topology we can't probe). The focused
-								// control's live ActualY is unreliable when it is off-viewport, so fall back to revealing the
-								// whole direct child - the historical ScrollChildIntoView behavior. Passing the child's full
-								// height to ScrollRangeIntoView keeps the tall-child guard active, so an already-visible tall
-								// container is not jumped to its top (#67), and a self-scrolling child reveals its own leaf.
-								scrollable.ScrollChildIntoView(current);
-							}
-						}
+						// Reveal the focused leaf's own row rather than the whole (possibly tall)
+						// intermediate container. The overload covers both shapes: the leaf BEING the
+						// direct child degrades to revealing that child, and an unreadable topology
+						// falls back to the same - keeping the tall-child guard active (#67).
+						Helpers.FocusScrollHelper.RevealNestedTarget(scrollable, current, focusedContent);
 					}
 					current = current.Container as IWindowControl;
 				}

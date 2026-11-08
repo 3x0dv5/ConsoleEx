@@ -3,6 +3,11 @@
 Progress indicator for tasks — determinate with a percentage, or indeterminate with a pulsing
 animation.
 
+<!-- gallery -->
+
+![ProgressBarControl](../images/controls/ProgressBarControl.png)
+
+
 ## Overview
 
 `ProgressBarControl` shows how far along a task is. In **determinate** mode you set `Value` against
@@ -117,7 +122,7 @@ you give it a `BarWidth` or a different alignment.
 ## Events
 
 None. `ProgressBarControl` implements `INotifyPropertyChanged` via `BaseControl`, so its properties
-can be data-bound — see [Data Binding](../binding.md).
+can be data-bound — see [Data Binding](../BINDING.md).
 
 ## Keyboard and mouse support
 

@@ -169,6 +169,70 @@ namespace SharpConsoleUI.Drivers
 		void InvalidateFrontBuffer() { }
 
 		/// <summary>
+		/// Whether this driver can be driven by a blocking main loop that owns its thread.
+		/// </summary>
+		/// <remarks>
+		/// <c>true</c> for a terminal driver, which runs on a thread it may block. A driver whose host
+		/// owns the event loop — a browser canvas, where WebAssembly is single-threaded and a blocking
+		/// wait holds the only thread — returns <c>false</c>, and
+		/// <see cref="ConsoleWindowSystem.Run"/> refuses rather than hanging. Such a host drives frames
+		/// itself via <see cref="ConsoleWindowSystem.BeginHosted"/>.
+		/// <para>Defaulted so existing drivers are unaffected.</para>
+		/// </remarks>
+		bool SupportsBlockingLoop => true;
+
+		/// <summary>
+		/// Captures the composed desktop - every window, stacked, as last presented.
+		/// </summary>
+		/// <returns>
+		/// A snapshot of what is on screen, or <c>null</c> when this driver keeps no composed
+		/// buffer to read.
+		/// </returns>
+		/// <remarks>
+		/// <para>
+		/// A diff-rendering driver already holds the composed result permanently, because it
+		/// needs it to decide what to send to the terminal. Reading it therefore costs one
+		/// copy per call and needs no diagnostics subsystem.
+		/// </para>
+		/// <para>
+		/// Returns <c>null</c> from a driver that keeps no buffer and so retains no composed
+		/// result. Callers should say so rather than substituting a blank image.
+		/// </para>
+		/// <para>Defaulted so existing drivers are unaffected.</para>
+		/// </remarks>
+		Diagnostics.Snapshots.ConsoleBufferSnapshot? CaptureComposed() => null;
+
+		/// <summary>
+		/// How many frames this driver has presented, or 0 when it does not count.
+		/// </summary>
+		/// <remarks>
+		/// Monotonic. Lets a caller ask "has the screen changed since I last looked" without
+		/// enabling the diagnostics subsystem - the cheap question deserves a cheap answer,
+		/// and anything streaming the screen asks it many times a second.
+		/// <para><see cref="long"/> so it cannot wrap: an int at 60fps overflows in about
+		/// thirteen months, and a counter that went backwards would strand a client waiting
+		/// for a frame number it had already passed.</para>
+		/// <para>Defaulted so existing drivers are unaffected.</para>
+		/// </remarks>
+		long FrameNumber => 0;
+
+		/// <summary>
+		/// Whether a mouse handler is executing right now, on any thread.
+		/// </summary>
+		/// <remarks>
+		/// A mouse event is dispatched synchronously, on whichever thread raised it,
+		/// rather than being queued the way a key is. So a control can be halfway
+		/// through handling a click while another thread asks whether the system has
+		/// finished reacting - and every "is anything queued" question answers no,
+		/// because nothing ever was.
+		/// <para>This is the fifth settling condition for that reason: it is the only
+		/// one that can see work which never passes through a queue.</para>
+		/// <para>Defaulted so a driver that does not count is unaffected: it says
+		/// false, and settling then rests on the queue-based conditions alone.</para>
+		/// </remarks>
+		bool IsDispatchingMouse => false;
+
+		/// <summary>
 		/// Copies a horizontal strip of cells from a <see cref="CharacterBuffer"/> directly
 		/// to the console output buffer, bypassing ANSI string serialization and parsing.
 		/// </summary>

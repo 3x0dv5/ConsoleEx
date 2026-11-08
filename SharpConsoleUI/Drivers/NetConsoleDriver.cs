@@ -27,21 +27,30 @@ namespace SharpConsoleUI.Drivers
 	public enum RenderMode
 	{
 		/// <summary>
-		/// Writes directly to the console without buffering.
+		/// Retired. Renders the same way as <see cref="Buffer"/>.
 		/// </summary>
 		/// <remarks>
-		/// This mode writes each output operation immediately to the console,
-		/// which may result in visible flickering during complex updates.
+		/// This was an unbuffered path from before the compositor existed, kept then as a
+		/// way to check the system end to end without double buffering in the way. The
+		/// compositor has been the only rendering foundation for a long time, and the
+		/// unbuffered path had drifted: it flickered, it retained nothing to screenshot or
+		/// diff, and two of its own write paths disagreed about whether text decorations
+		/// survived.
+		/// <para>
+		/// The value remains so that existing code keeps compiling, and selects buffered
+		/// rendering. Nothing needs to change; <see cref="Buffer"/> says the same thing
+		/// more clearly.
+		/// </para>
 		/// </remarks>
+		[Obsolete("Renders as Buffer. Pass RenderMode.Buffer instead.")]
 		Direct,
 
 		/// <summary>
-		/// Uses double-buffering for smoother rendering.
+		/// Double-buffered rendering: the only mode.
 		/// </summary>
 		/// <remarks>
-		/// This mode accumulates changes in a buffer and renders them all at once,
-		/// only updating portions of the screen that have changed. This provides
-		/// smoother visual updates and is recommended for most applications.
+		/// Changes accumulate in a buffer and reach the terminal in one pass, with only the
+		/// cells that actually changed rewritten. This is what every application gets.
 		/// </remarks>
 		Buffer
 	}
@@ -80,7 +89,6 @@ namespace SharpConsoleUI.Drivers
 	public class NetConsoleDriver : IConsoleDriver, IGraphicsProtocol
 	{
 		private const uint DISABLE_NEWLINE_AUTO_RETURN = 8;
-		private const int DoubleClickTime = 500;
 
 		/// <summary>Safety cap on bracketed-paste payload chars on the Windows ReadKey path, so a
 		/// missing ESC[201~ end marker can never hang the input loop. ~1 MiB of text.</summary>
@@ -118,11 +126,23 @@ namespace SharpConsoleUI.Drivers
 		private const int STD_INPUT_HANDLE = -10;
 		private const int STD_OUTPUT_HANDLE = -11;
 
+		// CreateFile access/share/disposition flags, for opening the console device directly
+		// (CONIN$/CONOUT$) when a standard stream is redirected. See ResolveWindowsConsoleHandle.
+		private const uint GENERIC_READ = 0x80000000;
+		private const uint GENERIC_WRITE = 0x40000000;
+		private const uint FILE_SHARE_READ = 0x00000001;
+		private const uint FILE_SHARE_WRITE = 0x00000002;
+		private const uint OPEN_EXISTING = 3;
+		private static readonly nint INVALID_HANDLE_VALUE = -1;
+
 		// ===== FIX TOGGLES =====
 
 		private ConsoleWindowSystem? _consoleWindowSystem;
 		private object _consoleLock = new object(); // Shared lock for thread-safe Console I/O (initialized to prevent race conditions)
 		private bool _useDirectAnsi; // True on Unix when raw mode active — bypasses ConsolePal
+
+		/// <summary>The raw tty reader, so Stop can end its auto-repeat.</summary>
+		private Input.UnixStdinReader? _unixReader;
 		private CancellationTokenSource? _rawInputCts;
 		private readonly nint _errorHandle;
 		private readonly nint _inputHandle;
@@ -130,10 +150,17 @@ namespace SharpConsoleUI.Drivers
 		private readonly uint _originalInputConsoleMode;
 		private readonly uint _originalOutputConsoleMode;
 		private readonly nint _outputHandle;
+
+		// Console-device handles this driver opened itself (CONIN$/CONOUT$) because the matching
+		// standard stream was redirected. Closed on cleanup; INVALID_HANDLE_VALUE when unused.
+		private nint _ownedConInHandle = INVALID_HANDLE_VALUE;
+		private nint _ownedConOutHandle = INVALID_HANDLE_VALUE;
+
+		// Whether each handle is a real console whose mode we captured and must restore.
+		private readonly bool _inputModeCaptured;
+		private readonly bool _outputModeCaptured;
+		private readonly bool _errorModeCaptured;
 		private ConsoleBuffer? _consoleBuffer;
-		private MouseFlags _lastButton;
-		private Point? _lastClickPosition;
-		private DateTime _lastClickTime;
 		private int _lastConsoleHeight;
 		private int _lastConsoleWidth;
 		private bool _lastSizeSubstituted;
@@ -147,13 +174,26 @@ namespace SharpConsoleUI.Drivers
 		/// <exception cref="ArgumentNullException">
 		/// Thrown when <paramref name="options"/> is null.
 		/// </exception>
-		/// <exception cref="ApplicationException">
-		/// Thrown when console mode configuration fails on Windows platforms.
+		/// <remarks>
+		/// On Windows a redirected standard stream is not an error: the driver opens the console device
+		/// (<c>CONIN$</c>/<c>CONOUT$</c>) instead, so the UI reaches the terminal while the redirected
+		/// stream keeps carrying the caller's data.
+		/// </remarks>
+		/// <exception cref="PlatformNotSupportedException">
+		/// Windows only, when stdin or stdout is redirected. See <see cref="ThrowIfWindowsStdioRedirected"/>.
 		/// </exception>
 		public NetConsoleDriver(NetConsoleDriverOptions options)
 		{
 			Options = options ?? throw new ArgumentNullException(nameof(options));
-			RenderMode = options.RenderMode;
+
+			// Buffered rendering, whatever was asked for. The retired mode remains a legal
+			// value so existing code compiles; resolving it here means the rest of the
+			// driver has one path rather than two, and callers who never looked at this
+			// enum get the behaviour they already expected.
+			RenderMode = RenderMode.Buffer;
+
+			// Refuse redirected stdio on Windows before touching Console at all — see the method.
+			ThrowIfWindowsStdioRedirected();
 
 			if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 			{
@@ -175,62 +215,59 @@ namespace SharpConsoleUI.Drivers
 
 			if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 			{
-				_inputHandle = GetStdHandle(STD_INPUT_HANDLE);
+				// Resolve the input handle. When stdin is redirected (a pipe or file, as in
+				// `type data.txt | app`), the standard handle is not a console and console-mode calls
+				// against it fail — so fall back to the console device, CONIN$. This mirrors what the
+				// Unix path does with /dev/tty: the UI talks to the terminal while the redirected
+				// stream stays free to carry the script's data.
+				_inputHandle = ResolveWindowsConsoleHandle(
+					STD_INPUT_HANDLE, "CONIN$", GENERIC_READ | GENERIC_WRITE, ref _ownedConInHandle);
 
-				if (!GetConsoleMode(_inputHandle, out uint mode))
+				if (GetConsoleMode(_inputHandle, out uint mode))
 				{
-					throw new ApplicationException($"Failed to get input console mode, error code: {GetLastError()}.");
-				}
+					_originalInputConsoleMode = mode;
+					_inputModeCaptured = true;
 
-				_originalInputConsoleMode = mode;
+					mode |= ENABLE_MOUSE_INPUT;
 
-				mode |= ENABLE_MOUSE_INPUT;
-
-				if ((mode & ENABLE_VIRTUAL_TERMINAL_INPUT) < ENABLE_VIRTUAL_TERMINAL_INPUT)
-				{
-					mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-
-					if (!SetConsoleMode(_inputHandle, mode))
+					if ((mode & ENABLE_VIRTUAL_TERMINAL_INPUT) < ENABLE_VIRTUAL_TERMINAL_INPUT)
 					{
-						throw new ApplicationException($"Failed to set input console mode, error code: {GetLastError()}.");
+						mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+						// Best-effort: a console that refuses VT input still renders, it just loses
+						// the richer input encoding. Refusing to start would be worse.
+						SetConsoleMode(_inputHandle, mode);
 					}
 				}
 
-				_outputHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+				_outputHandle = ResolveWindowsConsoleHandle(
+					STD_OUTPUT_HANDLE, "CONOUT$", GENERIC_READ | GENERIC_WRITE, ref _ownedConOutHandle);
 
-				if (!GetConsoleMode(_outputHandle, out mode))
+				if (GetConsoleMode(_outputHandle, out mode))
 				{
-					throw new ApplicationException($"Failed to get output console mode, error code: {GetLastError()}.");
-				}
+					_originalOutputConsoleMode = mode;
+					_outputModeCaptured = true;
 
-				_originalOutputConsoleMode = mode;
-
-				if ((mode & (ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN)) < DISABLE_NEWLINE_AUTO_RETURN)
-				{
-					mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
-
-					if (!SetConsoleMode(_outputHandle, mode))
+					if ((mode & (ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN)) < DISABLE_NEWLINE_AUTO_RETURN)
 					{
-						throw new ApplicationException($"Failed to set output console mode, error code: {GetLastError()}.");
+						mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+						SetConsoleMode(_outputHandle, mode);
 					}
 				}
 
+				// stderr is only ever written to; it is never reopened against the console device,
+				// because a redirected stderr is a deliberate choice by the caller (2> log.txt).
 				_errorHandle = GetStdHandle(STD_ERROR_HANDLE);
 
-				if (!GetConsoleMode(_errorHandle, out mode))
+				if (GetConsoleMode(_errorHandle, out mode))
 				{
-					throw new ApplicationException($"Failed to get error console mode, error code: {GetLastError()}.");
-				}
+					_originalErrorConsoleMode = mode;
+					_errorModeCaptured = true;
 
-				_originalErrorConsoleMode = mode;
-
-				if ((mode & DISABLE_NEWLINE_AUTO_RETURN) < DISABLE_NEWLINE_AUTO_RETURN)
-				{
-					mode |= DISABLE_NEWLINE_AUTO_RETURN;
-
-					if (!SetConsoleMode(_errorHandle, mode))
+					if ((mode & DISABLE_NEWLINE_AUTO_RETURN) < DISABLE_NEWLINE_AUTO_RETURN)
 					{
-						throw new ApplicationException($"Failed to set error console mode, error code: {GetLastError()}.");
+						mode |= DISABLE_NEWLINE_AUTO_RETURN;
+						SetConsoleMode(_errorHandle, mode);
 					}
 				}
 			}
@@ -303,29 +340,37 @@ namespace SharpConsoleUI.Drivers
 		/// Restores the console to its original configuration.
 		/// </summary>
 		/// <remarks>
-		/// On Windows, this method restores the original console modes for input, output, and error handles.
-		/// This method is automatically called by <see cref="Stop"/>.
+		/// On Windows, this restores the original console modes for whichever of the input, output, and
+		/// error handles were real consoles, and closes any console device the driver opened itself.
+		/// Failures are ignored: this runs while tearing down, where throwing would leave the terminal
+		/// unrestored. Called automatically by <see cref="Stop"/>.
 		/// </remarks>
-		/// <exception cref="ApplicationException">
-		/// Thrown when restoring console modes fails on Windows platforms.
-		/// </exception>
 		public void Cleanup()
 		{
 			if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 			{
-				if (!SetConsoleMode(_inputHandle, _originalInputConsoleMode))
+				// Restore only the modes actually captured: a redirected handle never had one, and
+				// this runs on the teardown path, where throwing would leave the terminal unrestored.
+				if (_inputModeCaptured)
+					SetConsoleMode(_inputHandle, _originalInputConsoleMode);
+
+				if (_outputModeCaptured)
+					SetConsoleMode(_outputHandle, _originalOutputConsoleMode);
+
+				if (_errorModeCaptured)
+					SetConsoleMode(_errorHandle, _originalErrorConsoleMode);
+
+				// Release console devices this driver opened itself.
+				if (_ownedConInHandle != INVALID_HANDLE_VALUE)
 				{
-					throw new ApplicationException($"Failed to restore input console mode, error code: {GetLastError()}.");
+					CloseHandle(_ownedConInHandle);
+					_ownedConInHandle = INVALID_HANDLE_VALUE;
 				}
 
-				if (!SetConsoleMode(_outputHandle, _originalOutputConsoleMode))
+				if (_ownedConOutHandle != INVALID_HANDLE_VALUE)
 				{
-					throw new ApplicationException($"Failed to restore output console mode, error code: {GetLastError()}.");
-				}
-
-				if (!SetConsoleMode(_errorHandle, _originalErrorConsoleMode))
-				{
-					throw new ApplicationException($"Failed to restore error console mode, error code: {GetLastError()}.");
+					CloseHandle(_ownedConOutHandle);
+					_ownedConOutHandle = INVALID_HANDLE_VALUE;
 				}
 			}
 		}
@@ -340,16 +385,7 @@ namespace SharpConsoleUI.Drivers
 		/// <inheritdoc/>
 		public void Clear()
 		{
-			switch (RenderMode)
-			{
-				case RenderMode.Direct:
-					Console.Clear();
-					break;
-
-				case RenderMode.Buffer:
-					_consoleBuffer?.Clear();
-					break;
-			}
+			_consoleBuffer?.Clear();
 		}
 
 		/// <inheritdoc/>
@@ -480,16 +516,28 @@ namespace SharpConsoleUI.Drivers
 					var parser = new AnsiInputParser();
 					var reader = new UnixStdinReader(ttyStream, parser);
 					var cts = _rawInputCts;
-					var inputTask = Task.Run(() => reader.ReadLoop(
+
+					// Held so Stop can end the auto-repeat without waiting for the
+					// read loop to notice. Cancelling the token does NOT unblock a
+					// synchronous read on the tty, so a button held across shutdown
+					// would otherwise keep raising events on a stopped driver until
+					// the next byte happened to arrive.
+					_unixReader = reader;
+
+					// Disposed when the loop ends, so the auto-repeat cannot outlive
+					// the reader that started it.
+					var inputTask = Task.Run(() =>
+					{
+						using (reader) reader.ReadLoop(
 						cts.Token,
 						onKey: key => KeyPressed?.Invoke(this, key),
-						onMouse: (flags, pos) => MouseEvent?.Invoke(this, flags, pos),
+						onMouse: RaiseMouse,
 						onPaste: text => Paste?.Invoke(this, text),
 						continuousButtonPressedHandler: (flag, pos) =>
 						{
-							var continuousFlags = new List<MouseFlags> { flag };
-							MouseEvent?.Invoke(this, continuousFlags, pos);
-						}));
+							RaiseMouse(new List<MouseFlags> { flag }, pos);
+						});
+					});
 				}
 			}
 			else
@@ -515,6 +563,16 @@ namespace SharpConsoleUI.Drivers
 
 			// Cancel raw input reader if active
 			try { _rawInputCts?.Cancel(); } catch { }
+
+			// SequenceHelper's click/press state is process-wide. Clearing it here stops any
+			// continuous-press loop still running against this driver's callback, and prevents a
+			// driver created later in the same process from inheriting a half-finished click.
+			try { Helpers.SequenceHelper.Reset(); } catch { }
+
+			// The Unix side's equivalent. SequenceHelper.Reset only reaches the
+			// Windows adapter's repeat; this one belongs to the raw reader.
+			try { _unixReader?.Dispose(); } catch { }
+			_unixReader = null;
 
 			bool wasDirectAnsi = _useDirectAnsi;
 
@@ -687,16 +745,38 @@ namespace SharpConsoleUI.Drivers
 		/// this does not gate on <see cref="Console.KeyAvailable"/> (which can briefly read false mid-paste).
 		/// </summary>
 		private static string ReadBracketedPastePayload()
+			=> ReadBracketedPastePayload(ConsoleKeys);
+
+		/// <summary>
+		/// Reads a bracketed-paste payload from <paramref name="source"/> until the <c>ESC[201~</c> end
+		/// marker, the size cap, or a gap in the input.
+		/// </summary>
+		/// <remarks>
+		/// This runs while the input loop holds <c>_consoleLock</c>, which every writer to the console
+		/// also takes — including the OSC 52 clipboard emitter on the UI thread. It must therefore
+		/// always terminate. It previously called <c>Console.ReadKey(true)</c>, which blocks until a
+		/// key arrives with no timeout: a start marker whose end marker never came (a truncated or
+		/// malformed paste) parked the input thread here holding the lock, and the next copy blocked
+		/// the UI thread behind it until the watchdog reported the application unresponsive.
+		///
+		/// <para>Uses the same gap-tolerant, time-bounded reader as the CSI path, which was already
+		/// written to "terminate instead of hanging" for exactly this reason.</para>
+		/// </remarks>
+		internal static string ReadBracketedPastePayload(IConsoleKeySource source)
 		{
 			var sb = new StringBuilder();
 			while (sb.Length < MaxBracketedPasteChars)
 			{
-				var k = Console.ReadKey(true);
+				if (!source.TryReadKey(out var k))
+					break; // No further bytes within the budget — the paste is over or was truncated.
+
 				sb.Append(k.KeyChar);
 				if (TryExtractBracketedPaste(sb, out string payload))
 					return payload;
 			}
-			// Cap hit without an end marker: return whatever we have, stripping a trailing partial marker.
+
+			// Cap or gap reached without an end marker: return whatever we have, stripping a trailing
+			// partial marker.
 			return StripPasteEndMarker(sb.ToString());
 		}
 
@@ -799,101 +879,19 @@ namespace SharpConsoleUI.Drivers
 		/// <inheritdoc/>
 		public void SetNarrowCell(int x, int y, char character, Color fg, Color bg)
 		{
-			switch (RenderMode)
-			{
-				case RenderMode.Direct:
-					var fgAnsi = fg.A == 0 ? "39" : $"38;2;{fg.R};{fg.G};{fg.B}";
-					var bgAnsi = bg.A == 0 ? "49" : $"48;2;{bg.R};{bg.G};{bg.B}";
-					var ansi = $"\x1b[{fgAnsi};{bgAnsi}m{character}\x1b[0m";
-					if (_useDirectAnsi)
-					{
-						WriteOutput($"\x1b[{Math.Clamp(y + 1, 1, 9999)};{Math.Clamp(x + 1, 1, 9999)}H");
-						WriteOutput(ansi);
-					}
-					else
-					{
-						Console.SetCursorPosition(x, y);
-						Console.Out.Write(ansi);
-					}
-					break;
-
-				case RenderMode.Buffer:
-					_consoleBuffer?.SetNarrowCell(x, y, character, fg, bg);
-					break;
-			}
+			_consoleBuffer?.SetNarrowCell(x, y, character, fg, bg);
 		}
 
 		/// <inheritdoc/>
 		public void FillCells(int x, int y, int width, char character, Color fg, Color bg)
 		{
-			switch (RenderMode)
-			{
-				case RenderMode.Direct:
-					var sb = new StringBuilder();
-					var fgAnsi = fg.A == 0 ? "39" : $"38;2;{fg.R};{fg.G};{fg.B}";
-					var bgAnsi = bg.A == 0 ? "49" : $"48;2;{bg.R};{bg.G};{bg.B}";
-					sb.Append($"\x1b[{fgAnsi};{bgAnsi}m");
-					sb.Append(character, width);
-					sb.Append("\x1b[0m");
-					if (_useDirectAnsi)
-					{
-						WriteOutput($"\x1b[{Math.Clamp(y + 1, 1, 9999)};{Math.Clamp(x + 1, 1, 9999)}H");
-						WriteOutput(sb.ToString());
-					}
-					else
-					{
-						Console.SetCursorPosition(x, y);
-						Console.Out.Write(sb.ToString());
-					}
-					break;
-
-				case RenderMode.Buffer:
-					_consoleBuffer?.FillCells(x, y, width, character, fg, bg);
-					break;
-			}
+			_consoleBuffer?.FillCells(x, y, width, character, fg, bg);
 		}
 
 		/// <inheritdoc/>
 		public void WriteBufferRegion(int destX, int destY, Layout.CharacterBuffer source, int srcX, int srcY, int width, Color fallbackBg)
 		{
-			switch (RenderMode)
-			{
-				case RenderMode.Direct:
-					// Fallback: format ANSI string and write directly
-					var sb = new StringBuilder();
-					for (int i = 0; i < width; i++)
-					{
-						var cell = source.GetCell(srcX + i, srcY);
-						var cfgAnsi = cell.Foreground.A == 0 ? "39" : $"38;2;{cell.Foreground.R};{cell.Foreground.G};{cell.Foreground.B}";
-						var cbgAnsi = cell.Background.A == 0 ? "49" : $"48;2;{cell.Background.R};{cell.Background.G};{cell.Background.B}";
-						sb.Append($"\x1b[{cfgAnsi};{cbgAnsi}");
-						if ((cell.Decorations & TextDecoration.Bold) != 0) sb.Append(";1");
-						if ((cell.Decorations & TextDecoration.Dim) != 0) sb.Append(";2");
-						if ((cell.Decorations & TextDecoration.Italic) != 0) sb.Append(";3");
-						if ((cell.Decorations & TextDecoration.Underline) != 0) sb.Append(";4");
-						if ((cell.Decorations & TextDecoration.Blink) != 0) sb.Append(";5");
-						if ((cell.Decorations & TextDecoration.Invert) != 0) sb.Append(";7");
-						if ((cell.Decorations & TextDecoration.Strikethrough) != 0) sb.Append(";9");
-						sb.Append('m');
-						sb.Append(cell.Character);
-					}
-					sb.Append("\x1b[0m");
-					if (_useDirectAnsi)
-					{
-						WriteOutput($"\x1b[{Math.Clamp(destY + 1, 1, 9999)};{Math.Clamp(destX + 1, 1, 9999)}H");
-						WriteOutput(sb.ToString());
-					}
-					else
-					{
-						Console.SetCursorPosition(destX, destY);
-						Console.Out.Write(sb.ToString());
-					}
-					break;
-
-				case RenderMode.Buffer:
-					_consoleBuffer?.SetCellsFromBuffer(destX, destY, source, srcX, srcY, width, fallbackBg);
-					break;
-			}
+			_consoleBuffer?.SetCellsFromBuffer(destX, destY, source, srcX, srcY, width, fallbackBg);
 		}
 
 		/// <inheritdoc />
@@ -959,6 +957,13 @@ namespace SharpConsoleUI.Drivers
 				}
 			}
 		}
+
+		/// <inheritdoc/>
+		public long FrameNumber => _consoleBuffer?.FrameNumber ?? 0;
+
+		/// <inheritdoc/>
+		public Diagnostics.Snapshots.ConsoleBufferSnapshot? CaptureComposed() =>
+			_consoleBuffer?.CaptureComposed();
 
 		/// <summary>
 		/// Gets the count of dirty characters in the rendering buffer.
@@ -1080,6 +1085,34 @@ namespace SharpConsoleUI.Drivers
 		/// or Console.Out.Write as fallback. Raw write completely bypasses .NET's
 		/// Console/StreamWriter/SyncTextWriter infrastructure.
 		/// </summary>
+		/// <summary>Counts mouse events being dispatched right now.</summary>
+		/// <remarks>
+		/// Dispatch is synchronous and happens on whichever thread raised the
+		/// event, so a handler can be running while another thread asks whether
+		/// the system has finished reacting. Without this, "no input is queued"
+		/// reads as settled at a moment when a control is halfway through
+		/// handling a click.
+		/// </remarks>
+		private readonly Core.WorkInFlight _mouseDispatch = new();
+
+		/// <summary>Whether a mouse handler is running on any thread.</summary>
+		public bool IsDispatchingMouse => _mouseDispatch.IsRunning;
+
+		/// <summary>
+		/// Raises <see cref="MouseEvent"/>, counting the dispatch while it runs.
+		/// </summary>
+		/// <param name="flags">What the terminal reported.</param>
+		/// <param name="position">Where, in cells.</param>
+		/// <remarks>
+		/// One place rather than the seven the invoke used to be spread across.
+		/// A counter in seven places is seven chances to miss one; here it is a
+		/// property of raising the event at all.
+		/// </remarks>
+		private void RaiseMouse(List<MouseFlags> flags, Point position)
+		{
+			_mouseDispatch.While(() => MouseEvent?.Invoke(this, flags, position));
+		}
+
 		private void WriteOutput(string text)
 		{
 			if (_useDirectAnsi)
@@ -1135,6 +1168,14 @@ namespace SharpConsoleUI.Drivers
 		[DllImport("kernel32.dll", SetLastError = true)]
 		private static extern nint GetStdHandle(int nStdHandle);
 
+		[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+		private static extern nint CreateFileW(
+			string lpFileName, uint dwDesiredAccess, uint dwShareMode, nint lpSecurityAttributes,
+			uint dwCreationDisposition, uint dwFlagsAndAttributes, nint hTemplateFile);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		private static extern bool CloseHandle(nint hObject);
+
 		[DllImport("kernel32.dll")]
 		private static extern bool SetConsoleMode(nint hConsoleHandle, uint dwMode);
 
@@ -1149,6 +1190,107 @@ namespace SharpConsoleUI.Drivers
 
 		[DllImport("libc", EntryPoint = "signal")]
 		private static extern IntPtr _unixSignal(int signum, IntPtr handler);
+
+		/// <summary>
+		/// Refuses to construct a Windows driver over redirected standard streams.
+		/// </summary>
+		/// <remarks>
+		/// On Windows this driver renders and reads input through the managed <see cref="Console"/>
+		/// APIs — <c>ReadKey</c>, <c>KeyAvailable</c>, <c>Write</c>, the cursor and buffer APIs — and
+		/// every one of them acts on the process's STANDARD handles. When those are redirected they
+		/// refer to a pipe or a file rather than the console, so input cannot be read and UI frames
+		/// would be written into the caller's data stream. The failures are not theoretical: setting
+		/// <c>TreatControlCAsInput</c> throws for redirected stdin, and <c>CursorVisible</c> throws for
+		/// redirected stdout, each with an unhelpful "The handle is invalid".
+		///
+		/// <para>Unix does not have this problem because the driver never uses <see cref="Console"/>
+		/// for UI there: it opens <c>/dev/tty</c>, writes to that fd directly, and points
+		/// <see cref="Console.Out"/> at <see cref="TextWriter.Null"/> so the runtime cannot leak into
+		/// the pipe. Giving Windows the same treatment means reading via <c>ReadConsoleInput</c> on
+		/// <c>CONIN$</c> and writing to <c>CONOUT$</c> — a separate Windows I/O backend, not a patch.
+		/// Until that exists, failing immediately with an explanation beats crashing later from a
+		/// cursor call, or silently painting escape sequences into somebody's output file.</para>
+		///
+		/// <para>Redirecting stderr is unaffected: <c>2&gt; log.txt</c> is a normal choice and the
+		/// driver only ever writes there.</para>
+		/// </remarks>
+		/// <exception cref="PlatformNotSupportedException">stdin or stdout is redirected on Windows.</exception>
+		private static void ThrowIfWindowsStdioRedirected()
+		{
+			if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+				return;
+
+			bool stdinRedirected = Console.IsInputRedirected;
+			bool stdoutRedirected = Console.IsOutputRedirected;
+
+			if (!stdinRedirected && !stdoutRedirected)
+				return;
+
+			throw new PlatformNotSupportedException(
+				"Piped or redirected stdin/stdout is not supported on Windows." + Environment.NewLine +
+				Environment.NewLine +
+				"SharpConsoleUI renders through the Windows console APIs, which act on the process's " +
+				"standard handles. When those are redirected they refer to a pipe or file rather than " +
+				"the console, so input cannot be read and UI output would be written into your data stream." +
+				Environment.NewLine + Environment.NewLine +
+				$"stdin redirected: {stdinRedirected}   stdout redirected: {stdoutRedirected}" +
+				Environment.NewLine + Environment.NewLine +
+				"Workarounds:" + Environment.NewLine +
+				"  - Run without redirection." + Environment.NewLine +
+				"  - Read the piped data yourself before constructing the window system." + Environment.NewLine +
+				"  - Use Linux/macOS, where the driver opens /dev/tty and pipelines work fully.");
+		}
+
+		/// <summary>
+		/// Returns a console handle for the given standard stream, falling back to the console device
+		/// when that stream is redirected.
+		/// </summary>
+		/// <param name="stdHandle">The <c>STD_*_HANDLE</c> identifier to try first.</param>
+		/// <param name="deviceName">The console device to open instead — <c>CONIN$</c> or <c>CONOUT$</c>.</param>
+		/// <param name="access">Desired access for the device open.</param>
+		/// <param name="ownedHandle">
+		/// Receives the handle when this method opens the device itself, so cleanup can close it.
+		/// </param>
+		/// <remarks>
+		/// A redirected standard stream (<c>type in.txt | app</c>, <c>app &gt; out.txt</c>) is a pipe or
+		/// file, not a console, so console-mode calls against it fail. Opening <c>CONIN$</c>/<c>CONOUT$</c>
+		/// reaches the terminal directly and leaves the redirected stream carrying the caller's data —
+		/// the Windows counterpart of the Unix <c>/dev/tty</c> path in <see cref="Input.TerminalRawMode"/>.
+		///
+		/// <para>Falls back to the standard handle when no console is attached at all (a detached or
+		/// service process): there is nothing better to return, and callers treat a non-console handle
+		/// as "no mode to configure" rather than as an error.</para>
+		///
+		/// <para>Note: the redirected branch is currently unreachable, because
+		/// <see cref="ThrowIfWindowsStdioRedirected"/> refuses that case first. It is kept because it is
+		/// correct, costs nothing, and is the foundation a real Windows device backend would build on.
+		/// The reachable path today is the no-console fallback.</para>
+		/// </remarks>
+		private static nint ResolveWindowsConsoleHandle(int stdHandle, string deviceName, uint access, ref nint ownedHandle)
+		{
+			nint handle = GetStdHandle(stdHandle);
+
+			// Already a console: use it directly, exactly as before.
+			if (handle != INVALID_HANDLE_VALUE && handle != 0 && GetConsoleMode(handle, out _))
+				return handle;
+
+			// Redirected. Reach the terminal through the console device instead.
+			nint device = CreateFileW(
+				deviceName, access, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+
+			if (device != INVALID_HANDLE_VALUE && GetConsoleMode(device, out _))
+			{
+				ownedHandle = device;
+				return device;
+			}
+
+			if (device != INVALID_HANDLE_VALUE)
+				CloseHandle(device);
+
+			// No console available (detached process, service, redirected CI runner). The caller
+			// skips mode configuration; rendering degrades rather than throwing.
+			return handle;
+		}
 
 		private void InputLoop()
 		{
@@ -1260,12 +1402,11 @@ namespace SharpConsoleUI.Drivers
 											(flags, position) =>
 											{
 												// Handle continuous mouse events (drag operations)
-												var continuousFlags = new List<MouseFlags> { flags };
-												MouseEvent?.Invoke(this, continuousFlags, position);
+												RaiseMouse(new List<MouseFlags> { flags }, position);
 											});
 										if (mouseFlags.Count > 0)
 										{
-											MouseEvent?.Invoke(this, mouseFlags, pos);
+											RaiseMouse(mouseFlags, pos);
 											continue;
 										}
 										else
@@ -1284,14 +1425,7 @@ namespace SharpConsoleUI.Drivers
 								else
 								{
 									// This is an Alt + key combination (ESC followed by key)
-									var altKey = new ConsoleKeyInfo(
-										nextKey.KeyChar,
-										nextKey.Key,
-										(nextKey.Modifiers & ConsoleModifiers.Shift) != 0,
-										true, // Alt is pressed
-										(nextKey.Modifiers & ConsoleModifiers.Control) != 0);
-
-									KeyPressed?.Invoke(this, altKey);
+									KeyPressed?.Invoke(this, BuildAltKey(nextKey));
 									continue;
 								}
 							}
@@ -1305,12 +1439,99 @@ namespace SharpConsoleUI.Drivers
 						else
 						{
 							// Regular key press
-							KeyPressed?.Invoke(this, key);
+							KeyPressed?.Invoke(this, NormalizeKey(key));
 						}
 					}
 				} // End lock(_consoleLock) - all Console I/O now protected
 				Thread.Sleep(10);
 			}
+		}
+
+		/// <summary>
+		/// Builds the Alt+key event for an <c>ESC</c> followed by a printable character.
+		/// </summary>
+		/// <param name="nextKey">The key read after the ESC.</param>
+		/// <remarks>
+		/// Under <c>ENABLE_VIRTUAL_TERMINAL_INPUT</c>, Alt+X arrives as ESC then X, and the X carries
+		/// no <see cref="ConsoleKey"/> — the same gap <see cref="NormalizeKey"/> closes for an ordinary
+		/// keystroke, reached through a different branch. Measured on Windows: Alt+w produced
+		/// <c>Key=None, Mods=Alt, KeyChar=0x77</c> both before and after that fix, because this branch
+		/// runs upstream of it.
+		///
+		/// <para>Shift is taken from the character's case, matching
+		/// <c>AnsiInputParser.ProcessEscape</c>. That is an inference and an imperfect one — a shifted
+		/// digit gives no uppercase to detect — but Unix has always reported it this way, so the
+		/// alternative is for the two backends to disagree about Alt+W, which is the concrete bug here.
+		/// See <see cref="NormalizeKey"/> for why Shift is NOT inferred on the ordinary path.</para>
+		/// </remarks>
+		internal static ConsoleKeyInfo BuildAltKey(ConsoleKeyInfo nextKey)
+		{
+			var normalized = NormalizeKey(nextKey);
+			char c = normalized.KeyChar;
+
+			return new ConsoleKeyInfo(
+				c,
+				normalized.Key,
+				// ASCII-only, matching ProcessEscape's own `b >= 0x20 && b <= 0x7E` range: outside it
+				// Unix does not take the Alt path at all, so inferring Shift there would invent a
+				// divergence rather than remove one. (char.IsUpper is Unicode-aware; the rule it
+				// mirrors is not.)
+				(normalized.Modifiers & ConsoleModifiers.Shift) != 0 || (c <= 0x7e && char.IsUpper(c)),
+				true, // Alt is pressed
+				(normalized.Modifiers & ConsoleModifiers.Control) != 0);
+		}
+
+		/// <summary>
+		/// Fills in a missing <see cref="ConsoleKeyInfo.Key"/> from the character, leaving everything
+		/// else untouched.
+		/// </summary>
+		/// <remarks>
+		/// The driver enables <c>ENABLE_VIRTUAL_TERMINAL_INPUT</c>, under which
+		/// <see cref="Console.ReadKey(bool)"/> reports <see cref="ConsoleKey.None"/> for ordinary
+		/// characters and sets only <see cref="ConsoleKeyInfo.KeyChar"/>. Verified by A/B on one console
+		/// with the same injected keystroke: with VT input off, <c>W</c> arrives as
+		/// <c>Key=W, KeyChar=0x77</c>; with it on, as <c>Key=None, KeyChar=0x77</c>.
+		///
+		/// <para>The effect was that <c>keyInfo.Key == ConsoleKey.W</c> — the obvious way to test for a
+		/// keystroke, and the way it works on Unix — was never true on Windows. Ctrl+letter combinations
+		/// escaped this only because the control-character branch above rebuilds them from 0x01-0x1A.</para>
+		///
+		/// <para>Uses the mapping the Unix parser already applies, so both input backends agree rather
+		/// than each carrying their own table.</para>
+		///
+		/// <para>Conservative by design: a key that already carries a <see cref="ConsoleKey"/> is
+		/// returned unchanged, and <see cref="ConsoleKeyInfo.KeyChar"/> and the modifiers are always
+		/// preserved — the raw character is what the CJK and bracketed-paste paths depend on (issue #42).</para>
+		///
+		/// <para><b>Known limitation — Shift is not reported under VT input on Windows.</b> conhost
+		/// drops <c>SHIFT_PRESSED</c> before the driver ever sees the record, so Shift+W arrives as
+		/// <c>KeyChar='W'</c> with no Shift modifier:</para>
+		/// <code>
+		/// VT off : Key=W(87)   Mods=Shift  KeyChar=0x57
+		/// VT on  : Key=W(87)   Mods=None   KeyChar=0x57
+		/// </code>
+		/// <para>So <c>Key == ConsoleKey.W &amp;&amp; Modifiers.HasFlag(Shift)</c> does not fire on
+		/// Windows. This is deliberately NOT worked around here: inferring Shift from an uppercase
+		/// character is wrong for anything without a case, where the shifted and unshifted forms are
+		/// different characters entirely (<c>5</c> versus <c>%</c>), so it would trade a missing
+		/// modifier for a wrong one. Test the character instead when case matters.</para>
+		/// </remarks>
+		internal static ConsoleKeyInfo NormalizeKey(ConsoleKeyInfo key)
+		{
+			// Already identified (VT input off, or a key the console resolved itself): leave it alone.
+			if (key.Key != ConsoleKey.None)
+				return key;
+
+			ConsoleKey mapped = Input.AnsiInputParser.CharToConsoleKey(key.KeyChar);
+			if (mapped == ConsoleKey.NoName)
+				return key; // No sensible mapping — reporting NoName would be no better than None.
+
+			return new ConsoleKeyInfo(
+				key.KeyChar,
+				mapped,
+				(key.Modifiers & ConsoleModifiers.Shift) != 0,
+				(key.Modifiers & ConsoleModifiers.Alt) != 0,
+				(key.Modifiers & ConsoleModifiers.Control) != 0);
 		}
 
 		private (ConsoleKeyInfo? consoleKeyInfo, bool isMouse) MapAnsiToConsoleKeyInfo(string ansiSequence, List<ConsoleKeyInfo> consoleKeyInfoSequence)
@@ -1437,7 +1658,7 @@ namespace SharpConsoleUI.Drivers
 
 								if (ParseMouseSequence(consoleKeyInfoSequence.ToArray(), out List<MouseFlags> mouseFlags, out Point pos))
 								{
-									MouseEvent?.Invoke(this, mouseFlags, pos);
+									RaiseMouse(mouseFlags, pos);
 								}
 							}
 						}
@@ -1448,145 +1669,41 @@ namespace SharpConsoleUI.Drivers
 			return (null, false);
 		}
 
-		private bool ParseMouseSequence(ConsoleKeyInfo[] sequence, out List<MouseFlags> mouseFlags, out Point position)
+		/// <summary>Decodes a legacy X10 mouse report and reports it.</summary>
+		/// <param name="sequence">The bytes collected after <c>ESC [ M</c>.</param>
+		/// <param name="mouseFlags">What the terminal said.</param>
+		/// <param name="position">Where, in cells.</param>
+		/// <returns>Whether it was a mouse report at all.</returns>
+		/// <remarks>
+		/// This was a third decoder of the same protocol, beside the two for SGR,
+		/// and it disagreed with the one in <see cref="Input.AnsiInputParser"/>
+		/// three ways: it read the MODIFIER bits as the button number
+		/// (<c>(buttonCode &gt;&gt; 2) &amp; 3</c>), it had the wheel direction
+		/// inverted, and its motion branch raised the event itself before
+		/// returning true to a caller that raised it again - so every X10 drag
+		/// was dispatched twice.
+		///
+		/// It now decodes with the same code every other path uses, and only
+		/// returns: raising is the caller's job, once.
+		/// </remarks>
+		private static bool ParseMouseSequence(
+			ConsoleKeyInfo[] sequence, out List<MouseFlags> mouseFlags, out Point position)
 		{
 			mouseFlags = new List<MouseFlags>();
-			position = new Point(0, 0);
+			position = Point.Empty;
 
-			// We need at least 6 bytes (ESC [ M <button> <x> <y>)
-			if (sequence.Length < 6)
-				return false;
+			// ESC [ M then the button, column and row.
+			if (sequence.Length < 6) return false;
 
-			try
-			{
-				// The button info is in the 4th byte (index 3)
-				// Subtract 32 as per ANSI mouse protocol
-				int buttonCode = sequence[3].KeyChar - 32;
+			var decoded = Input.AnsiInputParser.DecodeX10Mouse(
+				sequence[3].KeyChar, sequence[4].KeyChar, sequence[5].KeyChar);
 
-				// Extract coordinates (subtract 32 from the raw values as per ANSI mouse protocol)
-				// NOTE: This X10 format is limited to coordinates 0-222 (255-32-1)
-				// For coordinates beyond this range, SGR mode should be used instead
-				position.X = Math.Max(0, sequence[4].KeyChar - 33); // Convert to 0-based (32 + 1)
-				position.Y = Math.Max(0, sequence[5].KeyChar - 33); // Convert to 0-based (32 + 1)
+			if (decoded.Flags.Count == 0) return false;
 
-				// Set modifier flags first
-				if ((buttonCode & 0x04) != 0) mouseFlags.Add(MouseFlags.ButtonShift);
-				if ((buttonCode & 0x08) != 0) mouseFlags.Add(MouseFlags.ButtonAlt);
-				if ((buttonCode & 0x10) != 0) mouseFlags.Add(MouseFlags.ButtonCtrl);
+			mouseFlags = decoded.Flags;
+			position = decoded.Position;
 
-				// Check for mouse motion
-				bool motion = (buttonCode & 0x20) != 0;
-				if (motion)
-				{
-					mouseFlags.Add(MouseFlags.ReportMousePosition);
-					// For motion events, the bottom 2 bits indicate which button is being dragged (if any)
-					int dragButton = buttonCode & 0x03;
-					switch (dragButton)
-					{
-						case 0: mouseFlags.Add(MouseFlags.Button1Pressed); mouseFlags.Add(MouseFlags.Button1Dragged); break;
-						case 1: mouseFlags.Add(MouseFlags.Button2Pressed); mouseFlags.Add(MouseFlags.Button2Dragged); break;
-						case 2: mouseFlags.Add(MouseFlags.Button3Pressed); mouseFlags.Add(MouseFlags.Button3Dragged); break;
-					}
-					MouseEvent?.Invoke(this, mouseFlags, position); // Raise the MouseEvent
-					return true;
-				}
-
-				// Check for button release events
-				bool isRelease = (buttonCode & 0x03) == 3;
-				int buttonNumber = (buttonCode >> 2) & 0x03;
-
-				// Handle button events
-				switch (buttonNumber)
-				{
-					case 0: // Button 1 (Left button)
-						if (!isRelease)
-						{
-							mouseFlags.Add(MouseFlags.Button1Pressed);
-							_lastButton = MouseFlags.Button1Pressed;
-						}
-						else if (_lastButton == MouseFlags.Button1Pressed)
-						{
-							// SAFEGUARD: Ignore duplicate release events (< 50ms = driver bug)
-							// The console mouse driver sometimes generates duplicate Button1Released events
-							var timeSinceLastClick = (DateTime.Now - _lastClickTime).TotalMilliseconds;
-							if (_lastClickPosition?.X == position.X &&
-								_lastClickPosition?.Y == position.Y &&
-								timeSinceLastClick < 50)
-							{
-								// Duplicate event, ignore it
-								return true;
-							}
-
-							mouseFlags.Add(MouseFlags.Button1Released);
-							mouseFlags.Add(MouseFlags.Button1Clicked);
-
-							// Check for double/triple click
-							if (_lastClickPosition?.X == position.X &&
-								_lastClickPosition?.Y == position.Y &&
-								timeSinceLastClick < DoubleClickTime)
-							{
-								if (mouseFlags.Contains(MouseFlags.Button1DoubleClicked))
-									mouseFlags.Add(MouseFlags.Button1TripleClicked);
-								else
-									mouseFlags.Add(MouseFlags.Button1DoubleClicked);
-							}
-
-							_lastClickPosition = position;
-							_lastClickTime = DateTime.Now;
-						}
-						break;
-
-					case 1: // Button 2 (Middle button)
-						if (!isRelease)
-						{
-							mouseFlags.Add(MouseFlags.Button2Pressed);
-							_lastButton = MouseFlags.Button2Pressed;
-						}
-						else if (_lastButton == MouseFlags.Button2Pressed)
-						{
-							mouseFlags.Add(MouseFlags.Button2Released);
-							mouseFlags.Add(MouseFlags.Button2Clicked);
-						}
-						break;
-
-					case 2: // Button 3 (Right button)
-						if (!isRelease)
-						{
-							mouseFlags.Add(MouseFlags.Button3Pressed);
-							_lastButton = MouseFlags.Button3Pressed;
-						}
-						else if (_lastButton == MouseFlags.Button3Pressed)
-						{
-							mouseFlags.Add(MouseFlags.Button3Released);
-							mouseFlags.Add(MouseFlags.Button3Clicked);
-						}
-						break;
-
-					case 3: // Special cases - includes wheel events
-						if ((buttonCode & 0x40) != 0) // This bit indicates wheel event
-						{
-							if ((buttonCode & 0x01) != 0)
-							{
-								mouseFlags.Add(MouseFlags.WheeledUp);
-								if ((buttonCode & 0x10) != 0) // Ctrl is pressed
-									mouseFlags.Add(MouseFlags.WheeledLeft);
-							}
-							else
-							{
-								mouseFlags.Add(MouseFlags.WheeledDown);
-								if ((buttonCode & 0x10) != 0) // Ctrl is pressed
-									mouseFlags.Add(MouseFlags.WheeledRight);
-							}
-						}
-						break;
-				}
-
-				return true;
-			}
-			catch
-			{
-				return false;
-			}
+			return true;
 		}
 
 		private void ResizeLoop()
@@ -1606,7 +1723,13 @@ namespace SharpConsoleUI.Drivers
 					if (RenderMode.Buffer == RenderMode)
 					{
 						_consoleBuffer!.Lock = true;
+						long carried = _consoleBuffer.FrameNumber;
 						_consoleBuffer = new ConsoleBuffer(currentSize.Width, currentSize.Height, _consoleWindowSystem?.Options, _consoleLock);
+
+						// Keep the frame count monotonic across the rebuild, or a client
+						// tracking it would be told the screen went backwards and wait
+						// forever for a frame number it had already passed.
+						_consoleBuffer.ResumeFrameNumberFrom(carried);
 
 						// Connect diagnostics if enabled
 						if (_consoleWindowSystem?.RenderingDiagnostics != null)

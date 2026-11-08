@@ -201,7 +201,14 @@ public class HeadlessConsoleDriver : IConsoleDriver, IDisposable
 		_windowSystem = windowSystem;
 
 		// Create ConsoleBuffer for buffered rendering with thread-safe lock
-		_consoleBuffer = new ConsoleBuffer(_screenSize.Width, _screenSize.Height, windowSystem.Options, _consoleLock);
+		_consoleBuffer = new ConsoleBuffer(_screenSize.Width, _screenSize.Height, windowSystem.Options, _consoleLock)
+		{
+			// This driver captures output; it has no console to write to. Without this the buffer's
+			// Console.Out fallback would paint rendered frames into the process's real stdout — into
+			// the caller's data when stdout is redirected, which is exactly what the Windows
+			// redirected-stdio refusal exists to prevent.
+			SuppressConsoleOutput = true
+		};
 
 		// Connect diagnostics to ConsoleBuffer
 		if (windowSystem.RenderingDiagnostics != null)
@@ -229,6 +236,14 @@ public class HeadlessConsoleDriver : IConsoleDriver, IDisposable
 		_consoleBuffer?.SetCellsFromBuffer(destX, destY, source, srcX, srcY, width, fallbackBg);
 	}
 
+	/// <inheritdoc/>
+	/// <inheritdoc/>
+	public long FrameNumber => _consoleBuffer?.FrameNumber ?? 0;
+
+	/// <inheritdoc/>
+	public Diagnostics.Snapshots.ConsoleBufferSnapshot? CaptureComposed() =>
+		_consoleBuffer?.CaptureComposed();
+
 	/// <summary>
 	/// Returns the count of dirty characters from the ConsoleBuffer.
 	/// </summary>
@@ -250,15 +265,113 @@ public class HeadlessConsoleDriver : IConsoleDriver, IDisposable
 	/// </summary>
 	public void SimulateMouseEvent(List<MouseFlags> flags, Point point)
 	{
-		MouseEvent?.Invoke(this, flags, point);
+		// Counted the same way the real driver counts it, so a test driving this
+		// one gets the same answer from IsDispatchingMouse.
+		_mouseDispatch.While(() => MouseEvent?.Invoke(this, flags, point));
 	}
+
+	private readonly Core.WorkInFlight _mouseDispatch = new();
+
+	/// <summary>Whether a mouse handler is running on any thread.</summary>
+	/// <remarks>
+	/// Dispatch is synchronous on the calling thread, so this is true only while
+	/// a handler is actually executing - which is exactly the window in which
+	/// "nothing is queued" would otherwise read as nothing left to do.
+	/// </remarks>
+	public bool IsDispatchingMouse => _mouseDispatch.IsRunning;
+
+	/// <summary>
+	/// Simulates a full click: the press and the release a terminal sends.
+	/// </summary>
+	/// <param name="point">Where to click, in screen coordinates.</param>
+	/// <remarks>
+	/// <para>
+	/// Spelling the pair out by hand is easy to get subtly wrong, and none of it is
+	/// what a test is about. The gesture flags - clicked, double, triple - are NOT
+	/// added here: <c>MouseGestureRecognizer</c> derives them downstream, once, for
+	/// every driver, and a driver that invented its own would disagree with the real
+	/// input path.
+	/// </para>
+	/// <para>
+	/// The first click on an inactive window activates it rather than reaching the
+	/// control under the cursor, exactly as in a real terminal. Click twice, or
+	/// activate the window first, when the control is the target.
+	/// </para>
+	/// </remarks>
+	public void SimulateClick(Point point) => SimulateClick(point, MouseFlags.Button1Pressed);
+
+	/// <summary>
+	/// Simulates a full click with a specific button.
+	/// </summary>
+	/// <param name="point">Where to click, in screen coordinates.</param>
+	/// <param name="button">The PRESS flag of the button, such as
+	/// <see cref="MouseFlags.Button1Pressed"/>.</param>
+	public void SimulateClick(Point point, MouseFlags button)
+	{
+		SimulateMouseEvent([button], point);
+		SimulateMouseEvent([ReleaseFor(button)], point);
+	}
+
+	/// <summary>
+	/// Simulates two clicks in the same place, close enough in time to be one
+	/// double click.
+	/// </summary>
+	/// <param name="point">Where to click, in screen coordinates.</param>
+	/// <remarks>
+	/// Four raw events: press, release, press, release. The recognizer derives
+	/// <c>Button1DoubleClicked</c> on the SECOND PRESS, which is why a control must
+	/// test for the double before the press. Whether the two clicks fall inside the
+	/// multi-click window is decided by the recognizer's clock - pass a
+	/// <see cref="TimeProvider"/> through
+	/// <c>ConsoleWindowSystemOptions.TimeProvider</c> to control it.
+	/// </remarks>
+	public void SimulateDoubleClick(Point point)
+	{
+		SimulateClick(point);
+		SimulateClick(point);
+	}
+
+	/// <summary>The release flag matching a press flag.</summary>
+	private static MouseFlags ReleaseFor(MouseFlags press) => press switch
+	{
+		MouseFlags.Button2Pressed => MouseFlags.Button2Released,
+		MouseFlags.Button3Pressed => MouseFlags.Button3Released,
+		MouseFlags.Button4Pressed => MouseFlags.Button4Released,
+		_ => MouseFlags.Button1Released,
+	};
 
 	/// <summary>
 	/// Simulates a screen resize event.
 	/// </summary>
+	/// <remarks>
+	/// Rebuilds the console buffer BEFORE raising the event, which is the contract
+	/// <see cref="ConsoleWindowSystem"/>'s resize handler relies on - it treats the event
+	/// size as "the size the buffer was just rebuilt with" and lays windows out against it.
+	/// Without the rebuild the driver reports the new size while every rendered frame still
+	/// goes to a buffer of the old one, so a resize appears to succeed and changes nothing.
+	/// </remarks>
 	public void SimulateScreenResize(int width, int height)
 	{
 		_screenSize = new Size(width, height);
+
+		if (_windowSystem != null)
+		{
+			var rebuilt = new ConsoleBuffer(width, height, _windowSystem.Options, _consoleLock)
+			{
+				SuppressConsoleOutput = true,
+			};
+
+			if (_windowSystem.RenderingDiagnostics != null)
+				rebuilt.Diagnostics = _windowSystem.RenderingDiagnostics;
+
+			// Keep the frame count monotonic across the rebuild, or a client tracking it
+			// would be told the screen went backwards and wait forever for a frame number
+			// it had already passed.
+			rebuilt.ResumeFrameNumberFrom(_consoleBuffer?.FrameNumber ?? 0);
+
+			_consoleBuffer = rebuilt;
+		}
+
 		ScreenResized?.Invoke(this, _screenSize);
 	}
 

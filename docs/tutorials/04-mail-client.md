@@ -17,16 +17,16 @@ This is a long one — grab a coffee. Every code block below is lifted verbatim 
 The finished app is a single maximized window split into three columns:
 
 ```
-┌─ TerminalMail  ·  Inbox ─────────────────────────────────────────────────┐
+┌─ TerminalMail  ·  Inbox ───────────────────────────────────────────────────┐
 │ ▸ Inbox    (2) │ ● Q3 roadmap        alice   09:14 │ From:  alice@ex.com   │
 │   Sent         │   Lunch?            bob     08:50 │ Subj:  Q3 roadmap     │
 │   Drafts   (1) │   Re: invoice       carol   Mon   │ ───────────────────── │
 │   Archive      │   Standup notes     dave    Mon   │ Hi team, attached is  │
 │                │                                   │ the updated roadmap…  │
 │  folders       │           message list            │     reading pane      │
-├───────────────────────────────────────────────────────────────────────────┤
+├────────────────────────────────────────────────────────────────────────────┤
 │ ↑↓ navigate  c compose  s settings  q quit                                 │
-└───────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 The teaching spine of this article is **MVVM data binding**. State lives in view models that implement `INotifyPropertyChanged`; the UI binds to them. When you select a message, the reading pane updates itself — you never reach into a control and call `SetText(...)`. That declarative style is the thing I most want to show off.
@@ -786,7 +786,7 @@ TerminalMail stops at the UI on purpose. Obvious next steps, roughly in order of
 - **Threading** — group messages by conversation in the table's data source.
 - **Attachments** — a list control in the reading pane, plus a file picker in compose.
 
-Every file is reproduced inline above — and the **complete, runnable project lives right next to this tutorial** in [`04-mail-client/`](https://github.com/nickprotop/ConsoleEx/tree/master/docs/tutorials/04-mail-client) (app + tests). Just `cd 04-mail-client/TerminalMail && dotnet run`.
+Every file is reproduced inline above — and the **complete, runnable project lives right next to this tutorial** in [`04-mail-client/`](https://github.com/nickprotop/ConsoleEx/tree/master/docs/tutorials/04-mail-client). Just `cd 04-mail-client/TerminalMail && dotnet run`.
 
 For more complete applications built on SharpConsoleUI, browse the [Examples](https://github.com/nickprotop/ConsoleEx/blob/master/Examples) in this repository, or the production projects [CXPost](https://github.com/nickprotop/cxpost) (a terminal mail client) and [LazyNuGet](https://github.com/nickprotop/lazynuget) (a lazygit-style NuGet manager).
 

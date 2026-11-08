@@ -6,19 +6,40 @@ using Color = SharpConsoleUI.Color;
 
 namespace SharpConsoleUI.Tests.Highlighting
 {
+	// The class under test IS the obsolete one: BashSyntaxHighlighter was
+	// superseded by the TextMate engine, and these tests exist to prove the
+	// deprecated path still behaves while it remains public API. Calling it is
+	// the point, so CS0612 is suppressed for the file rather than silenced by
+	// giving every [Obsolete] a message it does not need.
+#pragma warning disable CS0612 // Type or member is obsolete
 	public class BashHighlighterTests
 	{
+		[Obsolete]
 		private static (IReadOnlyList<SyntaxToken>, SyntaxLineState) Tok(string line)
 			=> new BashSyntaxHighlighter().Tokenize(line, 0, SyntaxLineState.Initial);
 
 		[Fact]
+		[Obsolete]
 		public void Comment_ColoredToEndOfLine()
 		{
-			var (tokens, _) = Tok("echo hi  # a comment");
-			Assert.Contains(tokens, t => t.StartIndex == 9 && t.Length == "# a comment".Length);
+			const string line = "echo hi  # a comment";
+			var (tokens, _) = Tok(line);
+
+			// TextMate splits the comment into punctuation ('#') plus its text, where the old
+			// regex emitted one span. What matters is that every column from '#' to end of line
+			// is covered by comment-coloured tokens.
+			int hash = line.IndexOf('#');
+			var covering = tokens.Where(t => t.StartIndex >= hash).OrderBy(t => t.StartIndex).ToList();
+
+			Assert.NotEmpty(covering);
+			Assert.Equal(hash, covering[0].StartIndex);
+			Assert.Equal(line.Length, covering[^1].StartIndex + covering[^1].Length);
+			// All of it is one colour: the comment colour.
+			Assert.Single(covering.Select(t => t.ForegroundColor).Distinct());
 		}
 
 		[Fact]
+		[Obsolete]
 		public void Keyword_If_Then_Fi_Colored()
 		{
 			var (tokens, _) = Tok("if true; then echo x; fi");
@@ -28,6 +49,7 @@ namespace SharpConsoleUI.Tests.Highlighting
 		}
 
 		[Fact]
+		[Obsolete]
 		public void Variable_Dollar_Colored()
 		{
 			var (tokens, _) = Tok("echo $HOME ${PATH} $1 $?");
@@ -37,6 +59,7 @@ namespace SharpConsoleUI.Tests.Highlighting
 		}
 
 		[Fact]
+		[Obsolete]
 		public void DoubleAndSingleQuotedStrings_Colored()
 		{
 			var (tokens, _) = Tok("export X=\"abc\" Y='def'");
@@ -45,6 +68,7 @@ namespace SharpConsoleUI.Tests.Highlighting
 		}
 
 		[Fact]
+		[Obsolete]
 		public void HashInsideParamExpansion_NotTreatedAsComment()
 		{
 			// ${X#prefix} — the # is parameter-expansion, not a comment.
@@ -60,7 +84,9 @@ namespace SharpConsoleUI.Tests.Highlighting
 		{
 			Assert.NotNull(SyntaxHighlighters.For("bash"));
 			Assert.NotNull(SyntaxHighlighters.For("sh"));
-			Assert.IsType<BashSyntaxHighlighter>(SyntaxHighlighters.For("bash"));
+			// Resolves through the TextMate fallback now; the two aliases share one instance.
+			Assert.Same(SyntaxHighlighters.For("bash"), SyntaxHighlighters.For("sh"));
 		}
 	}
 }
+#pragma warning restore CS0612

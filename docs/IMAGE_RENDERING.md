@@ -43,7 +43,8 @@ pixels.SetPixel(0, 1, new ImagePixel(0, 0, 255));   // Blue
 // Get pixel
 ImagePixel pixel = pixels.GetPixel(0, 0);
 
-// Resize with bilinear interpolation
+// Resize to exactly the size asked for. Shrinking averages the source area each
+// target pixel covers; enlarging interpolates.
 PixelBuffer resized = pixels.Resize(50, 25);
 ```
 
@@ -63,7 +64,12 @@ var buffer = PixelBuffer.FromArgbArray(argbArray, width, height);
 
 ## Loading Images from Files
 
-SharpConsoleUI can load real image files using [SixLabors.ImageSharp](https://github.com/SixLabors/ImageSharp). Supported formats: **PNG, JPEG, BMP, GIF, TIFF, TGA, PBM, WebP**.
+SharpConsoleUI can load real image files using [StbImageSharp](https://github.com/StbSharp/StbImageSharp). Supported formats: **PNG, JPEG, BMP, GIF, TGA**, identified by content rather than by file extension.
+
+> TIFF is not decodable at all. TIFF decoders have carried two heap out-of-bounds writes and a
+> header that never terminates, and images often arrive from somewhere the application does not
+> control, so no TIFF decoder is linked into the library. A TIFF, like any other unsupported
+> input, raises `UnsupportedImageFormatException`.
 
 ### From a File Path
 
@@ -79,24 +85,34 @@ using var stream = File.OpenRead("photo.jpg");
 var buffer = PixelBuffer.FromStream(stream);
 ```
 
-### From an ImageSharp Image
+### From Another Imaging Library
 
-If you already have an `Image<Rgb24>` (e.g., after applying ImageSharp processing), convert it directly:
+If another library already produced the pixels — because you need a format this one does not
+decode, or you applied processing of your own — copy them into a byte buffer and hand them over.
+No imaging dependency is shared with SharpConsoleUI.
 
 ```csharp
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+// Tightly packed 24-bit RGB, row-major (3 bytes per pixel).
+var buffer = PixelBuffer.FromRgb24Bytes(rgbBytes, width, height);
 
-using var image = Image.Load<Rgb24>("photo.png");
-image.Mutate(x => x.Resize(200, 100)); // optional pre-processing
-var buffer = PixelBuffer.FromImageSharp(image);
+// Or 32-bit RGBA, where the alpha byte is ignored.
+var buffer = PixelBuffer.FromRgba32Bytes(rgbaBytes, width, height);
+```
+
+With ImageSharp, for example:
+
+```csharp
+using var image = Image.Load<Rgb24>("photo.webp");
+var pixels = new byte[image.Width * image.Height * 3];
+image.CopyPixelDataTo(pixels);
+var buffer = PixelBuffer.FromRgb24Bytes(pixels, image.Width, image.Height);
 ```
 
 ### With File Picker Dialog
 
 ```csharp
 var path = await FileDialogs.ShowFilePickerAsync(windowSystem,
-    filter: "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tiff");
+    filter: "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tga");
 
 if (path != null)
 {
@@ -340,7 +356,7 @@ Image defaults are in `ImagingDefaults`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `DefaultScaleMode` | `Fit` | Default scale mode for ImageControl |
-| `MaxImageDimension` | 500 | Maximum image dimension (prevents overflow in unbounded layouts) |
+| `MaxImageDimension` | 500 | Cap used by `ImageControl` when layout constraints are unbounded. `PixelBuffer.Resize` does NOT apply it: it gives the size asked for |
 | `PixelsPerCell` | 2 | Vertical pixels per character cell |
 | `HalfBlockChar` | `'▀'` | The Unicode half-block character used for rendering |
 | `KittyChunkSize` | 4096 | Maximum bytes per Kitty graphics protocol chunk |

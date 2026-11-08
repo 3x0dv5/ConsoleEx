@@ -28,7 +28,7 @@ public class SynchronizationContextInstalledTests
 	[Fact]
 	public void False_BeforeRun()
 	{
-		var sys = new ConsoleWindowSystem(RenderMode.Buffer);
+		var sys = new ConsoleWindowSystem(new HeadlessConsoleDriver());
 		Assert.False(sys.SynchronizationContextInstalled);
 	}
 
@@ -36,7 +36,7 @@ public class SynchronizationContextInstalledTests
 	public void True_DuringRun_WhenOptedIn_AndFalse_AfterShutdown()
 	{
 		var opts = new ConsoleWindowSystemOptions() with { InstallSynchronizationContext = true };
-		var sys = new ConsoleWindowSystem(RenderMode.Buffer, options: opts);
+		var sys = new ConsoleWindowSystem(new HeadlessConsoleDriver(), options: opts);
 
 		Exception? runFailure = null;
 		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
@@ -55,7 +55,7 @@ public class SynchronizationContextInstalledTests
 	public void False_DuringRun_WhenNotOptedIn()
 	{
 		var opts = new ConsoleWindowSystemOptions() with { InstallSynchronizationContext = false };
-		var sys = new ConsoleWindowSystem(RenderMode.Buffer, options: opts);
+		var sys = new ConsoleWindowSystem(new HeadlessConsoleDriver(), options: opts);
 
 		bool? observedDuringRun = null;
 		Exception? runFailure = null;

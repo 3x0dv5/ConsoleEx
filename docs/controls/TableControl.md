@@ -2,6 +2,11 @@
 
 Interactive data grid with virtual data support, sorting, inline editing, and multi-selection.
 
+<!-- gallery -->
+
+![TableControl](../images/controls/TableControl.png)
+
+
 ## Overview
 
 TableControl renders tabular data with full keyboard and mouse interaction. It supports two data modes: **in-memory rows** for simple tables, and **ITableDataSource** for virtual/lazy data binding that handles millions of rows by querying only visible rows on demand.
@@ -18,6 +23,7 @@ By default, `ReadOnly = true` preserves backward-compatible static table renderi
 | `CellNavigationEnabled` | `bool` | `false` | Enable Tab/Arrow cell-level navigation |
 | `MultiSelectEnabled` | `bool` | `false` | Enable Ctrl+Click/Shift+Click multi-selection |
 | `CheckboxMode` | `bool` | `false` | Show [x]/[ ] checkboxes (implies MultiSelect) |
+| `RightClickExtendsSelection` | `bool` | `false` | Right-click extends the multi-selection from the anchor |
 | `SortingEnabled` | `bool` | `false` | Enable column sorting by clicking headers |
 | `ColumnResizeEnabled` | `bool` | `false` | Enable column resize by dragging borders |
 | `InlineEditingEnabled` | `bool` | `false` | Enable F2/Enter/DblClick cell editing |
@@ -37,6 +43,8 @@ By default, `ReadOnly = true` preserves backward-compatible static table renderi
 | `FilteringEnabled` | `bool` | `false` | Enable inline filtering (press `/`) |
 | `FuzzyFilterEnabled` | `bool` | `false` | Enable fuzzy matching as fallback |
 | `AutoHighlightOnFocus` | `bool` | `true` | Auto-select first row on focus |
+| `MinScrollbarThumbSize` | `int` | `1` | Minimum vertical scrollbar thumb height, in rows |
+| `MouseWheelScrollSpeed` | `int` | `ControlDefaults.DefaultScrollWheelLines` (1) | Rows (or columns, with Shift+wheel) scrolled per wheel notch; values below 1 clamp to 1 |
 
 ## Events
 
@@ -216,7 +224,7 @@ var grid = Controls.Table()
 |--------|--------|
 | **Left Click** | Select row (and cell if cell nav enabled) |
 | **Double Click** | Activate row / begin cell edit |
-| **Right Click** | Select row/cell, then fire MouseRightClick |
+| **Right Click** | Select row/cell, then fire MouseRightClick (extends the selection when `RightClickExtendsSelection`) |
 | **Ctrl+Click** | Toggle row selection (multi-select) |
 | **Shift+Click** | Select range (multi-select) |
 | **Click Header** | Sort by column (toggles Asc/Desc/None) |
@@ -227,12 +235,66 @@ var grid = Controls.Table()
 | **Drag Scrollbar Thumb** | Smooth scroll |
 | **Click Scrollbar Arrow** | Scroll by one row/column |
 
+## Column Widths
+
+A column is either **fixed** (an explicit `Width`) or **auto** (sized from its content). When the
+auto columns do not fit, they are shrunk proportionally — which means one column holding a very
+long value can squeeze its neighbors down to a couple of characters:
+
+```
+│St│Ti│Message
+│RU│16│XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX...
+```
+
+`MinWidth` sets a floor for an auto column so that cannot happen:
+
+```csharp
+var table = new TableControlBuilder()
+    .AddColumn("Status",  TextJustification.Left, width: null, minWidth: 8)
+    .AddColumn("Time",    TextJustification.Left, width: null, minWidth: 8)
+    .AddColumn("Message", TextJustification.Left, width: null, minWidth: null)
+    .WithHorizontalScrollbar(ScrollbarVisibility.Auto)
+    .Build();
+```
+
+```
+│Status  │Time    │Message
+│RUNNING │16:29:00│XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX...
+```
+
+Or on an existing column:
+
+```csharp
+table.Columns[0].MinWidth = 8;
+```
+
+Behavior worth knowing:
+
+- **Fixed columns ignore `MinWidth`.** An explicit `Width` is already a decision; its floor stays 1.
+- **`null`, `0` or a negative value all mean no floor** — the column can shrink to 1 character, which
+  is how the table behaved before floors existed.
+- **Floors can overflow the viewport.** When honoring every floor needs more room than there is, the
+  table lets its total content width exceed the viewport and relies on the horizontal scrollbar to
+  pan, rather than crushing a column below a usable width. Pair `MinWidth` with
+  `WithHorizontalScrollbar(ScrollbarVisibility.Auto)` so the overflow is reachable.
+
+For a virtual data source, return the floor from `GetColumnMinWidth` instead:
+
+```csharp
+public int? GetColumnMinWidth(int columnIndex) => columnIndex switch
+{
+    0 => 8,     // Status
+    1 => 8,     // Time
+    _ => null,  // no floor
+};
+```
+
 ## ITableDataSource
 
 The `ITableDataSource` interface enables virtual data binding for large datasets. Only visible rows are queried — the control never loads all data into memory.
 
 ```csharp
-public interface ITableDataSource
+public interface ITableDataSource : INotifyCollectionChanged
 {
     int RowCount { get; }
     int ColumnCount { get; }
@@ -242,14 +304,17 @@ public interface ITableDataSource
     // Optional (default interface methods):
     TextJustification GetColumnAlignment(int columnIndex) => TextJustification.Left;
     int? GetColumnWidth(int columnIndex) => null;
+    int? GetColumnMinWidth(int columnIndex) => null;
     Color? GetRowBackgroundColor(int rowIndex) => null;
     Color? GetRowForegroundColor(int rowIndex) => null;
     bool IsRowEnabled(int rowIndex) => true;
     object? GetRowTag(int rowIndex) => null;
     bool CanSort(int columnIndex) => false;
     void Sort(int columnIndex, SortDirection direction) { }
-
-    event EventHandler? DataChanged;
+    void ClearSort() { }
+    bool CanFilter => false;
+    void ApplyFilter(string filterText, string? columnName, FilterOperator op) { }
+    void ClearFilter() { }
 }
 ```
 
@@ -257,8 +322,10 @@ When `DataSource` is set:
 - Internal `_rows`/`_columns` lists are ignored
 - Only visible rows are queried via `GetCellValue()`
 - Column widths auto-measure from visible rows
-- Sorting delegates to `DataSource.Sort()` if `CanSort()` returns true
-- `DataChanged` event triggers re-measure and re-render
+- Sorting delegates to `DataSource.Sort()` if `CanSort()` returns true; clearing the sort calls `DataSource.ClearSort()` so the source can restore its own order
+- Filtering is handed to the source when `CanFilter` is true — see [Letting the data source filter](#letting-the-data-source-filter)
+- Raising `CollectionChanged` triggers re-measure and re-render; `Reset` also returns the selection to the first row
+- A filter over the source follows its changes: a client-side filter is scanned again, and display rows supplied through `TryApplyFilterToDataSource` are asked for again, also after the source sorts itself
 - `AddRow()`/`ClearRows()` throw if DataSource is set
 
 ## Builder Methods
@@ -268,6 +335,7 @@ When `DataSource` is set:
 | Method | Description |
 |--------|-------------|
 | `.AddColumn(header, alignment?, width?)` | Add a column |
+| `.AddColumn(header, alignment, width, minWidth)` | Add a column with an auto-width floor ([Column Widths](#column-widths)) |
 | `.WithColumns(headers...)` | Add multiple columns by name |
 | `.AddRow(cells...)` | Add a data row |
 | `.WithDataSource(source)` | Set virtual data source |
@@ -280,6 +348,7 @@ When `DataSource` is set:
 | `.WithCellNavigation()` | Enable cell-level Tab/Arrow navigation |
 | `.WithMultiSelect()` | Enable Ctrl+Click/Shift+Click multi-select |
 | `.WithCheckboxMode()` | Enable checkbox multi-select |
+| `.WithRightClickExtendsSelection()` | Right-click extends the range (implies multi-select) |
 | `.WithSorting()` | Enable click-header sorting |
 | `.WithColumnResize()` | Enable drag-to-resize columns |
 | `.WithInlineEditing()` | Enable F2/Enter cell editing |
@@ -295,6 +364,8 @@ When `DataSource` is set:
 | `.ShowRowSeparators()` | Show lines between rows |
 | `.WithVerticalScrollbar(visibility)` | Scrollbar visibility (Auto/Always/Never) |
 | `.WithHorizontalScrollbar(visibility)` | Scrollbar visibility (Auto/Always/Never) |
+| `.WithMinScrollbarThumbSize(size)` | Minimum vertical thumb height in rows (default 1) |
+| `.WithMouseWheelScrollSpeed(speed)` | Rows/columns scrolled per wheel notch, min 1 (default: `ControlDefaults.DefaultScrollWheelLines`) |
 
 ### Events
 
@@ -439,6 +510,55 @@ bool isFiltering = table.IsFiltering;
 string? filterText = table.ActiveFilterText;
 ```
 
+### Letting the data source filter
+
+An `ITableDataSource` that sets `CanFilter` is handed single-expression filters through
+`ApplyFilter(text, column, op)`, and narrows itself rather than being scanned row by row. That hook
+takes one condition, so compound `AND`/`OR` filters are applied by the table instead — correct, but
+it means a source that could evaluate the whole expression never sees it.
+
+Override `TryApplyFilterToDataSource` to receive the parsed filter whole:
+
+```csharp
+protected override TableFilterResult TryApplyFilterToDataSource(
+    ITableDataSource dataSource, CompoundFilterExpression compound)
+```
+
+Return one of three answers:
+
+| Result | Meaning |
+|--------|---------|
+| `TableFilterResult.NotHandled` | The table filters client-side, as it would by default |
+| `TableFilterResult.SourceNarrowed` | The source narrowed its own `RowCount`; rows are read by identity |
+| `TableFilterResult.WithDisplayRows(indices)` | The source names which rows to show, and keeps reporting all of them |
+
+`SourceNarrowed` is what to use for large, remote or virtualized sources: nothing is materialized,
+the table holds no map, and cells are read only for rows about to be painted.
+
+`WithDisplayRows` is for a source whose visible set its own `RowCount` cannot express — a hierarchy
+keeping a non-matching parent visible because a child matched, or any source wanting a display order
+of its own. It costs one `int` per matching row, and the source must enumerate its complete match
+set before the table paints, since the row count comes from the list length. Cell reads stay lazy
+either way.
+
+Everything after the hand-off — display map, selection, scroll position, the `FilterApplied` event —
+stays with the control, so an override cannot skip it. Sorting a table whose source supplied display
+rows asks the source to sort, rather than rebuilding the map and discarding its choice.
+
+```csharp
+protected override TableFilterResult TryApplyFilterToDataSource(
+    ITableDataSource dataSource, CompoundFilterExpression compound)
+{
+    if (dataSource is not TreeSource tree)
+        return base.TryApplyFilterToDataSource(dataSource, compound);
+
+    // One value per term; each FilterExpression also carries ColumnName and Operator
+    // when the user typed a "col:value" prefix.
+    var needles = compound.Terms.Select(t => t.Alternatives[0].Value);
+    return TableFilterResult.WithDisplayRows(tree.MatchesKeepingParents(needles));
+}
+```
+
 ### Builder Methods
 
 | Method | Description |
@@ -458,23 +578,151 @@ string? filterText = table.ActiveFilterText;
 
 When `SortingEnabled = true`, clicking a column header cycles through: Ascending -> Descending -> None. A sort indicator (up/down triangle) appears in the header.
 
-For in-memory rows, sorting creates an internal index map. For `ITableDataSource`, sorting delegates to `DataSource.Sort()` if `CanSort()` returns true.
+For in-memory rows, sorting creates an internal index map. For `ITableDataSource`, sorting delegates to `DataSource.Sort()` if `CanSort()` returns true, and
+clearing the sort, by a header click, `ClearSort()` or `SortingEnabled = false`, calls
+`DataSource.ClearSort()` on a source that sorted itself.
+
+How in-memory rows are ordered:
+
+- A column's `CustomRowComparer` wins, then its `CustomComparer` (given the raw cell text), then an
+  ordinal, case-insensitive comparison of the text the cell displays — markup is ignored, so
+  `[red]Apple[/]` sorts under A.
+- The sort is stable: rows that compare equal keep the order they were added in, ascending and
+  descending alike.
+- The same rules apply whether or not a filter is active.
+- Rows added, inserted, removed or replaced while sorted take their sorted place; the sort stays on.
+  Editing a cell does not re-sort, so an edited row does not jump away under the cursor.
+- The selection stays on its rows when the order changes, and when the sort or a filter is cleared.
+
+## Hit Testing
+
+`HitTest(x, y)` says what part of the table a position falls on, in the same control-relative
+coordinates `MouseEventArgs.Position` reports:
+
+```csharp
+table.MouseRightClick += (_, e) =>
+{
+    var hit = table.HitTest(e.Position.X, e.Position.Y);
+    if (hit.Zone == TableHitZone.Cell)
+        ShowCellMenu(table.GetRow(hit.DataRowIndex), hit.ColumnIndex);
+};
+```
+
+`Zone` is one of `None`, `Title`, `Header`, `Cell`, `Row` (a data row's borders or gutter),
+`Checkbox`, `EmptyDataArea`, `FilterBar`, `VerticalScrollbar` and `HorizontalScrollbar`. A hit on a
+row reports it twice: `DisplayRowIndex`, as the selection counts rows, and `DataRowIndex`, as
+`GetRow` counts them — they differ under a sort or a filter. `CellOffset` counts cells from the
+column's left edge as laid out, so horizontal scrolling does not change it. Before the first paint
+every position is `None`.
+
+## Extending TableControl
+
+`TableControl` can be subclassed. A derived table — one that nests rows, say — reuses the table's
+painting, scrolling, selection, sorting and filtering, and supplies only what it knows that the table
+cannot. Every member below is protected, and runs on the UI thread.
+[TreeTableControl](TreeTableControl.md) is built on these members alone.
+
+### Deciding which rows are displayed
+
+| Member | What it is for |
+|--------|----------------|
+| `ComputeDisplayRows(TableDisplayQuery)` | Return the data rows to display, in order, or `null` for all rows in data order. Called after every change that can alter what is shown. The default applies the filter and a stable sort, kept up to date incrementally. |
+| `RefreshDisplayRows()` | Ask again after state only the derived table knows about changed, such as a parent being expanded. The selection follows its rows. |
+| `ResolveHiddenSelectedRow(int)` | Name the row the cursor moves to when its own row is still there but hidden. Default `-1`: the row now at its old position. |
+| `ResolveRemovedSelectedRow(TableRow)` | Name the row the cursor moves to when its own row was removed. Default `-1`: the row now at its old position. |
+| `RowMatchesFilter(int, CompoundFilterExpression)` | The table's own matching rules, fuzzy fallback included. |
+| `CompareRows(...)`, `SortRowIndices(...)` | The table's own comparison, and the stable sort built on it, over a span. |
+| `DataRowCount`, `GetDataRowIndex(int)`, `GetDisplayRowIndex(int)` | Map between data rows and display positions; `-1` for none. |
+| `SyncRoot` | The lock that guards the rows. Guard any structure kept beside them with it. |
+
+`RowCount` counts displayed rows; `DataRowCount` counts every row, and data indices — `GetRow`, the
+cell accessors — run up to it.
+
+### Changing rows
+
+| Member | What it is for |
+|--------|----------------|
+| `InsertRowsCore`, `RemoveRowsCore`, `SetDataCore` | Every public row mutator funnels into one of these. Override to keep a structure of your own in step, and call the base to make the change. |
+| `CreateRow(string[])` | The row the text overloads of `AddRow` and `InsertRow` create — return your own row type here. |
+| `OnRowContentChanged(TableRow)` | Called after a row's cells change. The table does not re-sort on its own; call `RefreshDisplayRows` here if your order depends on content. |
+| `ThrowIfComputingDisplayRows()` | Call before changing a structure kept beside the rows, so a display hook trying to change it is refused before anything has changed. |
+
+Changing the rows, or calling `RefreshDisplayRows`, from inside `ComputeDisplayRows`,
+`ResolveHiddenSelectedRow` or `ResolveRemovedSelectedRow` throws `InvalidOperationException` rather
+than recursing.
+
+### Drawing and input
+
+| Member | What it is for |
+|--------|----------------|
+| `GetCellPrefixMarkup(int dataRow, int column)` | Markup drawn in front of a cell's value: guide lines, an expander, a glyph. Alignment, truncation, filter highlighting and editing apply to the value alone; auto width counts the prefix. |
+| `InvalidateColumnWidths()` | Re-measure after a prefix changed width without the rows changing. |
+| `TryHandleKey(ConsoleKeyInfo)` | Offered every key before navigation, after filter typing and editing. Return `true` to take it. |
+| `TryHandleClick(TableHitTestResult, int clickCount, MouseEventArgs)` | Offered every completed left click before sorting, selection and double-click pairing. Return `true` to take it. |
+
+The hooks are never called while `SyncRoot` is held, and none of them should block.
+
+```csharp
+// A table that hides rows tagged "draft" unless asked to show them, marks them with a
+// glyph, and toggles them with D.
+public sealed class DraftAwareTable : TableControl
+{
+    private bool _showDrafts;
+
+    protected override int[]? ComputeDisplayRows(TableDisplayQuery query)
+    {
+        int[] rows = base.ComputeDisplayRows(query) ?? Enumerable.Range(0, DataRowCount).ToArray();
+        return _showDrafts ? rows : rows.Where(r => GetRow(r).Tag is not "draft").ToArray();
+    }
+
+    protected override string? GetCellPrefixMarkup(int dataRowIndex, int columnIndex)
+        => columnIndex == 0 && GetRow(dataRowIndex).Tag is "draft" ? "[dim]~ [/]" : null;
+
+    protected override bool TryHandleKey(ConsoleKeyInfo key)
+    {
+        if (key.Key != ConsoleKey.D) return false;
+
+        _showDrafts = !_showDrafts;
+        RefreshDisplayRows();
+        return true;
+    }
+}
+```
 
 ## Virtual Rendering
 
 Regardless of data mode or ReadOnly state, TableControl always uses virtual rendering: only visible rows are measured and painted. This means 10,000+ row tables render instantly with no performance penalty.
 
-Column widths are computed using sample-based measurement (header + visible rows + a small buffer), cached and invalidated on significant scroll or data changes.
+Column widths are computed using sample-based measurement (header + visible rows + a small buffer), cached and invalidated on significant scroll or data changes. Auto columns are shrunk proportionally to fit, subject to any `MinWidth` floor — see [Column Widths](#column-widths).
 
 ## Scrollbars
 
 - **Vertical scrollbar**: Appears when rows exceed viewport. Shows up/down arrows, draggable thumb, and clickable track for page scrolling.
 - **Horizontal scrollbar**: Appears when total column width exceeds viewport. Same interaction model.
 - Both support `ScrollbarVisibility.Auto` (default), `Always`, or `Never`.
+- On a table with very many rows the proportional vertical thumb shrinks to a single row and becomes
+  hard to grab. `MinScrollbarThumbSize` sets a floor for it.
+- `MouseWheelScrollSpeed` sets how many rows (or columns, with Shift+wheel) move per wheel notch —
+  it drives both scroll axes. It defaults to `ControlDefaults.DefaultScrollWheelLines`, so setting
+  that once at startup changes the wheel step for every table that hasn't overridden it:
+
+```csharp
+// Change the wheel step everywhere, once at startup:
+ControlDefaults.DefaultScrollWheelLines = 3;
+
+// Or override it for just this table:
+var table = Controls.Table()
+    .WithMouseWheelScrollSpeed(5)
+    .Build();
+```
+- A table whose columns carry `MinWidth` floors may deliberately overflow its viewport rather than
+  crush a column — see [Column Widths](#column-widths). The horizontal scrollbar is how that
+  overflow is reached, so leave it on `Auto`.
 
 ## See Also
 
 - [ListControl](ListControl.md) - For simple item lists
+- [TreeTableControl](TreeTableControl.md) - A table whose rows nest
 - [Controls Reference](../CONTROLS.md) - All controls overview
 
 ---

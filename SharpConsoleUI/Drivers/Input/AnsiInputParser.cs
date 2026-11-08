@@ -34,7 +34,8 @@ namespace SharpConsoleUI.Drivers.Input
 			Ss3,
 			Utf8,
 			X10Mouse, // Collecting 3 raw bytes after CSI M (legacy X10 format)
-			Paste // Accumulating bracketed-paste content between ESC[200~ and ESC[201~
+			Paste, // Accumulating bracketed-paste content between ESC[200~ and ESC[201~
+			Apc // Swallowing an APC reply (ESC _ ... ESC \\, or 0x9F ... 0x9C)
 		}
 
 		private State _state = State.Ground;
@@ -47,6 +48,7 @@ namespace SharpConsoleUI.Drivers.Input
 		private readonly byte[] _x10MouseBuffer = new byte[X10MouseByteCount];
 		private int _x10MouseIndex;
 		private readonly List<byte> _pasteBytes = new();
+		private bool _apcSawEscape; // the previous APC byte was ESC, so ESC \\ ends it
 		private static readonly byte[] PasteEnd = { 0x1b, (byte)'[', (byte)'2', (byte)'0', (byte)'1', (byte)'~' };
 
 		/// <summary>
@@ -89,6 +91,10 @@ namespace SharpConsoleUI.Drivers.Input
 
 					case State.Paste:
 						ProcessPaste(b, events);
+						break;
+
+					case State.Apc:
+						ProcessApc(b);
 						break;
 				}
 			}
@@ -179,6 +185,16 @@ namespace SharpConsoleUI.Drivers.Input
 				return;
 			}
 
+			// The 8-bit APC introducer, for a terminal that sends C1 controls directly rather than
+			// as ESC pairs. Same reply, same rule: it is not typing.
+			if (b == 0x9F)
+			{
+				_state = State.Apc;
+				_apcSawEscape = false;
+				_pending.Clear();
+				return;
+			}
+
 			// Ctrl+Letter: 0x01-0x1A (except Tab=0x09, Enter=0x0D)
 			if (b >= 0x01 && b <= 0x1A)
 			{
@@ -241,6 +257,59 @@ namespace SharpConsoleUI.Drivers.Input
 			events.Add(new UnknownSequenceEvent(new[] { b }));
 		}
 
+		/// <summary>
+		/// Swallows an APC sequence, raising nothing.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// APC carries a terminal's ANSWERS, not a user's input: a Kitty graphics reply, an error
+		/// report, whatever a future terminal adds. None of it is typing, and a reader that cannot
+		/// tell delivers it as keystrokes into whatever has the keyboard.
+		/// </para>
+		/// <para>
+		/// Suppressing the replies at the source is not enough on its own. A graphics command can be
+		/// answered even when it asked not to be, because an ERROR is reported regardless of the
+		/// quiet level, so the parser has to know the shape either way.
+		/// </para>
+		/// <para>
+		/// Ends at ST, in both spellings: ESC backslash, or the single byte 0x9C. No length cap: the
+		/// payload is the terminal's, a truncated swallow would resume mid-reply and deliver the
+		/// tail as keys, which is the bug this exists to stop.
+		/// </para>
+		/// </remarks>
+		private void ProcessApc(byte b)
+		{
+			if (_apcSawEscape)
+			{
+				// ESC \ is ST and ends it. ESC anything-else is a malformed reply; treat the ESC as
+				// the start of a fresh sequence rather than staying stuck here forever.
+				if (b == (byte)'\\')
+				{
+					_state = State.Ground;
+					_apcSawEscape = false;
+					return;
+				}
+
+				_apcSawEscape = false;
+				if (b != 0x1B)
+					return;   // still inside the APC payload
+			}
+
+			if (b == 0x1B)
+			{
+				_apcSawEscape = true;
+				return;
+			}
+
+			if (b == 0x9C)   // 8-bit ST
+			{
+				_state = State.Ground;
+				return;
+			}
+
+			// Everything else is payload, and is dropped.
+		}
+
 		private void ProcessEscape(byte b, List<InputEvent> events)
 		{
 			_pending.Add(b);
@@ -258,6 +327,19 @@ namespace SharpConsoleUI.Drivers.Input
 			{
 				// SS3 sequence start (F1-F4)
 				_state = State.Ss3;
+				return;
+			}
+
+			// APC: A REPLY, NOT TYPING. Kitty answers a graphics command with
+			// ESC _ G i=<id>;OK ESC \\, and '_' is printable, so without this the reply fell into
+			// the Alt+key rule below and was delivered as the keystrokes _ G i = 3 1 ; O K.
+			// Seen for real: the reply typed itself into a composer and was sent to a model, and a
+			// portal that closes on any key closed the moment its image finished uploading.
+			if (b == '_')
+			{
+				_state = State.Apc;
+				_apcSawEscape = false;
+				_pending.Clear();
 				return;
 			}
 
@@ -485,6 +567,19 @@ namespace SharpConsoleUI.Drivers.Input
 				return;
 			}
 
+			// CURSOR POSITION REPORT — swallowed, never delivered.
+			//
+			// `ESC [ <row> ; <col> R` is the terminal ANSWERING a DSR query (ESC[6n), not a keystroke.
+			// It arrives on the input stream because that is where a terminal replies, so a parser
+			// that only knows CSI-R-means-F3 hands the app a function key nobody pressed — and any
+			// bytes it fails to consume get painted as text. Seen live: `R;3R 6;3R [46;3R` smeared
+			// across a transcript while TerminalCapabilities probed emoji widths (see its ReadDSRColumn).
+			//
+			// THE PARAMETERS TELL THEM APART. Real F3 is a bare `ESC [ R`; a report always carries the
+			// two numbers it exists to deliver. Requiring both — and requiring them numeric — keeps
+			// `ESC[R` and modified forms like `ESC[1;5R` (Ctrl+F3) working as keys.
+			if (finalByte == 'R' && IsCursorPositionReport(paramStr)) return;
+
 			// Parse modifiers from CSI sequences like "1;5A" (Ctrl+Up)
 			ParseModifiers(paramStr, out string numericPart, out bool shift, out bool alt, out bool ctrl);
 
@@ -568,6 +663,164 @@ namespace SharpConsoleUI.Drivers.Input
 			}
 		}
 
+		/// <summary>One parser per thread, reused across calls.</summary>
+		/// <remarks>
+		/// <para>
+		/// A parser per mouse event is three allocations on a path that fires on
+		/// every motion report while a button is held. It is reused instead -
+		/// but a parser carries state between calls BY DESIGN, since a sequence
+		/// can span two reads, and a truncated one leaves it mid-sequence. The
+		/// next decode on a poisoned instance returns nothing at all, which is
+		/// an intermittent fault depending on what arrived before it.
+		/// </para>
+		/// <para>
+		/// <see cref="Flush"/> after every decode is what makes reuse safe: it
+		/// drains any partial sequence and returns the parser to Ground. The
+		/// cost is one call against three allocations.
+		/// </para>
+		/// <para>
+		/// Thread-static because the Windows input loop and anything else that
+		/// decodes a sequence are not guaranteed to be the same thread, and a
+		/// shared mutable parser across threads would interleave two sequences
+		/// into one.
+		/// </para>
+		/// </remarks>
+		[ThreadStatic]
+		private static AnsiInputParser? _decoder;
+
+		/// <summary>The byte buffer the decode writes into, reused with the parser.</summary>
+		/// <remarks>
+		/// An SGR report is short - a button code, two coordinates and a
+		/// terminator - so a fixed buffer covers every well-formed one, and
+		/// anything longer is not a mouse report worth decoding.
+		/// </remarks>
+		[ThreadStatic]
+		private static byte[]? _decodeBuffer;
+
+		/// <summary>How long an SGR mouse report can be and still be one.</summary>
+		/// <remarks>
+		/// <c>ESC [ &lt; 255 ; 65535 ; 65535 M</c> is 22 characters; 64 leaves
+		/// room for a terminal that pads its numbers.
+		/// </remarks>
+		private const int MaxSgrMouseBytes = 64;
+
+		/// <summary>
+		/// Decodes one legacy X10 mouse report, for a caller holding it as characters.
+		/// </summary>
+		/// <param name="button">The button byte, as the terminal sent it.</param>
+		/// <param name="x">The column byte.</param>
+		/// <param name="y">The row byte.</param>
+		/// <returns>The flags and the position, or an empty list if it is not one.</returns>
+		/// <remarks>
+		/// X10 is what a terminal falls back to when it does not understand SGR
+		/// (1006). The Windows input loop reassembles it from Console.ReadKey as
+		/// three characters after <c>ESC [ M</c>, so it cannot use the byte loop
+		/// - but it can use the same decoder, which is the point.
+		/// </remarks>
+		internal static (List<MouseFlags> Flags, Point Position) DecodeX10Mouse(char button, char x, char y)
+		{
+			// The three payload bytes are written into the parser behind the
+			// introducer it expects, so the decode is the one the byte loop runs.
+			var parser = _decoder ??= new AnsiInputParser();
+			var buffer = _decodeBuffer ??= new byte[MaxSgrMouseBytes];
+
+			// X10 payload bytes are a value plus 32 and CAN exceed ASCII; the
+			// parser reads them as raw bytes, so they are written as such.
+			if (button > 0xff || x > 0xff || y > 0xff)
+				return (new List<MouseFlags>(), Point.Empty);
+
+			buffer[0] = 0x1b;
+			buffer[1] = (byte)'[';
+			buffer[2] = (byte)'M';
+			buffer[3] = (byte)button;
+			buffer[4] = (byte)x;
+			buffer[5] = (byte)y;
+
+			try
+			{
+				var mouse = parser.Parse(buffer.AsSpan(0, 6), 6)
+					.OfType<MouseInputEvent>()
+					.FirstOrDefault();
+
+				return mouse != null
+					? (mouse.Flags, mouse.Position)
+					: (new List<MouseFlags>(), Point.Empty);
+			}
+			finally
+			{
+				parser.Flush();
+			}
+		}
+
+		/// <summary>
+		/// Decodes one SGR mouse report, for a caller holding it as characters.
+		/// </summary>
+		/// <param name="sequence">
+		/// The sequence without its CSI introducer, as the Windows input loop
+		/// collects it: <c>&lt;0;10;5M</c>.
+		/// </param>
+		/// <returns>The flags and the position, or an empty list if it is not one.</returns>
+		/// <remarks>
+		/// <para>
+		/// Exists so the protocol is decoded ONCE. The Windows path reads through
+		/// <c>Console.ReadKey</c> and assembles an escape sequence a character at a
+		/// time, so it cannot use the byte-level loop above - but the sequence it
+		/// ends up holding is pure ASCII, so the bytes are one encode away and the
+		/// decoder can be shared.
+		/// </para>
+		/// <para>
+		/// Static and allocating its own parser: an SGR report is self-contained,
+		/// so there is no state to carry between calls, and a caller decoding one
+		/// report should not have to own a parser to do it.
+		/// </para>
+		/// </remarks>
+		internal static (List<MouseFlags> Flags, Point Position) DecodeSgrMouse(char[] sequence)
+		{
+			var parser = _decoder ??= new AnsiInputParser();
+			var buffer = _decodeBuffer ??= new byte[MaxSgrMouseBytes];
+
+			int length = 0;
+
+			// The introducer, which the caller may or may not have kept.
+			if (sequence.Length == 0 || sequence[0] != '\u001b')
+			{
+				buffer[length++] = 0x1b;
+				buffer[length++] = (byte)'[';
+			}
+
+			foreach (char c in sequence)
+			{
+				// The caller's '[' when it kept one, since the introducer above
+				// already wrote it.
+				if (length == 2 && c == '[' && buffer[1] == (byte)'[') continue;
+
+				if (length >= buffer.Length) return (new List<MouseFlags>(), Point.Empty);
+
+				// SGR is ASCII. Anything outside it is not part of a mouse report,
+				// and encoding it would change the bytes the parser sees.
+				if (c > 0x7f) return (new List<MouseFlags>(), Point.Empty);
+
+				buffer[length++] = (byte)c;
+			}
+
+			try
+			{
+				var mouse = parser.Parse(buffer.AsSpan(0, length), length)
+					.OfType<MouseInputEvent>()
+					.FirstOrDefault();
+
+				return mouse != null
+					? (mouse.Flags, mouse.Position)
+					: (new List<MouseFlags>(), Point.Empty);
+			}
+			finally
+			{
+				// Always, including after an exception: a parser left mid-sequence
+				// silently swallows whatever is decoded next on this thread.
+				parser.Flush();
+			}
+		}
+
 		private void ParseSgrMouse(string paramStr, bool isPress, List<InputEvent> events)
 		{
 			// SGR format: ESC [ < buttonCode ; x ; y M/m
@@ -618,16 +871,60 @@ namespace SharpConsoleUI.Drivers.Input
 					case 2: flags.Add(MouseFlags.WheeledLeft); break;
 					case 3: flags.Add(MouseFlags.WheeledRight); break;
 				}
+
+				// A modifier on a vertical wheel is NOT rewritten as a horizontal
+				// tilt. The old Windows decoder did that, from a hardcoded table,
+				// and porting it here for parity broke the platform that was
+				// right: TableControl reads ButtonShift for horizontal scroll, and
+				// WheeledLeft carries ButtonCtrl by definition, so shift+wheel
+				// arrived as ctrl+wheel with the shift gone.
+				//
+				// Real horizontal tilt is reported by the terminal as button 2
+				// or 3 with the wheel bit, which the switch above handles.
 			}
+
 			else if (motion)
 			{
 				flags.Add(MouseFlags.ReportMousePosition);
+
+				// The terminator still says whether the button is down. SGR only
+				// ever ends a motion report with M, so a motion report saying
+				// release is malformed either way - but reading it as a press
+				// leaves a control believing a button is held that is not, which
+				// is the worse of the two ways to be wrong.
 				switch (baseButton)
 				{
-					case 0: flags.Add(MouseFlags.Button1Pressed); flags.Add(MouseFlags.Button1Dragged); break;
-					case 1: flags.Add(MouseFlags.Button2Pressed); flags.Add(MouseFlags.Button2Dragged); break;
-					case 2: flags.Add(MouseFlags.Button3Pressed); flags.Add(MouseFlags.Button3Dragged); break;
-						// baseButton 3 = motion with no button
+					case 0:
+						flags.Add(isPress ? MouseFlags.Button1Pressed : MouseFlags.Button1Released);
+						flags.Add(MouseFlags.Button1Dragged);
+						break;
+					case 1:
+						flags.Add(isPress ? MouseFlags.Button2Pressed : MouseFlags.Button2Released);
+						flags.Add(MouseFlags.Button2Dragged);
+						break;
+					case 2:
+						flags.Add(isPress ? MouseFlags.Button3Pressed : MouseFlags.Button3Released);
+						flags.Add(MouseFlags.Button3Dragged);
+						break;
+
+					case 3:
+						// Motion with no button held. Nothing to add: the frame is
+						// ReportMousePosition and only that, which is the whole
+						// meaning - the mouse moved, nobody is holding anything.
+						//
+						// Named explicitly because its emptiness is load-bearing.
+						// A reader who sees three cases and no fourth cannot tell
+						// whether this one was handled or forgotten, and a control
+						// that treats a bare ReportMousePosition as a drag will
+						// follow the pointer with no button down. PromptControl did
+						// exactly that: a selection dragged out with the mouse
+						// collapsed the moment the pointer stopped moving, because
+						// that is when the button-held frames give way to these.
+						//
+						// Contrast the press/release branch below, which DOES name
+						// button 3 and answers differently for M and m: there a
+						// release must be attributed to a button or it ends nothing.
+						break;
 				}
 			}
 			else
@@ -645,8 +942,24 @@ namespace SharpConsoleUI.Drivers.Input
 						flags.Add(isPress ? MouseFlags.Button3Pressed : MouseFlags.Button3Released);
 						break;
 					case 3:
-						// Button release (X10 compat — button 3 release means "released")
-						flags.Add(MouseFlags.Button1Released);
+						// No button named. The terminator still says which this is,
+						// and it is the only thing that does: answering the same for
+						// M and m reads neither.
+						//
+						// A release keeps naming button 1 even though the report does
+						// not. Ending a drag, releasing a window capture and deriving
+						// a click are all keyed on Button1Released, and there is no
+						// button-agnostic release to key them on instead, so a
+						// release that named nothing would end nothing - the hang
+						// this case exists to avoid. The guess is confined to the
+						// release, where something must be chosen.
+						//
+						// A press names no button, because nothing has to be chosen:
+						// a press of no button starts nothing, and inventing one
+						// leaves a control believing a button is held that is not.
+						flags.Add(isPress
+							? MouseFlags.ReportMousePosition
+							: MouseFlags.Button1Released);
 						break;
 				}
 			}
@@ -658,6 +971,34 @@ namespace SharpConsoleUI.Drivers.Input
 		/// Parses ANSI modifier codes from CSI parameter string.
 		/// Format: "number;modifierCode" where modifierCode is 1-based (1=none, 2=Shift, 3=Alt, etc.)
 		/// </summary>
+		/// <summary>
+		/// Whether a CSI-R sequence's parameters are a cursor-position report rather than a function key.
+		/// </summary>
+		/// <remarks>
+		/// <para>Both share the final byte 'R', so only the parameters separate them:</para>
+		/// <list type="bullet">
+		///   <item>F3 is a bare <c>ESC [ R</c> — no parameters at all.</item>
+		///   <item>Modified F3 is <c>ESC [ 1 ; &lt;mod&gt; R</c> — the xterm form, whose first parameter is
+		///     always the literal 1 and whose second is a modifier code in 2..16.</item>
+		///   <item>A report is <c>ESC [ &lt;row&gt; ; &lt;col&gt; R</c>, carrying the two numbers it exists to
+		///     deliver.</item>
+		/// </list>
+		/// <para>So anything whose first parameter is not 1 is unambiguously a report, and a leading 1 is
+		/// treated as a report only when the second number cannot be a modifier code. That ordering
+		/// matters: a real keypress must never be swallowed, whereas a report misread as F3 is merely
+		/// the bug this exists to fix, so the ambiguous corner (row 1) resolves in favour of the key.</para>
+		/// </remarks>
+		private static bool IsCursorPositionReport(string paramStr)
+		{
+			var parts = paramStr.Split(';');
+			if (parts.Length != 2) return false;
+			if (!int.TryParse(parts[0], out var row) || !int.TryParse(parts[1], out var col)) return false;
+			if (row < 1 || col < 1) return false;
+
+			// Row 1 collides with the modifier form; every other row is a report outright.
+			return row != 1 || col > 16;
+		}
+
 		private static void ParseModifiers(string paramStr, out string numericPart, out bool shift, out bool alt, out bool ctrl)
 		{
 			shift = false;
@@ -695,7 +1036,17 @@ namespace SharpConsoleUI.Drivers.Input
 			return new KeyInputEvent(new ConsoleKeyInfo(keyChar, key, shift, alt, ctrl));
 		}
 
-		private static ConsoleKey CharToConsoleKey(char c)
+		/// <summary>
+		/// Maps a printable character to its <see cref="ConsoleKey"/>, or
+		/// <see cref="ConsoleKey.NoName"/> when there is no sensible mapping.
+		/// </summary>
+		/// <remarks>
+		/// Shared with the Windows ReadKey path (see <c>NetConsoleDriver.NormalizeKey</c>) so both
+		/// input backends report the same <see cref="ConsoleKey"/> for the same keystroke. They used to
+		/// disagree: this mapping existed only here, so a plain letter arrived as
+		/// <see cref="ConsoleKey.NoName"/> on Windows.
+		/// </remarks>
+		internal static ConsoleKey CharToConsoleKey(char c)
 		{
 			return c switch
 			{

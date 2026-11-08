@@ -2,6 +2,12 @@
 
 Display rich formatted text using SharpConsoleUI markup syntax.
 
+<!-- gallery -->
+
+![MarkupControl](../images/controls/MarkupControl.png)
+
+![MarkupControl, markdown](../images/controls/MarkupControl-markdown.png)
+
 ## Overview
 
 MarkupControl displays multi-line rich text using SharpConsoleUI's markup syntax. It supports colors
@@ -819,7 +825,7 @@ c.SetMarkdown("# Updated\n\nNew content");   // live update  (Markdown(...) is a
 Styling is controlled by `MarkdownStyle` (per-control via `MarkupControl.MarkdownStyle` or builder `.WithMarkdownStyle(...)`, globally via `MarkdownStyle.Default`). See [Markup Syntax → Markdown](../MARKUP_SYNTAX.md#markdown) for the full reference.
 
 **Fenced code blocks are syntax-highlighted.** A fenced block with a language tag is tokenized and
-coloured (highlighting carries across multi-line constructs like block comments and strings). Built-in
+colored (highlighting carries across multi-line constructs like block comments and strings). Built-in
 languages: C#, JavaScript, JSON, YAML, XML, HTML, CSS, Bash, Dockerfile, Razor, SLN, Diff, Markdown.
 You can register your own highlighter for a language via `MarkdownStyle.CodeHighlighters`.
 
@@ -845,7 +851,7 @@ label.AppendLine("- second point");
 ## See Also
 
 - [Markup Syntax Reference](../MARKUP_SYNTAX.md) - Complete markup syntax guide with all colors and decorations
-- [FigleControl](FigleControl.md) - For large ASCII art text
+- [FigletControl](FigletControl.md) - For large ASCII art text
 - [SpectreRenderableControl](SpectreRenderableControl.md) - For Spectre.Console widgets
 - [LogViewerControl](LogViewerControl.md) - For log display with filtering
 

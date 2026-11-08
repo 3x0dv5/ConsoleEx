@@ -3,9 +3,14 @@
 Horizontal bar graph for showing a single value against a maximum — CPU load, memory use, disk
 capacity, progress toward a target.
 
+<!-- gallery -->
+
+![BarGraphControl](../images/controls/BarGraphControl.png)
+
+
 ## Overview
 
-`BarGraphControl` renders one labelled horizontal bar: an optional label, a filled/unfilled bar
+`BarGraphControl` renders one labeled horizontal bar: an optional label, a filled/unfilled bar
 track, and an optional formatted value. It is a **display control** — it takes no focus, handles no
 input, and simply reflects whatever you assign to `Value`.
 
@@ -128,7 +133,7 @@ The bar is drawn with `█` for the filled portion and `░` for the remainder.
 ## Events
 
 `BarGraphControl` raises no control-specific events. It implements `INotifyPropertyChanged` through
-`BaseControl`, so its properties can be data-bound — see [Data Binding](../binding.md).
+`BaseControl`, so its properties can be data-bound — see [Data Binding](../BINDING.md).
 
 ## Keyboard and mouse support
 

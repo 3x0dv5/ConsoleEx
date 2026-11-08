@@ -164,7 +164,7 @@ namespace SharpConsoleUI
 	/// Represents a window in the console UI system that can contain controls and handle user input.
 	/// Implements <see cref="IContainer"/> for control management.
 	/// </summary>
-	public partial class Window : IContainer, Controls.IControlHost, Controls.IPortalHost
+	public partial class Window : IContainer, Controls.IControlHost, Controls.IPortalHost, Layout.IDockSurfaceProvider
 	{
 		internal readonly List<IWindowControl> _controls = new();
 		internal readonly List<IInteractiveControl> _interactiveContents = new();
@@ -205,6 +205,14 @@ namespace SharpConsoleUI
 		private bool _isModal = false;
 		internal int _scrollOffset;
 		private WindowState _state;
+
+		/// <summary>
+		/// The state the window was in when it was minimized, so restoring returns it to that state
+		/// rather than always to <see cref="WindowState.Normal"/>. Minimizing does not change geometry,
+		/// so a maximized window that is minimized is still desktop-sized; restoring it to Normal would
+		/// leave the reported state and the actual bounds disagreeing (issue #70).
+		/// </summary>
+		private WindowState _stateBeforeMinimize = WindowState.Normal;
 		private object? _tag;
 		internal int _topStickyHeight;
 		private List<string> _topStickyLines = new List<string>();
@@ -685,8 +693,16 @@ namespace SharpConsoleUI
 		/// from any thread (no <c>Monitor.TryEnter</c>), so a cross-thread invalidation under render-lock
 		/// contention can never drop the intent.
 		/// </summary>
-		private void Request(Invalidation work)
+		private void Request(Invalidation work) => Request(work, null);
+
+		/// <summary>
+		/// As <see cref="Request(Invalidation)"/>, recording who asked when
+		/// diagnostics are on.
+		/// </summary>
+		private void Request(Invalidation work, IWindowControl? caller)
 		{
+			RecordInvalidation(work, caller);
+
 			int w = (int)work;
 			int cur;
 			do
@@ -697,6 +713,81 @@ namespace SharpConsoleUI
 			while (Interlocked.CompareExchange(ref _pendingWork, w, cur) != cur);
 
 			Interlocked.Increment(ref _requestsThisFrame);
+		}
+
+		/// <summary>One recorded invalidation: what was asked for, and by whom.</summary>
+		/// <param name="Work">The kind of frame work requested.</param>
+		/// <param name="Control">
+		/// The control's name, or null for an invalidation with no control behind
+		/// it - a window-level one, or a control that was never named.
+		/// </param>
+		public readonly record struct InvalidationEntry(Invalidation Work, string? Control);
+
+		/// <summary>The most recent invalidations, when diagnostics are on.</summary>
+		/// <remarks>
+		/// Bounded, because a control invalidating in a loop is exactly the bug
+		/// this exists to find and must not also become a leak. The oldest entries
+		/// are dropped, since the recent ones are what a reader is looking at.
+		/// </remarks>
+		private readonly System.Collections.Generic.Queue<InvalidationEntry> _invalidationTrace = new();
+
+		private readonly object _invalidationTraceLock = new();
+
+		/// <summary>How many invalidations the trace keeps before dropping the oldest.</summary>
+		private const int InvalidationTraceLimit = 512;
+
+		/// <summary>Records an invalidation, when the system was asked for diagnostics.</summary>
+		/// <remarks>
+		/// <see cref="Request(Invalidation, IWindowControl?)"/> is lock-free and on
+		/// the hot path, so an app with diagnostics off does no work here beyond
+		/// one flag check. Gated on IsEnabled rather than on the recorder
+		/// existing: the recorder is always constructed so it can be switched on
+		/// mid-session, and testing for it would put a lock and an allocation on
+		/// the invalidation path of every application.
+		/// </remarks>
+		private void RecordInvalidation(Invalidation work, IWindowControl? caller)
+		{
+			if (_windowSystem?.RenderingDiagnostics?.IsEnabled != true) return;
+
+			lock (_invalidationTraceLock)
+			{
+				if (_invalidationTrace.Count >= InvalidationTraceLimit)
+					_invalidationTrace.Dequeue();
+
+				// The id, not the name: most controls are unnamed, and a name
+				// of null collapsed every one of them into "(window)" - which
+				// made the verb that exists to say WHICH control asked for a
+				// frame unable to answer for the common case.
+				_invalidationTrace.Enqueue(new InvalidationEntry(
+					work,
+					caller is { } c
+						? Diagnostics.Socket.DiagnosticsSerializer.ControlId(c)
+						: null));
+			}
+		}
+
+		/// <summary>
+		/// Returns the invalidations recorded since the last call, and clears them.
+		/// </summary>
+		/// <returns>
+		/// What asked for frame work, oldest first. Always empty unless
+		/// <c>EnableDiagnostics</c> was set.
+		/// </returns>
+		/// <remarks>
+		/// A window counts how many invalidations folded into a frame, which says
+		/// a repaint was asked for a hundred times but not by whom - and "whom" is
+		/// the question. A chart repainting every frame because one setter fires
+		/// in a loop looks exactly like a chart repainting because its data
+		/// changed.
+		/// </remarks>
+		public System.Collections.Generic.IReadOnlyList<InvalidationEntry> ConsumeInvalidationTrace()
+		{
+			lock (_invalidationTraceLock)
+			{
+				var snapshot = _invalidationTrace.ToArray();
+				_invalidationTrace.Clear();
+				return snapshot;
+			}
 		}
 
 		/// <summary>

@@ -168,7 +168,7 @@ Toast defaults live in `Configuration.ControlDefaults`:
 
 ### Theming
 
-Toast borders and the inner accent bar resolve from the severity's color role against the active theme, so toasts adapt to light/dark themes automatically. See [THEMES.md](THEMES.md) for the role palette.
+Toast borders and the inner accent bar resolve from the severity's color role against the active theme, so toasts adapt to light/dark themes automatically. See [Theming](THEMES.md) for the role palette.
 
 ### Demo
 
@@ -239,4 +239,4 @@ ws.NotificationStateService.NotificationDismissed += (_, e) => { };
 
 - [State Services](STATE-SERVICES.md) — all built-in state services
 - [Themes](THEMES.md) — color roles used by toast borders and severities
-- [Common Patterns](patterns.md) — quick recipes
+- [Common Patterns](PATTERNS.md) — quick recipes

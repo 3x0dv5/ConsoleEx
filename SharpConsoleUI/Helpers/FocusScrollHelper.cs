@@ -36,12 +36,18 @@ namespace SharpConsoleUI.Helpers
 		/// <param name="focused">The focused control nested somewhere inside <paramref name="directChild"/>.</param>
 		/// <param name="rowInChild">On success, the focused control's top row relative to the direct child's top.</param>
 		/// <param name="regionHeight">On success, the focused control's arranged height (at least 1).</param>
+		/// <param name="scroller">
+		/// The scrolling container the child belongs to, used to recover a layout width when the child
+		/// has never been painted. Optional; omitting it keeps the pre-existing behaviour for a child
+		/// that carries no explicit <see cref="IWindowControl.Width"/>.
+		/// </param>
 		/// <returns><c>true</c> if the offset was resolved from the layout subtree; otherwise <c>false</c>.</returns>
 		public static bool TryGetFocusedRowInDirectChild(
 			IWindowControl directChild,
 			IWindowControl focused,
 			out int rowInChild,
-			out int regionHeight)
+			out int regionHeight,
+			IScrollableContainer? scroller = null)
 		{
 			rowInChild = 0;
 			regionHeight = 1;
@@ -52,16 +58,30 @@ namespace SharpConsoleUI.Helpers
 			if (directChild is IScrollableContainer)
 				return false;
 
-			int width = directChild.ActualWidth > 0 ? directChild.ActualWidth : (directChild.Width ?? 0);
-			int height = directChild.ActualHeight;
-			if (width <= 0 || height <= 0)
+			// ActualWidth/ActualHeight come from SetActualBounds, which only runs in PaintDOM, and paint
+			// culls a child scrolled fully out of the viewport. So the child we most need to probe - the
+			// one holding an off-fold focus target - is routinely 0x0. Recover the width from the
+			// scroller's viewport and let the measure pass tell us the height, instead of giving up and
+			// revealing only the child's top (#91).
+			int width = directChild.ActualWidth > 0
+				? directChild.ActualWidth
+				: (directChild.Width ?? ScrollerContentWidth(scroller));
+			if (width <= 0)
 				return false;
+
+			int height = directChild.ActualHeight;
 
 			LayoutNode subtree;
 			try
 			{
 				subtree = LayoutNodeFactory.CreateSubtree(directChild);
-				subtree.Measure(new LayoutConstraints(1, width, 1, height));
+				// An unpainted child has no height to measure against. Measuring unbounded makes the
+				// subtree report its natural content height, which is the extent the row offset below is
+				// relative to - the same height a painted child would have had.
+				var measured = subtree.Measure(new LayoutConstraints(1, width, 1,
+					height > 0 ? height : int.MaxValue));
+				if (height <= 0)
+					height = Math.Max(1, measured.Height);
 				subtree.Arrange(new LayoutRect(0, 0, width, height));
 			}
 			catch
@@ -97,8 +117,52 @@ namespace SharpConsoleUI.Helpers
 			// its offset within the direct child.
 			var ab = childNode.AbsoluteBounds;
 			rowInChild = ab.Y;
-			regionHeight = System.Math.Max(1, ab.Height);
+			regionHeight = Math.Max(1, ab.Height);
 			return true;
+		}
+
+		/// <summary>
+		/// Reveals <paramref name="nestedTarget"/> within <paramref name="directChild"/> on
+		/// <paramref name="scroller"/>: resolves the target's own row and scrolls to it, falling back
+		/// to revealing the whole child when the target IS that child or the topology cannot be read.
+		/// The fallback keeps the tall-child guard active, so a container already spanning the
+		/// viewport is not yanked to its top (#67).
+		/// </summary>
+		/// <remarks>
+		/// Internal on purpose: callers outside the framework hold the control they want revealed, not
+		/// the scroller's direct child, so they want
+		/// <c>ScrollablePanelControl.ScrollTargetIntoView</c> instead - which resolves the direct
+		/// child and then lands here.
+		/// </remarks>
+		internal static void RevealNestedTarget(
+			IScrollableContainer scroller,
+			IWindowControl directChild,
+			IWindowControl nestedTarget)
+		{
+			if (ReferenceEquals(directChild, nestedTarget))
+			{
+				scroller.ScrollChildIntoView(directChild);
+				return;
+			}
+
+			if (TryGetFocusedRowInDirectChild(directChild, nestedTarget, out int rowInChild, out int regionHeight, scroller))
+				scroller.ScrollChildRegionIntoView(directChild, rowInChild, regionHeight);
+			else
+				scroller.ScrollChildIntoView(directChild);
+		}
+
+		/// <summary>
+		/// The width an unpainted direct child would be laid out at. <see cref="IScrollableContainer"/>
+		/// carries no width member, so this reads the viewport off the panel when the scroller is one and
+		/// falls back to its control width; 0 means no width could be recovered.
+		/// </summary>
+		private static int ScrollerContentWidth(IScrollableContainer? scroller)
+		{
+			if (scroller is ScrollablePanelControl panel && panel.ViewportWidth > 0)
+				return panel.ViewportWidth;
+			if (scroller is IWindowControl control && control.ActualWidth > 0)
+				return control.ActualWidth;
+			return 0;
 		}
 	}
 }

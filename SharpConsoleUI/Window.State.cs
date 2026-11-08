@@ -36,16 +36,27 @@ namespace SharpConsoleUI
 				switch (value)
 				{
 					case WindowState.Minimized:
+						// Remember what to come back to. Minimizing does not resize the window, so a
+						// maximized window is still desktop-sized while minimized; restoring it to Normal
+						// would leave State and bounds disagreeing (issue #70).
+						_stateBeforeMinimize = previous_state;
 						// Clear the window area before minimizing
 						_windowSystem?.Renderer?.ClearArea(Left, Top, Width, Height, _windowSystem.Theme, _windowSystem.Windows);
 						Invalidate(Invalidation.Relayout);
 						break;
 
 					case WindowState.Maximized:
-						OriginalWidth = Width;
-						OriginalHeight = Height;
-						OriginalLeft = Left;
-						OriginalTop = Top;
+						// Capture the restore target ONLY when coming from Normal. Arriving from
+						// Minimized means the window is already at desktop size (minimizing left the
+						// bounds alone), so capturing here would overwrite the saved normal geometry
+						// with the maximized geometry and destroy the restore target for good.
+						if (previous_state == WindowState.Normal)
+						{
+							OriginalWidth = Width;
+							OriginalHeight = Height;
+							OriginalLeft = Left;
+							OriginalTop = Top;
+						}
 						// Position window at desktop origin (0,0 in desktop coordinates)
 						// Desktop coordinates are automatically offset by DesktopUpperLeft during rendering
 						Left = 0;
@@ -301,26 +312,32 @@ namespace SharpConsoleUI
 		/// <returns>True if the cursor position is visible</returns>
 		internal bool IsCursorPositionVisible(Point cursorPosition, IWindowControl control)
 		{
-			// Get the control's bounds to understand its positioning
-			var bounds = _layoutManager.GetOrCreateControlBounds(control);
-			if (bounds == null) return false;
-			var controlBounds = bounds.ControlContentBounds;
+			// Resolve the node that actually positions this control on screen, and prefer it over the
+			// cached ControlContentBounds. That cache is only ever written by
+			// WindowEventDispatcher.UpdateControlLayout(), which runs from ProcessMouseEvent, so once
+			// populated it freezes at the layout the pointer last saw — and this reader decides
+			// WHETHER to show the caret, so a stale rectangle can hide a caret that is on screen.
+			//
+			// A control inside a self-painting container (ScrollablePanelControl) has only an ORPHAN
+			// registered node (empty bounds, not reachable from the root); its real position is
+			// governed by its nearest root-reachable ancestor (the host), whose node ResolveLaidOutNode
+			// returns instead. The host has already validated the cursor against its own viewport, so
+			// checking the cursor against the host bounds here is the correct visibility gate.
+			var node = _layoutManager.ResolveLaidOutNode(control);
 
-			// For nested controls, ControlContentBounds is never populated (only top-level controls get it).
-			// Fall back to the DOM node's AbsoluteBounds which tracks all controls including nested ones.
-			if (controlBounds.Width == 0 && controlBounds.Height == 0)
+			Rectangle controlBounds;
+			if (node != null)
 			{
-				// Resolve the node that actually positions this control on screen. A control inside a
-				// self-painting container (ScrollablePanelControl) has only an ORPHAN registered node
-				// (empty bounds, not reachable from the root); its real position is governed by its
-				// nearest root-reachable ancestor (the host), whose node we use instead. The host has
-				// already validated the cursor against its own viewport, so checking the cursor
-				// against the host bounds here is the correct visibility gate.
-				var node = _layoutManager.ResolveLaidOutNode(control);
-				if (node == null) return false;
-
 				var ab = node.AbsoluteBounds;
 				controlBounds = new Rectangle(ab.X, ab.Y, ab.Width, ab.Height);
+			}
+			else
+			{
+				// No node positions this control — the cached bounds are the only source left.
+				var bounds = _layoutManager.GetOrCreateControlBounds(control);
+				if (bounds == null) return false;
+				controlBounds = bounds.ControlContentBounds;
+				if (controlBounds.Width == 0 && controlBounds.Height == 0) return false;
 			}
 
 			// Convert cursor position from window coordinates to window content coordinates
@@ -382,7 +399,7 @@ namespace SharpConsoleUI
 		/// <param name="caller">The control that initiated the invalidation (unused at the window root).</param>
 		public void Invalidate(Invalidation work, IWindowControl? caller = null)
 		{
-			Request(work);
+			Request(work, caller);
 		}
 
 		/// <summary>
@@ -445,11 +462,17 @@ namespace SharpConsoleUI
 		}
 
 		/// <summary>
-		/// Restores the window to its normal state.
+		/// Restores the window from its current state.
+		/// <para>
+		/// A minimized window returns to whatever it was before it was minimized — a window minimized
+		/// while maximized comes back maximized, which is what every desktop window manager does and
+		/// what the taskbar caption implies. From any other state this restores to
+		/// <see cref="WindowState.Normal"/>, so the title-bar restore button is unchanged.
+		/// </para>
 		/// </summary>
 		public void Restore()
 		{
-			State = WindowState.Normal;
+			State = _state == WindowState.Minimized ? _stateBeforeMinimize : WindowState.Normal;
 		}
 
 		/// <summary>
@@ -472,7 +495,7 @@ namespace SharpConsoleUI
 				if (CloseOnDeactivate)
 				{
 					// Defer close to avoid re-entrancy — we're inside SetIsActive
-					_windowSystem!.EnqueueOnUIThread(() => Close(force: true));
+					_windowSystem!.EnqueueOnUIThread(() => Close(force: true), "window.SetIsActive");
 				}
 			}
 			InvalidateBorderCache();

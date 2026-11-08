@@ -30,6 +30,27 @@ namespace SharpConsoleUI.Html
 			"dl", "dt", "dd", "form", "fieldset"
 		};
 
+		// Link ids must be unique across the whole document, not per inline run: the control
+		// highlights and Tab-navigates links by id, so per-paragraph ids starting at 0 lit up
+		// the first link of every paragraph together. A layout runs on one thread, so a
+		// thread-static counter reset by HtmlLayoutEngine.LayoutDocument numbers the document
+		// (FlowBlocks recurses for grid cells, so it cannot reset it).
+		[ThreadStatic]
+		private static int t_nextLinkId;
+
+		internal static void ResetLinkIds() => t_nextLinkId = 0;
+
+		/// <summary>
+		/// Takes the next link id from the document's sequence.
+		/// </summary>
+		/// <remarks>
+		/// For a link that is not made of inline text - an image, which is laid
+		/// out as block rows and never passes through the inline flow. It draws
+		/// from the same counter so a picture takes its place in the Tab order
+		/// instead of colliding with a text link or sitting outside the sequence.
+		/// </remarks>
+		internal static int NextLinkId() => t_nextLinkId++;
+
 		/// <summary>
 		/// Flows inline nodes into wrapped LayoutLines.
 		/// </summary>
@@ -109,7 +130,21 @@ namespace SharpConsoleUI.Html
 
 						case "a":
 							var href = element.GetAttribute("href") ?? "";
-							childFg = ctx.LinkColor;
+
+							// Always the theme's link colour, held to the contrast
+							// floor against whatever surface the link lands on.
+							//
+							// Deferring to a page-specified colour was tried and
+							// does not work: AngleSharp's user-agent stylesheet
+							// gives EVERY anchor a default colour, so "the page
+							// styled this link" is true even for a page that said
+							// nothing, and the theme colour would never apply.
+							// Distinguishing an author rule from a UA rule is not
+							// worth the complexity, and the contrast floor already
+							// solves the case that prompted it - Hacker News's
+							// black links are now readable either way.
+							childFg = PaletteColors.EnsureContrastRatio(
+								ctx.LinkColor, childBg, PaletteColors.TextContrast);
 							childDecorations |= TextDecoration.Underline;
 							childLinkUrl = href;
 							break;
@@ -123,7 +158,23 @@ namespace SharpConsoleUI.Html
 							break;
 
 						case "img":
-							var alt = element.GetAttribute("alt") ?? "image";
+							// A picture with nothing to say says nothing. See
+							// HtmlBlockFlow.Image.AddAltText: an absent or empty alt
+							// is how a page marks a decorative image, and inventing
+							// a word for it fills the page with placeholders that
+							// carry no information.
+							//
+							// Inside a link the URL stands in, so the link still has
+							// something to land on and can be followed.
+							var alt = element.GetAttribute("alt");
+							if (string.IsNullOrWhiteSpace(alt))
+							{
+								if (linkUrl == null)
+									continue;
+
+								alt = linkUrl;
+							}
+
 							var imgText = HtmlConstants.ImageAltPrefix + alt + HtmlConstants.ImageAltSuffix;
 							var imgDecorations = decorations | TextDecoration.Dim | TextDecoration.Italic;
 							EmitText(imgText, fg, bg, imgDecorations, linkUrl, ctx, collapseWhitespace: false);
@@ -173,7 +224,9 @@ namespace SharpConsoleUI.Html
 
 					if (ctx.CurrentX >= ctx.MaxWidth)
 					{
-						ctx.FinishLine();
+						// Out of room at a space: a wrap, not the author's break,
+						// and the space it fell on is part of the text.
+						ctx.FinishLine(wrapped: true, betweenWords: true);
 						continue;
 					}
 
@@ -188,8 +241,8 @@ namespace SharpConsoleUI.Html
 					// Check if word fits on current line
 					if (ctx.CurrentX > 0 && ctx.CurrentX + wordWidth > ctx.MaxWidth)
 					{
-						// Wrap to next line
-						ctx.FinishLine();
+						// Wrap to next line, at the space before this word.
+						ctx.FinishLine(wrapped: true, betweenWords: true);
 					}
 
 					// If word is longer than maxWidth, break character by character
@@ -200,8 +253,11 @@ namespace SharpConsoleUI.Html
 							var safe = Helpers.TextSanitizer.IsUnsafeRune(rune)
 								? Helpers.TextSanitizer.ReplacementCharacter : rune;
 							int rw = Helpers.UnicodeWidth.GetRuneWidth(safe);
+							// A word longer than the whole line is broken mid-word.
+							// A wrap, but not between words: no space was consumed,
+							// so rejoining must not invent one.
 							if (ctx.CurrentX + rw > ctx.MaxWidth)
-								ctx.FinishLine();
+								ctx.FinishLine(wrapped: true, betweenWords: false);
 							ctx.AddCell(new Cell(safe, fg, bg, decorations), linkUrl);
 						}
 					}
@@ -289,7 +345,6 @@ namespace SharpConsoleUI.Html
 			private int _currentLinkStartX = -1;
 			private string _currentLinkText = "";
 			private int _currentLinkId;
-			private int _nextLinkId;
 
 			public void AddCell(Cell cell, string? linkUrl)
 			{
@@ -305,7 +360,16 @@ namespace SharpConsoleUI.Html
 						_currentLinkUrl = linkUrl;
 						_currentLinkStartX = CurrentX;
 						_currentLinkText = "";
-						_currentLinkId = _nextLinkId++;
+						_currentLinkId = t_nextLinkId++;
+					}
+					else
+					{
+						// Left the link: without this every following plain cell would close yet
+						// another region starting at the link (same id), making plain text clickable
+						// and flipping the focus highlight on and off across it
+						_currentLinkUrl = null;
+						_currentLinkStartX = -1;
+						_currentLinkText = "";
 					}
 				}
 
@@ -324,7 +388,19 @@ namespace SharpConsoleUI.Html
 				CurrentX += runeWidth;
 			}
 
-			public void FinishLine()
+			/// <summary>
+			/// Closes the current line and starts the next.
+			/// </summary>
+			/// <param name="wrapped">
+			/// True when the line is being closed because the text would not fit,
+			/// so the rest of the same block continues on the next line. False for
+			/// a break the author wrote. The caller is the only thing that knows
+			/// which this is, and copied text depends on the answer: a wrap joined
+			/// with a newline puts a hard break every viewport width through a
+			/// paragraph the author wrote as one.
+			/// </param>
+			/// <param name="betweenWords"></param>
+			public void FinishLine(bool wrapped = false, bool betweenWords = false)
 			{
 				// Close any open link region for this line
 				CloseLinkRegion();
@@ -332,7 +408,8 @@ namespace SharpConsoleUI.Html
 				var cells = CurrentCells.ToArray();
 				LinkRegion[]? links = _currentLineLinks.Count > 0 ? _currentLineLinks.ToArray() : null;
 
-				Lines.Add(new LayoutLine(LineY, 0, cells.Length, cells, Alignment, links));
+				Lines.Add(new LayoutLine(LineY, 0, cells.Length, cells, Alignment, links,
+					isImage: false, continuesNextLine: wrapped, brokeBetweenWords: wrapped && betweenWords));
 
 				LineY++;
 				CurrentCells.Clear();

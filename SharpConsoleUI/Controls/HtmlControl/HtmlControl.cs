@@ -9,11 +9,35 @@
 using SharpConsoleUI.Configuration;
 using SharpConsoleUI.Events;
 using SharpConsoleUI.Extensions;
+using SharpConsoleUI.Helpers;
+using SharpConsoleUI.Helpers.Scrollbar;
 using SharpConsoleUI.Html;
 using SharpConsoleUI.Layout;
 
 namespace SharpConsoleUI.Controls
 {
+	/// <summary>
+	/// Sub-region gesture ownership for <see cref="HtmlControl"/> mouse handling. A fresh Button1 press
+	/// hit-tests one of these regions and captures it; every subsequent resent press/drag routes to the
+	/// captured region without re-hit-testing (SGR re-sends Button1Pressed on motion).
+	/// </summary>
+	internal enum HtmlGestureRegion
+	{
+		/// <summary>
+		/// No region. Must stay first so <c>default(HtmlGestureRegion)</c> is never a real region:
+		/// <see cref="Helpers.MouseGestureCapture{TRegion}.Route"/> returns <c>default</c> together
+		/// with <see cref="Helpers.GesturePhase.None"/> for an uncaptured bare click, and a region
+		/// worth 0 would make that read as a genuine hit.
+		/// </summary>
+		None = 0,
+
+		/// <summary>The vertical scrollbar column.</summary>
+		Scrollbar,
+
+		/// <summary>The rendered HTML content area.</summary>
+		Content
+	}
+
 	/// <summary>
 	/// A control that renders HTML content in the terminal with scrolling, link interaction, and keyboard navigation.
 	/// </summary>
@@ -40,6 +64,18 @@ namespace SharpConsoleUI.Controls
 		private Color? _lastLayoutFg;
 		private Color? _lastLayoutBg;
 		private Color? _lastLayoutLinkColor;
+
+		/// <summary>
+		/// Set when a downloaded image lands after the layout that would have used it.
+		/// </summary>
+		/// <remarks>
+		/// Images arrive on a background task, and the layout they belong in may already
+		/// have run: a control whose width never changes again is never re-laid out, so
+		/// the picture stayed as its alt text while the decoded bytes sat in the cache.
+		/// Paint checks this the same way it checks for a theme change - the layout is
+		/// stale for the same reason, and the fix is the same one.
+		/// </remarks>
+		private volatile bool _imagesChangedSinceLayout;
 		private string? _rawHtml;
 		private string? _baseUrl;
 		private string? _currentUrl;
@@ -47,17 +83,32 @@ namespace SharpConsoleUI.Controls
 		private CancellationTokenSource? _loadCts;
 		private static readonly HttpClient _httpClient = new()
 		{
+			// Well under HttpClient's 100-second default. A host that accepts the
+			// connection and then says nothing - textfiles.com over https, which
+			// serves no TLS - otherwise leaves the control spinning for a minute
+			// and a half before it can report anything, which reads as a hang
+			// rather than as a site that is down. Matches the image loader.
+			Timeout = TimeSpan.FromSeconds(PageFetchTimeoutSeconds),
 			DefaultRequestHeaders =
 			{
 				{ "User-Agent", "SharpConsoleUI/1.0 (HtmlControl; +https://github.com/nickprotop/ConsoleEx)" }
 			}
 		};
 
+		/// <summary>
+		/// How long a page fetch may take before it is abandoned and reported as an error.
+		/// </summary>
+		private const int PageFetchTimeoutSeconds = 15;
+
 		// Scroll state
 		private int _scrollOffset;
 
-		// Scrollbar drag state
-		private bool _isScrollbarDragging;
+		// Mouse gesture capture: a fresh Button1 press captures one sub-region; every subsequent
+		// resent press/drag routes to it without re-hit-testing (SGR re-sends Button1Pressed on
+		// motion). Replaces the former _isScrollbarDragging latch, which released only on
+		// Button1Released and could leak a captured drag into content when the pointer left the bar.
+		private readonly MouseGestureCapture<HtmlGestureRegion> _gesture = new();
+		private bool _thumbDragging;
 		private int _scrollbarDragStartY;
 		private int _scrollbarDragStartOffset;
 
@@ -82,6 +133,7 @@ namespace SharpConsoleUI.Controls
 		// Null = follow the active theme accent (so links read on light themes); explicit set pins it.
 		private Color? _linkColor;
 		private Color _visitedLinkColor = HtmlConstants.DefaultVisitedLinkColor;
+		private bool _usePageBackground;
 		private bool _showImages;
 		private bool _showBulletPoints = true;
 		private int _tabSize = 4;
@@ -93,6 +145,10 @@ namespace SharpConsoleUI.Controls
 		private string? _loadingStatus;
 		private int _imageLoadTotal;
 		private int _imageLoadCompleted;
+		// Images downloaded for the current URL load (URL → decoded buffer, null = failed).
+		// Every relayout of that page reads from it, so a resize, theme switch or CSS reload
+		// never downloads the images again. Written only under _contentLock.
+		private Dictionary<string, Imaging.PixelBuffer?>? _imageCache;
 		// True between LoadUrlAsync start and first content commit — used to dim the
 		// previous page and render a banner while fetching, without discarding context.
 		private bool _isNavigating;
@@ -167,7 +223,44 @@ namespace SharpConsoleUI.Controls
 		public bool ShowImages
 		{
 			get => _showImages;
-			set => SetProperty(ref _showImages, value);
+			set
+			{
+				if (SetProperty(ref _showImages, value))
+					OnShowImagesChanged();
+			}
+		}
+
+		/// <summary>
+		/// Gets or sets whether a page may paint its own background.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// Off by default: the control sits inside a themed window, so a page
+		/// painting its own surface in the middle of it is a deliberate choice
+		/// rather than something that should change under an existing application
+		/// on upgrade.
+		/// </para>
+		/// <para>
+		/// On, a page that states a background - through <c>bgcolor</c> or CSS -
+		/// is drawn on it, and its text colours finally mean what the page
+		/// intended: Hacker News's black headlines on its own cream page instead
+		/// of black on a dark terminal. Text is still held to the contrast floor
+		/// against whichever surface ends up being used, so a page that colours
+		/// its text but not its background cannot become unreadable either way.
+		/// </para>
+		/// <para>
+		/// Setting it re-runs layout, so it can be toggled while a page is on
+		/// screen.
+		/// </para>
+		/// </remarks>
+		public bool UsePageBackground
+		{
+			get => _usePageBackground;
+			set
+			{
+				if (SetProperty(ref _usePageBackground, value))
+					RelayoutForStyleChange();
+			}
 		}
 
 		/// <summary>
@@ -285,6 +378,24 @@ namespace SharpConsoleUI.Controls
 		/// <inheritdoc/>
 		public bool CanReceiveFocus => IsEnabled;
 
+		/// <summary>
+		/// Resolves the scrollbar thumb/track colors via the shared <see cref="ScrollbarPaletteResolver"/>.
+		/// Html already resolved its colors focus-aware from the theme with the same fallback cascade
+		/// (Cyan1/Grey thumb, Grey/Grey23 track) that the resolver now applies uniformly, so this is a
+		/// non-visible refactor for Html - a check that the shared resolver preserves the existing policy.
+		/// </summary>
+		private ScrollbarPalette ResolveScrollbarPalette()
+		{
+			var theme = Container?.GetConsoleWindowSystem?.Theme;
+			return ScrollbarPaletteResolver.Resolve(new ScrollbarPaletteRequest(
+				ThumbOverride: null,
+				TrackOverride: null,
+				Theme: theme,
+				HasFocus: HasFocus,
+				IsEnabled: IsEnabled,
+				Background: Color.Transparent));
+		}
+
 		#endregion
 
 		#region Events
@@ -353,631 +464,15 @@ namespace SharpConsoleUI.Controls
 
 		#endregion
 
-		#region Public Methods
-
-		/// <summary>
-		/// Sets the HTML content to display.
-		/// </summary>
-		/// <param name="html">The HTML string to render.</param>
-		public void SetContent(string html)
-		{
-			lock (_contentLock)
-			{
-				_rawHtml = html;
-				_baseUrl = null;
-				_currentUrl = null;
-				_scrollOffset = 0;
-				_hoveredLinkLineIndex = -1;
-				_hoveredLinkIndex = -1;
-				int layoutWidth = _lastLayoutWidth > 0 ? _lastLayoutWidth : 80;
-				RunLayout(layoutWidth);
-			}
-			Invalidate(Invalidation.Relayout);
-		}
-
-		/// <summary>
-		/// Sets the HTML content to display with a base URL for resolving relative links.
-		/// </summary>
-		/// <param name="html">The HTML string to render.</param>
-		/// <param name="baseUrl">The base URL for resolving relative links.</param>
-		public void SetContent(string html, string baseUrl)
-		{
-			lock (_contentLock)
-			{
-				_rawHtml = html;
-				_baseUrl = baseUrl;
-				_currentUrl = null;
-				_scrollOffset = 0;
-				_hoveredLinkLineIndex = -1;
-				_hoveredLinkIndex = -1;
-				int layoutWidth = _lastLayoutWidth > 0 ? _lastLayoutWidth : 80;
-				RunLayout(layoutWidth);
-			}
-			Invalidate(Invalidation.Relayout);
-		}
-
-		/// <summary>
-		/// Loads HTML content from a URL asynchronously.
-		/// </summary>
-		/// <param name="url">The URL to load content from.</param>
-		public async Task LoadUrlAsync(string url)
-		{
-			await LoadUrlAsync(url, CancellationToken.None);
-		}
-
-		/// <summary>
-		/// Loads HTML content from a URL asynchronously with cancellation support.
-		/// </summary>
-		/// <param name="url">The URL to load content from.</param>
-		/// <param name="ct">External cancellation token.</param>
-		public async Task LoadUrlAsync(string url, CancellationToken ct)
-		{
-			// Cancel any previous load
-			_loadCts?.Cancel();
-			_loadCts?.Dispose();
-			_loadCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-			var linkedToken = _loadCts.Token;
-
-			_isLoading = true;
-			_isNavigating = true;
-			_currentUrl = url;
-			_loadingStatus = $"Fetching {url}";
-			_imageLoadTotal = 0;
-			_imageLoadCompleted = 0;
-			// Reset scroll + hover state immediately so stray input during the fetch
-			// doesn't apply to the page we're about to replace.
-			_scrollOffset = 0;
-			_hoveredLinkLineIndex = -1;
-			_hoveredLinkIndex = -1;
-			Invalidate(Invalidation.Relayout);
-
-			// Animate the loading-banner spinner for the full loading lifecycle
-			// (fetch → render → background image load). Fire-and-forget, tied to the same
-			// cancellation token; stops as soon as _loadingStatus becomes null.
-			_ = AnimateLoadingSpinnerAsync(linkedToken);
-
-			try
-			{
-				// Phase 1: Fetch HTML
-				var html = await _httpClient.GetStringAsync(url, linkedToken);
-				linkedToken.ThrowIfCancellationRequested();
-
-				_loadingStatus = "Rendering...";
-				Invalidate(Invalidation.Relayout);
-
-				// Phase 2: Render text immediately (no images) — progressive rendering
-				lock (_contentLock)
-				{
-					_rawHtml = html;
-					_baseUrl = url;
-					int layoutWidth = _lastLayoutWidth > 0 ? _lastLayoutWidth : 80;
-					RunLayoutWithoutImages(layoutWidth);
-				}
-
-				_isLoading = false;
-				_isNavigating = false;
-				// Leave _loadingStatus set only if Phase 3 will pick it up — otherwise clear it
-				// so the spinner animation loop exits. We hand off the status to the image
-				// loader before clearing navigation state to avoid a one-frame blank gap.
-				bool handingOffToImages = _showImages;
-				if (!handingOffToImages)
-					_loadingStatus = null;
-				else
-					_loadingStatus = "Preparing images...";
-				Invalidate(Invalidation.Relayout);
-				Core.AsyncEvent.Raise(ContentLoaded, ContentLoadedAsync, this, EventArgs.Empty, Container?.GetConsoleWindowSystem?.LogService);
-
-				// Phase 2b: Load external CSS stylesheets in background.
-				// When done, re-layout with CSS-aware computed styles (correct image widths etc.)
-				if (url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-					_ = _layoutEngine.LoadCssAsync(html, url).ContinueWith(_ =>
-					{
-						_lastLayoutWidth = -1; // force re-layout on next measure
-						InvalidateLinkCache();
-						Invalidate(Invalidation.Relayout);
-					}, TaskScheduler.Default);
-
-				// Phase 3: If ShowImages, re-layout with images in background
-				if (handingOffToImages)
-				{
-					_ = LoadImagesProgressivelyAsync(linkedToken);
-				}
-				else
-				{
-					// No image phase — this is the terminal state for a successful load.
-					Core.AsyncEvent.Raise(LoadingCompleted, LoadingCompletedAsync, this, EventArgs.Empty, Container?.GetConsoleWindowSystem?.LogService);
-				}
-			}
-			catch (OperationCanceledException)
-			{
-				_isLoading = false;
-				_isNavigating = false;
-				_loadingStatus = null;
-				Core.AsyncEvent.Raise(LoadingCompleted, LoadingCompletedAsync, this, EventArgs.Empty, Container?.GetConsoleWindowSystem?.LogService);
-			}
-			catch (Exception ex)
-			{
-				_isLoading = false;
-				_isNavigating = false;
-				_loadingStatus = null;
-
-				// Show error as HTML content
-				var errorHtml = $"""
-					<h1 style="color: red">Error Loading Page</h1>
-					<p><b>URL:</b> {System.Net.WebUtility.HtmlEncode(url)}</p>
-					<p><b>Error:</b> {System.Net.WebUtility.HtmlEncode(ex.Message)}</p>
-					<hr>
-					<p style="color: gray">Press Home or type a new address to navigate elsewhere.</p>
-					""";
-				lock (_contentLock)
-				{
-					_rawHtml = errorHtml;
-					_baseUrl = null;
-					_scrollOffset = 0;
-					int layoutWidth = _lastLayoutWidth > 0 ? _lastLayoutWidth : 80;
-					RunLayout(layoutWidth);
-				}
-
-				Core.AsyncEvent.Raise(LoadError, LoadErrorAsync, this, new LoadErrorEventArgs(url, ex), Container?.GetConsoleWindowSystem?.LogService);
-				Core.AsyncEvent.Raise(LoadingCompleted, LoadingCompletedAsync, this, EventArgs.Empty, Container?.GetConsoleWindowSystem?.LogService);
-			}
-
-			Invalidate(Invalidation.Relayout);
-		}
-
-		private async Task AnimateLoadingSpinnerAsync(CancellationToken ct)
-		{
-			try
-			{
-				// Keep animating as long as there is a loading status to show — covers both
-				// the navigation overlay (_isNavigating) and the background image-load banner.
-				while (_loadingStatus != null && !ct.IsCancellationRequested)
-				{
-					Invalidate(Invalidation.Repaint);
-					await Task.Delay(100, ct);
-				}
-			}
-			catch (OperationCanceledException)
-			{
-				// Expected on navigation cancel — nothing to do.
-			}
-		}
-
-		private async Task LoadImagesProgressivelyAsync(CancellationToken ct)
-		{
-			bool raiseCompleted = true;
-			try
-			{
-				if (string.IsNullOrEmpty(_rawHtml))
-				{
-					_loadingStatus = null;
-					return;
-				}
-
-				// Collect all image URLs from the HTML
-				var imageUrls = _layoutEngine.GetImageUrls(_rawHtml, _baseUrl);
-				if (imageUrls.Count == 0)
-				{
-					_loadingStatus = null;
-					Invalidate(Invalidation.Relayout);
-					return;
-				}
-
-				_imageLoadTotal = imageUrls.Count;
-				_imageLoadCompleted = 0;
-
-				// Capture state ONCE at start
-				int capturedWidth;
-				string? capturedHtml;
-				string? capturedBaseUrl;
-				lock (_contentLock)
-				{
-					capturedWidth = _lastLayoutWidth > 0 ? _lastLayoutWidth : 80;
-					capturedHtml = _rawHtml;
-					capturedBaseUrl = _baseUrl;
-				}
-				if (capturedHtml == null)
-				{
-					_loadingStatus = null;
-					return;
-				}
-
-				// Image cache: URL → PixelBuffer (or null for failed)
-				var imageCache = new Dictionary<string, Imaging.PixelBuffer?>();
-
-				// Throttled re-layout: commit the partial image cache to the layout at most
-				// once every ThrottleMs. A full re-layout of a large page (e.g. Wikipedia Cat)
-				// can take ~1s, so re-laying out per image (20+ times) would stall the UI.
-				// Throttling gives the user visible progress — images pop in in batches of
-				// whatever arrived during the interval — without burning CPU.
-				const int ThrottleMs = 750;
-				long lastCommitTicks = 0;
-				bool htmlChanged = false;
-
-				// Fetch images one-by-one; after each, if the throttle has elapsed, re-layout
-				// with whatever images are cached so far. Missing images still render as alt
-				// text (HtmlBlockFlow.ProcessImage handles partial caches cleanly).
-				foreach (var url in imageUrls)
-				{
-					ct.ThrowIfCancellationRequested();
-
-					_loadingStatus = $"Loading images ({_imageLoadCompleted + 1}/{_imageLoadTotal})...";
-					Invalidate(Invalidation.Relayout);
-
-					try
-					{
-						var response = await HtmlImageLoader.HttpClient.GetAsync(url, ct);
-						var contentType = response.Content.Headers.ContentType?.MediaType ?? "";
-						if (!contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
-							contentType.Contains("svg", StringComparison.OrdinalIgnoreCase))
-						{
-							imageCache[url] = null;
-						}
-						else
-						{
-							var bytes = await response.Content.ReadAsByteArrayAsync(ct);
-							using var stream = new System.IO.MemoryStream(bytes);
-							var buffer = Imaging.PixelBuffer.FromStream(stream);
-							imageCache[url] = buffer;
-						}
-					}
-					catch
-					{
-						imageCache[url] = null;
-					}
-
-					_imageLoadCompleted++;
-
-					// Throttled commit — only re-layout if ThrottleMs elapsed since last commit
-					// and there are still images pending (the final commit after the loop
-					// guarantees the last batch lands regardless of timing).
-					long nowTicks = Environment.TickCount64;
-					bool isLast = _imageLoadCompleted >= _imageLoadTotal;
-					if (!isLast && (nowTicks - lastCommitTicks) >= ThrottleMs)
-					{
-						if (!TryCommitPartialImageLayout(capturedHtml, capturedWidth, capturedBaseUrl, imageCache))
-						{
-							htmlChanged = true;
-							break; // page was replaced under us — abort image loading
-						}
-						lastCommitTicks = nowTicks;
-						Invalidate(Invalidation.Relayout);
-					}
-				}
-
-				// Final commit: guarantees the last batch of images reaches the screen even if
-				// they arrived inside the throttle window.
-				if (!htmlChanged)
-				{
-					ct.ThrowIfCancellationRequested();
-					_loadingStatus = "Rendering images...";
-					Invalidate(Invalidation.Relayout);
-
-					if (!TryCommitPartialImageLayout(capturedHtml, capturedWidth, capturedBaseUrl, imageCache))
-						htmlChanged = true;
-				}
-
-				_loadingStatus = null;
-				Invalidate(Invalidation.Relayout);
-				if (htmlChanged)
-				{
-					// Caller is already navigating to new content — it owns its own completion
-					// event lifecycle. Suppress ours to avoid a double-fire.
-					raiseCompleted = false;
-				}
-			}
-			catch (OperationCanceledException)
-			{
-				_loadingStatus = null;
-				// A new LoadUrlAsync() cancels the previous one and will fire its own
-				// LoadingCompleted on its terminal state. Don't double-fire here.
-				raiseCompleted = false;
-			}
-			catch
-			{
-				_loadingStatus = null;
-			}
-			finally
-			{
-				if (raiseCompleted)
-					Core.AsyncEvent.Raise(LoadingCompleted, LoadingCompletedAsync, this, EventArgs.Empty, Container?.GetConsoleWindowSystem?.LogService);
-			}
-		}
-
-		#endregion
-
-		#region Private Helpers
-
-		/// <summary>
-		/// Re-lays out the captured HTML with the current (possibly partial) image cache,
-		/// committing the result atomically to <c>_layoutResult</c>. Returns <c>false</c> if
-		/// the page was replaced under us (caller should abort the image-load loop).
-		/// </summary>
-		private bool TryCommitPartialImageLayout(
-			string capturedHtml,
-			int capturedWidth,
-			string? capturedBaseUrl,
-			Dictionary<string, Imaging.PixelBuffer?> imageCache)
-		{
-			lock (_contentLock)
-			{
-				if (_rawHtml != capturedHtml)
-					return false;
-
-				var fg = ForegroundColor;
-				var bg = BackgroundColor; // theme-resolved (was Container?.BackgroundColor ?? Color.Black)
-				_lastLayoutFg = fg; _lastLayoutBg = bg; _lastLayoutLinkColor = LinkColor;
-
-				try
-				{
-					var gp = Container?.GetConsoleWindowSystem?.ConsoleDriver as Drivers.IGraphicsProtocol;
-					_layoutResult = _layoutEngine.Layout(
-						capturedHtml,
-						capturedWidth, fg, bg,
-						_blockSpacing, LinkColor, VisitedLinkColor,
-						capturedBaseUrl,
-						showImages: true,
-						imageCache: imageCache,
-						graphicsProtocol: gp);
-				}
-				catch
-				{
-					// Layout failed — keep the previous result rather than blanking the view.
-				}
-
-				InvalidateLinkCache();
-			}
-			return true;
-		}
-
-		private void RunLayoutWithoutImages(int width)
-		{
-			if (width <= 0) width = 80;
-			if (string.IsNullOrEmpty(_rawHtml))
-			{
-				_layoutResult = new LayoutResult(Array.Empty<LayoutLine>(), 0);
-				_lastLayoutWidth = width;
-				InvalidateLinkCache();
-				return;
-			}
-
-			var fg = ForegroundColor;
-			var bg = BackgroundColor; // theme-resolved (was Container?.BackgroundColor ?? Color.Black)
-			_lastLayoutFg = fg; _lastLayoutBg = bg; _lastLayoutLinkColor = LinkColor;
-
-			try
-			{
-				_layoutResult = _layoutEngine.Layout(
-					_rawHtml, width, fg, bg, _blockSpacing,
-					LinkColor, VisitedLinkColor, _baseUrl,
-					showImages: false);
-			}
-			catch (Exception ex)
-			{
-				var errorHtml = $"""
-					<h1 style="color: red">Rendering Error</h1>
-					<p><b>Error:</b> {System.Net.WebUtility.HtmlEncode(ex.Message)}</p>
-					""";
-				try { _layoutResult = _layoutEngine.Layout(errorHtml, width, fg, bg, _blockSpacing, showImages: false); }
-				catch { _layoutResult = new LayoutResult(Array.Empty<LayoutLine>(), 0); }
-			}
-
-			_lastLayoutWidth = width;
-			InvalidateLinkCache();
-		}
-
-		private void RunLayout(int width)
-		{
-			if (width <= 0) width = 80;
-			if (string.IsNullOrEmpty(_rawHtml))
-			{
-				_layoutResult = new LayoutResult(Array.Empty<LayoutLine>(), 0);
-				_lastLayoutWidth = width;
-				return;
-			}
-
-			var fg = ForegroundColor;
-			var bg = BackgroundColor; // theme-resolved (was Container?.BackgroundColor ?? Color.Black)
-			_lastLayoutFg = fg; _lastLayoutBg = bg; _lastLayoutLinkColor = LinkColor;
-
-			try
-			{
-				var gp = Container?.GetConsoleWindowSystem?.ConsoleDriver as Drivers.IGraphicsProtocol;
-				_layoutResult = _layoutEngine.Layout(
-					_rawHtml,
-					width,
-					fg,
-					bg,
-					_blockSpacing,
-					LinkColor,
-					VisitedLinkColor,
-					_baseUrl,
-					_showImages,
-					graphicsProtocol: gp);
-			}
-			catch (Exception ex)
-			{
-				// Render the error as visible HTML so the user sees it instead of a blank page
-				var errorHtml = $"""
-					<h1 style="color: red">Rendering Error</h1>
-					<p><b>Error:</b> {System.Net.WebUtility.HtmlEncode(ex.Message)}</p>
-					<hr>
-					<p style="color: gray">The page was loaded but could not be rendered.</p>
-					""";
-				try
-				{
-					// Layout the error page (without images to avoid recursion)
-					_layoutResult = _layoutEngine.Layout(errorHtml, width, fg, bg, _blockSpacing, showImages: false);
-				}
-				catch
-				{
-					// Last resort — truly can't render anything
-					_layoutResult = new LayoutResult(Array.Empty<LayoutLine>(), 0);
-				}
-			}
-
-			_lastLayoutWidth = width;
-			InvalidateLinkCache();
-		}
-
-		private int GetViewportHeight()
-		{
-			int h = Height ?? ActualHeight;
-			return Math.Max(1, h - Margin.Top - Margin.Bottom);
-		}
-
-		/// <summary>
-		/// Computes the width at which the document should be laid out, given the current
-		/// control content width. Reserves one column for the scrollbar whenever scrollbar
-		/// visibility is not <see cref="ScrollbarVisibility.Never"/> so that cell content
-		/// (notably HTML table right borders) never collides with the scrollbar column.
-		/// This must be deterministic and consistent between <c>MeasureDOM</c> and
-		/// <c>PaintDOM</c> to avoid relayout ping-pong on large documents.
-		/// </summary>
-		private int ComputeLayoutWidth(int contentWidth)
-		{
-			if (contentWidth <= 1)
-				return Math.Max(1, contentWidth);
-			if (_scrollbarVisibility == ScrollbarVisibility.Never)
-				return contentWidth;
-			return contentWidth - 1;
-		}
-
-		/// <summary>
-		/// Returns a flattened list of all links across all layout lines, cached and
-		/// invalidated when layout changes. Each entry contains the line index, link
-		/// index within that line, the LinkRegion data, and the line's Y position.
-		/// </summary>
-		/// <summary>
-		/// Returns a deduplicated list of links (one entry per LinkId, using the first segment).
-		/// Used for Tab navigation — multi-line links are a single Tab stop.
-		/// </summary>
-		internal List<(int lineIndex, int linkIndex, LinkRegion link, int lineY)> GetAllLinks()
-		{
-			if (!_flattenedLinksDirty && _flattenedLinks != null)
-				return _flattenedLinks;
-
-			_flattenedLinks ??= new List<(int, int, LinkRegion, int)>();
-			_flattenedLinks.Clear();
-
-			var seenLinkIds = new HashSet<int>();
-
-			if (_layoutResult.Lines != null)
-			{
-				for (int i = 0; i < _layoutResult.Lines.Length; i++)
-				{
-					var line = _layoutResult.Lines[i];
-					if (line.Links == null) continue;
-					for (int j = 0; j < line.Links.Length; j++)
-					{
-						// Only add the first segment of each LinkId
-						if (seenLinkIds.Add(line.Links[j].LinkId))
-						{
-							_flattenedLinks.Add((i, j, line.Links[j], line.Y));
-						}
-					}
-				}
-			}
-
-			_flattenedLinksDirty = false;
-			return _flattenedLinks;
-		}
-
-		/// <summary>
-		/// Returns the LinkId of the currently focused link, or -1 if none.
-		/// </summary>
-		internal int GetFocusedLinkId()
-		{
-			if (_focusedLinkIndex < 0) return -1;
-			var links = GetAllLinks();
-			if (_focusedLinkIndex >= links.Count) return -1;
-			return links[_focusedLinkIndex].link.LinkId;
-		}
-
-		/// <summary>
-		/// Invalidates the cached flattened link list. Called when layout changes.
-		/// </summary>
-		internal void InvalidateLinkCache()
-		{
-			// Save the focused link's identity before invalidating
-			int savedLinkId = -1;
-			if (_focusedLinkIndex >= 0 && _flattenedLinks != null && _focusedLinkIndex < _flattenedLinks.Count)
-			{
-				savedLinkId = _flattenedLinks[_focusedLinkIndex].link.LinkId;
-			}
-
-			_flattenedLinksDirty = true;
-
-			if (savedLinkId >= 0)
-			{
-				// Rebuild and try to restore focus to the same logical link
-				var links = GetAllLinks();
-				_focusedLinkIndex = -1;
-				for (int i = 0; i < links.Count; i++)
-				{
-					if (links[i].link.LinkId == savedLinkId)
-					{
-						_focusedLinkIndex = i;
-						break;
-					}
-				}
-			}
-			else if (_focusedLinkIndex >= 0)
-			{
-				var links = GetAllLinks();
-				if (_focusedLinkIndex >= links.Count)
-					_focusedLinkIndex = links.Count > 0 ? 0 : -1;
-			}
-		}
-
-		/// <summary>
-		/// Scrolls the viewport to ensure the given line Y position is visible.
-		/// </summary>
-		private void EnsureLinkVisible(int lineY)
-		{
-			var viewportHeight = GetViewportHeight();
-			if (lineY < _scrollOffset)
-				ScrollOffset = lineY;
-			else if (lineY >= _scrollOffset + viewportHeight)
-				ScrollOffset = lineY - viewportHeight + 1;
-		}
-
-		/// <summary>
-		/// Gets or sets the currently focused link index (-1 = none).
-		/// Setting this scrolls the viewport to make the link visible.
-		/// </summary>
-		internal int FocusedLinkIndex
-		{
-			get => _focusedLinkIndex;
-			set
-			{
-				var links = GetAllLinks();
-				if (links.Count == 0)
-				{
-					_focusedLinkIndex = -1;
-					return;
-				}
-
-				_focusedLinkIndex = value;
-				if (_focusedLinkIndex >= 0 && _focusedLinkIndex < links.Count)
-				{
-					EnsureLinkVisible(links[_focusedLinkIndex].lineY);
-				}
-				Invalidate(Invalidation.Repaint);
-			}
-		}
-
 		/// <inheritdoc/>
-		protected override void OnDisposing()
+		public override void DescribeState(IStateWriter w)
 		{
-			_loadCts?.Cancel();
-			_loadCts?.Dispose();
-			_loadCts = null;
-			_resizeDebounceTimer?.Stop();
-			_resizeDebounceTimer?.Dispose();
-			_resizeDebounceTimer = null;
+			ArgumentNullException.ThrowIfNull(w);
+			base.DescribeState(w);
+
+			w.Scroll(ScrollOffset, ActualHeight, ContentHeight);
+			w.Write("loading", IsLoading);
 		}
 
-		#endregion
 	}
 }

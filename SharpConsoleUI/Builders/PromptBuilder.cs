@@ -43,6 +43,9 @@ public sealed class PromptBuilder : IControlBuilder<PromptControl>
 	private int? _inputWidth;
 	private bool _historyEnabled;
 	private Func<string, int, IEnumerable<string>?>? _tabCompleter;
+	private Func<string, PromptToken?>? _pasteFilter;
+	private Color? _tokenForegroundColor;
+	private Color? _tokenBackgroundColor;
 	private Color? _inputBackgroundColor;
 	private Color? _inputFocusedBackgroundColor;
 	private Color? _inputForegroundColor;
@@ -50,6 +53,80 @@ public sealed class PromptBuilder : IControlBuilder<PromptControl>
 	private ColorRole _role = ColorRole.Default;
 	private ThemeMode? _colorRoleMode;
 	private bool _outline;
+	private bool _multiline;
+	private int? _minRows;
+	private int? _maxRows;
+	private EnterBehavior _enterBehavior = EnterBehavior.Submit;
+	private string? _placeholder;
+	private int? _maxLength;
+	private bool _readOnly;
+	private int? _maxHistoryEntries;
+
+	/// <summary>
+	/// Lets the value wrap and the box grow instead of scrolling sideways on one row.
+	/// Off by default, so an existing prompt is unaffected.
+	/// </summary>
+	public PromptBuilder Multiline(bool multiline = true)
+	{
+		_multiline = multiline;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets how far a <see cref="Multiline"/> prompt may shrink and grow, in rows.
+	/// </summary>
+	public PromptBuilder WithRows(int minRows, int maxRows)
+	{
+		_minRows = minRows;
+		_maxRows = maxRows;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets what Enter does. The default, <see cref="EnterBehavior.Submit"/>, keeps Enter meaning
+	/// "submit" in both modes.
+	/// </summary>
+	public PromptBuilder WithEnterBehavior(EnterBehavior behavior)
+	{
+		_enterBehavior = behavior;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the hint shown while the value is empty. Never part of the value.
+	/// </summary>
+	public PromptBuilder WithPlaceholder(string placeholder)
+	{
+		_placeholder = placeholder;
+		return this;
+	}
+
+	/// <summary>
+	/// Caps the value at <paramref name="maxLength"/> characters.
+	/// </summary>
+	public PromptBuilder WithMaxLength(int maxLength)
+	{
+		_maxLength = maxLength;
+		return this;
+	}
+
+	/// <summary>
+	/// Makes the value uneditable while still focusable, navigable and copyable.
+	/// </summary>
+	public PromptBuilder ReadOnly(bool readOnly = true)
+	{
+		_readOnly = readOnly;
+		return this;
+	}
+
+	/// <summary>
+	/// Caps how many entries the command history retains.
+	/// </summary>
+	public PromptBuilder WithMaxHistoryEntries(int maxEntries)
+	{
+		_maxHistoryEntries = maxEntries;
+		return this;
+	}
 
 	/// <summary>
 	/// Sets the prompt text (displayed before the input area)
@@ -103,6 +180,29 @@ public sealed class PromptBuilder : IControlBuilder<PromptControl>
 	public PromptBuilder WithTabCompleter(Func<string, int, IEnumerable<string>?> completer)
 	{
 		_tabCompleter = completer;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the filter that decides whether a paste becomes a token rather than ordinary text.
+	/// </summary>
+	/// <param name="filter">
+	/// Called with the pasted text. Return a <see cref="PromptToken"/> to insert that instead, or
+	/// null to paste as text. The rule is the host's: the control owns none of it.
+	/// </param>
+	public PromptBuilder WithPasteFilter(Func<string, PromptToken?> filter)
+	{
+		_pasteFilter = filter;
+		return this;
+	}
+
+	/// <summary>Sets the colours a token's label is drawn in, so it reads as a chip.</summary>
+	/// <param name="foreground">The label's foreground, or null to keep the derived default.</param>
+	/// <param name="background">The label's background, or null for none.</param>
+	public PromptBuilder WithTokenColors(Color? foreground, Color? background = null)
+	{
+		_tokenForegroundColor = foreground;
+		_tokenBackgroundColor = background;
 		return this;
 	}
 
@@ -344,6 +444,12 @@ public sealed class PromptBuilder : IControlBuilder<PromptControl>
 			prompt.HistoryEnabled = true;
 		if (_tabCompleter != null)
 			prompt.TabCompleter = _tabCompleter;
+		if (_pasteFilter != null)
+			prompt.PasteFilter = _pasteFilter;
+		if (_tokenForegroundColor != null)
+			prompt.TokenForegroundColor = _tokenForegroundColor;
+		if (_tokenBackgroundColor != null)
+			prompt.TokenBackgroundColor = _tokenBackgroundColor;
 		if (_inputBackgroundColor.HasValue)
 			prompt.InputBackgroundColor = _inputBackgroundColor.Value;
 		if (_inputFocusedBackgroundColor.HasValue)
@@ -353,8 +459,30 @@ public sealed class PromptBuilder : IControlBuilder<PromptControl>
 		if (_inputFocusedForegroundColor.HasValue)
 			prompt.InputFocusedForegroundColor = _inputFocusedForegroundColor.Value;
 
+		// Mode and limits are applied BEFORE the initial value: SetInput flattens newlines in
+		// single-line mode and truncates to MaxLength, so setting them afterwards would silently
+		// mangle an initial value that the caller configured the control to accept.
+		if (_multiline)
+			prompt.Multiline = true;
+		if (_minRows.HasValue)
+			prompt.MinRows = _minRows.Value;
+		if (_maxRows.HasValue)
+			prompt.MaxRows = _maxRows.Value;
+		if (_enterBehavior != EnterBehavior.Submit)
+			prompt.EnterBehavior = _enterBehavior;
+		if (_placeholder != null)
+			prompt.Placeholder = _placeholder;
+		if (_maxLength.HasValue)
+			prompt.MaxLength = _maxLength.Value;
+		if (_maxHistoryEntries.HasValue)
+			prompt.MaxHistoryEntries = _maxHistoryEntries.Value;
+
 		if (!string.IsNullOrEmpty(_initialInput))
 			prompt.SetInput(_initialInput);
+
+		// After the initial value: a read-only prompt still accepts the value it was built with.
+		if (_readOnly)
+			prompt.ReadOnly = true;
 
 		// Attach standard handlers
 		if (_enteredHandler != null)

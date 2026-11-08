@@ -187,6 +187,27 @@ namespace SharpConsoleUI.Controls
 		/// <summary>Returns the message's status-row <see cref="StatusBarControl"/>, or <c>null</c> when it has none (test-only seam).</summary>
 		internal StatusBarControl? StatusBarForTest(ChatMessageId id) => Require(id).StatusBar;
 
+		/// <summary>
+		/// The actions row of the newest message that has one, or <c>null</c> when no message does.
+		/// </summary>
+		/// <remarks>
+		/// <para>SO A HOST CAN PUT THE KEYBOARD ON IT. Action buttons are real focusable controls, but
+		/// nothing reaches them: a transcript is a long scrolling surface and a host that wants the
+		/// buttons answerable needs to say WHICH row — and "the newest" is the only answer that is
+		/// ever right, because a block with buttons is a question just asked.</para>
+		///
+		/// <para>Without this the buttons were mouse-only in practice, which for a confirmation like
+		/// "delete this history" means a keyboard-driven user cannot answer at all.</para>
+		/// </remarks>
+		public ToolbarControl? NewestActionsRow()
+		{
+			for (var i = _order.Count - 1; i >= 0; i--)
+				if (_order[i].ActionsToolbar is { } toolbar && toolbar.Visible)
+					return toolbar;
+
+			return null;
+		}
+
 		/// <summary>Returns whether the message currently has a footer row (actions and/or status) rendered as a sibling of its panel (test-only seam).</summary>
 		internal bool HasFooterForTest(ChatMessageId id) => Require(id).HasFooter;
 
@@ -243,7 +264,9 @@ namespace SharpConsoleUI.Controls
 			if (entry.PeekRow != null)
 				entry.PeekRow.Margin = WithBottom(entry.PeekRow.Margin, 0);
 
-			// Bottommost sibling below the panel: status → actions → peek.
+			// Bottommost sibling below the panel: status → actions → peek. The spacer is applied for
+			// COMPACT messages too: the separator RULE is chrome that says nothing, but the trailing
+			// blank is what keeps consecutive steps from running together into an unreadable block.
 			BaseControl? bottom = (BaseControl?)entry.StatusBar ?? entry.ActionsToolbar ?? (BaseControl?)entry.PeekRow;
 			if (bottom != null)
 				bottom.Margin = WithBottom(bottom.Margin, 1);
@@ -259,6 +282,15 @@ namespace SharpConsoleUI.Controls
 		{
 			if (!entry.HasFooter)
 				return;
+
+			// Compact messages carry no divider: the rule is full-width and says nothing, so on a
+			// sequence of short rows it doubles the height for no information.
+			if (entry.CompactFooter)
+			{
+				if (entry.ActionsToolbar != null) entry.ActionsToolbar.ShowAboveLine = false;
+				if (entry.StatusBar != null) entry.StatusBar.ShowAboveLine = false;
+				return;
+			}
 
 			Color lineColor = ResolveRailColor(entry);
 			if (entry.ActionsToolbar != null)

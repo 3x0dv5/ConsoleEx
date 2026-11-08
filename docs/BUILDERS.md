@@ -318,6 +318,8 @@ Controls.Dropdown()
 Controls.Prompt("Enter name:")
     .WithInput("")
     .WithInputWidth(50)
+    .WithPlaceholder("your full name")
+    .WithMaxLength(80)
     .WithName("nameInput")
     .OnEntered((sender, text, window) =>
     {
@@ -329,6 +331,33 @@ Controls.Prompt("Enter name:")
     })
     .Build();
 ```
+
+A prompt that wraps and grows instead of scrolling sideways — `Multiline()` is opt-in, so every
+existing prompt keeps its single-row behavior:
+
+```csharp
+Controls.Prompt("> ")
+    .Multiline()
+    .WithRows(1, 6)                                  // start at one row, grow to six
+    .WithEnterBehavior(EnterBehavior.Submit)         // the default: Enter sends, Alt+Enter newlines
+    .WithPlaceholder("Message… (Alt+Enter for a new line)")
+    .WithMaxHistoryEntries(200)
+    .UnfocusOnEnter(false)
+    .Build();
+```
+
+| Method | Effect |
+|---|---|
+| `.Multiline(bool = true)` | Allow newlines, wrap the text, grow the box |
+| `.WithRows(min, max)` | Row bounds when multiline |
+| `.WithEnterBehavior(...)` | `Submit` (default) or `InsertNewline` |
+| `.WithPlaceholder(text)` | Hint shown while empty |
+| `.WithMaxLength(n)` | Cap the value length in characters |
+| `.ReadOnly(bool = true)` | Uneditable but focusable, navigable and copyable |
+| `.WithMaxHistoryEntries(n)` | Cap the command history (default 500) |
+
+See [PromptControl](controls/PromptControl.md) for the full key table and the note on why
+`Shift+Enter` cannot be the newline chord on Unix.
 
 ### MarkupBuilder
 
@@ -392,6 +421,26 @@ Controls.Tree()
 
 Use `AddRootNodes(params TreeNode[])` to add several roots at once.
 
+### TreeTableControlBuilder
+
+```csharp
+// Every TableControlBuilder method, plus the hierarchy's own.
+// AddRootRow with cell text returns the new row, so you can nest by capturing it.
+var builder = Controls.TreeTable()
+    .AddColumn("Title")
+    .AddColumn("Owner")
+    .Interactive()
+    .WithSorting()
+    .WithGuide(TreeGuide.Line);
+
+var feature = builder.AddRootRow("Feature: Login", "Pat");
+feature.AddChild("Story: Form", "Bo").AddChild("Task: Layout", "Bo");
+
+var table = builder.Build();
+```
+
+See [TreeTableControl](controls/TreeTableControl.md#builder-api) for the hierarchy's builder methods.
+
 ### HorizontalGridBuilder
 
 ```csharp
@@ -413,6 +462,28 @@ Controls.ScrollablePanel()
     .WithHeight(5)
     .Build();
 ```
+
+### ScrollbarBuilder
+
+A standalone scrollbar, not attached to any one view — for composites where several views scroll
+together (a side-by-side diff with one bar for both panes). See
+[ScrollbarControl](controls/ScrollbarControl.md).
+
+```csharp
+Controls.Scrollbar()
+    .WithMaximum(200)           // total content length
+    .WithViewportLength(20)     // visible length
+    .OnUserValueChanged((s, value) =>
+    {
+        leftPane.ScrollVerticalBy(value - leftPane.VerticalScrollOffset);
+        rightPane.ScrollVerticalBy(value - rightPane.VerticalScrollOffset);
+    })
+    .Build();
+```
+
+`OnUserValueChanged` fires only for user interaction (arrow, track, thumb drag, wheel), so writing
+the bar's `Value` back from the views it drives does not echo. `OnValueChanged` fires for every
+change, including code-set. The bar never takes keyboard focus.
 
 ### CollapsiblePanelBuilder
 
@@ -500,7 +571,7 @@ Controls.MultilineEdit()
     .Build();
 ```
 
-### FigleControlBuilder
+### FigletControlBuilder
 
 ```csharp
 Controls.Figlet("BIG TEXT")
@@ -804,11 +875,12 @@ Controls.Prompt(prompt)             // PromptBuilder
 Controls.Tree()                     // TreeControlBuilder
 Controls.HorizontalGrid()           // HorizontalGridBuilder
 Controls.ScrollablePanel()          // ScrollablePanelBuilder
+Controls.Scrollbar()                // ScrollbarBuilder (standalone bar, drives other views)
 Controls.CollapsiblePanel(title?)   // CollapsiblePanelBuilder (click-to-expand container)
 Controls.Menu()                     // MenuBuilder
 Controls.Toolbar()                  // ToolbarBuilder
 Controls.MultilineEdit()            // MultilineEditControlBuilder
-Controls.Figlet(text)               // FigleControlBuilder
+Controls.Figlet(text)               // FigletControlBuilder
 Controls.RuleBuilder()              // RuleBuilder
 Controls.Panel()                    // PanelBuilder (for bordered content panels)
 Controls.Panel(text)                // PanelControl directly with text content
@@ -826,6 +898,7 @@ Controls.Wizard()                   // WizardBuilder
 
 // Data and graphs
 Controls.Table()                    // TableBuilder (data grid)
+Controls.TreeTable()                // TreeTableControlBuilder (data grid whose rows nest)
 Controls.Sparkline()                // SparklineBuilder (time-series graphs)
 Controls.BarGraph()                 // BarGraphBuilder (horizontal bar graphs)
 Controls.LineGraph()                // LineGraphBuilder

@@ -44,10 +44,19 @@ namespace SharpConsoleUI.Parsing
 		/// </summary>
 		public static List<Cell> Parse(string markup, Color defaultFg, Color defaultBg, out List<LinkSpan> links, Configuration.MarkdownStyle? markdownStyle = null)
 		{
+			var cells = new ListCellSink();
+			ParseCore(markup, defaultFg, defaultBg, ref cells, out links, markdownStyle);
+			return cells.Cells;
+		}
+
+		private static void ParseCore<TSink>(string markup, Color defaultFg, Color defaultBg, ref TSink cells,
+			out List<LinkSpan> links, Configuration.MarkdownStyle? markdownStyle = null, bool measureOnly = false)
+			where TSink : struct, ICellSink
+		{
 			links = new List<LinkSpan>();
 
 			if (string.IsNullOrEmpty(markup))
-				return new List<Cell>();
+				return;
 
 			// Expand any [markdown]…[/] regions into native markup first
 			markup = PreProcessMarkdownTags(markup, markdownStyle);
@@ -55,9 +64,11 @@ namespace SharpConsoleUI.Parsing
 			// Pre-process gradient tags before normal parsing
 			markup = PreProcessGradientTags(markup, defaultFg, defaultBg, out var gradientSpans);
 
-			var cells = new List<Cell>();
 			var styleStack = new Stack<MarkupStyle>();
-			var linkStack = new Stack<(int startCell, string url)>();
+			var linkStack = new Stack<(int startCell, string url, int linkIndex)>();
+			// Assigned when a link OPENS: links are recorded on their closing tag, so a nested
+			// link would otherwise be numbered before the one enclosing it.
+			int nextLinkIndex = 0;
 			var frameIsLink = new Stack<bool>(); // one entry per pushed scope ([style tag] OR [link=…])
 			bool fillToWidth = false;
 			var currentFg = defaultFg;
@@ -110,12 +121,20 @@ namespace SharpConsoleUI.Parsing
 
 					i = tagEnd + 1;
 
-					// Self-closing [fillwidth] marker: emit no cell, just flag this line so the
-					// painter fills the trailing background to the row width. Does not touch the
-					// style stack. The flag is applied to the line's last cell after parsing.
+					// Self-closing [fillwidth] marker: emit no cell, just flag the line so the painter
+					// fills the trailing background to the row width. Does not touch the style stack.
+					//
+					// Flag the CURRENT line's last cell right here, rather than deferring one global
+					// bool to the end of the parse. ParseLines parses the whole markup in ONE call
+					// (parse-then-cut, newlines swapped for a row-break sentinel), so a multi-line
+					// block emits [fillwidth] once PER LINE but only the very last cell of the whole
+					// run would have been flagged — every earlier line painted an unshaded tail
+					// stopping at its last character, which is the code-block shading bug.
+					// Flagging at the marker's own position is line-correct by construction.
 					if (tagContent == "fillwidth")
 					{
 						fillToWidth = true;
+						MarkLineFillToWidth(ref cells);
 						continue;
 					}
 
@@ -139,6 +158,7 @@ namespace SharpConsoleUI.Parsing
 							}
 						}
 						MarkupSpinnerClock.MarkParsed();
+						MarkupSpinnerClock.ReportInterval(spinnerInterval);
 						continue;
 					}
 
@@ -146,7 +166,7 @@ namespace SharpConsoleUI.Parsing
 					if (tagContent.StartsWith(LinkTagPrefix, StringComparison.OrdinalIgnoreCase))
 					{
 						string url = LinkUrl.Unescape(tagContent.Substring(LinkTagPrefix.Length));
-						linkStack.Push((cells.Count, url));
+						linkStack.Push((cells.Count, url, nextLinkIndex++));
 						frameIsLink.Push(true);
 						continue;
 					}
@@ -156,14 +176,14 @@ namespace SharpConsoleUI.Parsing
 						if (frameIsLink.Count > 0 && frameIsLink.Peek())
 						{
 							frameIsLink.Pop();
-							var (start, url) = linkStack.Pop();
+							var (start, url, linkIndex) = linkStack.Pop();
 							int end = cells.Count;
-							if (end > start)
+							if (!measureOnly && end > start)
 							{
 								var sb = new System.Text.StringBuilder();
 								for (int c = start; c < end; c++)
 									if (!cells[c].IsWideContinuation) sb.Append(cells[c].Character.ToString());
-								links.Add(new LinkSpan(start, end, url, sb.ToString()));
+								links.Add(new LinkSpan(start, end, url, sb.ToString(), linkIndex));
 							}
 						}
 						else if (styleStack.Count > 0)
@@ -218,7 +238,7 @@ namespace SharpConsoleUI.Parsing
 									// A wide rune immediately after a ZWJ continues the current grapheme cluster
 									// (e.g. 👨‍👩‍👧‍👦). Attach it to the base cell's combiner tail instead of starting a
 									// new cell, so the whole cluster occupies one base + one continuation = 2 columns.
-									AppendClusterRune(cells, sanitized);
+									AppendClusterRune(ref cells, sanitized);
 								}
 								else
 								{
@@ -297,7 +317,7 @@ namespace SharpConsoleUI.Parsing
 							// new cell, so the whole cluster occupies one base + one continuation = 2 columns,
 							// matching how a ligating terminal renders it. The rune is already sanitized, so we
 							// append it directly (AppendCombiner would reject a wide emoji as a non-combiner).
-							AppendClusterRune(cells, sanitized);
+							AppendClusterRune(ref cells, sanitized);
 						}
 						else
 						{
@@ -305,6 +325,14 @@ namespace SharpConsoleUI.Parsing
 							if (IsWideRune(sanitized))
 								cells.Add(new Cell(' ', currentFg, currentBg, currentDec) { IsWideContinuation = true });
 						}
+
+						// A row break ends the current logical line: clear the pending marker so it
+						// describes only the line being built. Without this the flag, once set, would
+						// still be live at end-of-parse and get applied to a FINAL line that never
+						// asked for it (an unmarked paragraph after a code block filling its tail).
+						if (sanitized.Value == RowBreakSentinelRune)
+							fillToWidth = false;
+
 						prevWasZwj = (sanitized.Value == 0x200D);
 						i += rune.Utf16SequenceLength;
 					}
@@ -318,21 +346,42 @@ namespace SharpConsoleUI.Parsing
 			}
 
 			// Apply gradient foreground colors to gradient spans
-			if (gradientSpans != null)
+			if (!measureOnly && gradientSpans != null)
 			{
-				ApplyGradientSpans(cells, gradientSpans);
+				ApplyGradientSpans(ref cells, gradientSpans);
 			}
 
-			// Apply the [fillwidth] marker (if seen) to the line's last cell so the painter
-			// extends its background to the available render width.
-			if (fillToWidth && cells.Count > 0)
+			// Apply the marker to the FINAL line too. Lines that ended at a row-break sentinel were
+			// already flagged when their own [fillwidth] was encountered; this covers the trailing
+			// line (and the single-line Parse callers), and is idempotent for anything already set.
+			if (fillToWidth)
 			{
-				var last = cells[^1];
-				last.FillToWidth = true;
-				cells[^1] = last;
+				MarkLineFillToWidth(ref cells);
 			}
+		}
 
-			return cells;
+		/// <summary>
+		/// Flags the last cell of the current logical line with <see cref="Cell.FillToWidth"/>, so the
+		/// painter extends that cell's background to the render width.
+		/// </summary>
+		/// <remarks>
+		/// "Current line" means the trailing cells after the most recent row-break sentinel. During the
+		/// whole-markup parse used by <c>ParseLines</c> the sentinel cells are still present in the list,
+		/// so a sentinel in last position means the line is empty and there is nothing to carry the flag.
+		/// The flag goes on the TRUE last cell — the painter reads <c>cellLine[^1]</c> — including a wide
+		/// continuation cell, which shares its base cell's background, so the fill color is unaffected.
+		/// </remarks>
+		private static void MarkLineFillToWidth<TSink>(ref TSink cells) where TSink : struct, ICellSink
+		{
+			if (cells.Count == 0)
+				return;
+
+			var last = cells[cells.Count - 1];
+			if (last.Character.Value == RowBreakSentinelRune)
+				return;
+
+			last.FillToWidth = true;
+			cells[cells.Count - 1] = last;
 		}
 
 		/// <summary>
@@ -343,7 +392,7 @@ namespace SharpConsoleUI.Parsing
 		/// rune was already sanitized by the caller, so this is safe. Skips over a trailing wide-continuation
 		/// cell to land on the base cell. No-op if there is no base cell.
 		/// </summary>
-		private static void AppendClusterRune(List<Cell> cells, Rune continuation)
+		private static void AppendClusterRune<TSink>(ref TSink cells, Rune continuation) where TSink : struct, ICellSink
 		{
 			if (cells.Count == 0) return;
 			var lastIdx = cells.Count - 1;
@@ -387,43 +436,99 @@ namespace SharpConsoleUI.Parsing
 		internal static string CellsToMarkup(List<Cell> cells, Color defaultFg, Color defaultBg)
 		{
 			var sb = new System.Text.StringBuilder();
-			bool open = false;
-			Color curFg = defaultFg, curBg = defaultBg;
-			TextDecoration curDec = TextDecoration.None;
+			var writer = new MarkupRunWriter(sb, defaultFg, defaultBg, alwaysTag: false);
 
 			foreach (var cell in cells)
 			{
-				if (cell.IsWideContinuation) continue;
+				writer.Append(cell.Character, cell.Foreground, cell.Background,
+					cell.Decorations, cell.IsWideContinuation, cell.Combiners);
+			}
 
-				bool styled = cell.Foreground != defaultFg || cell.Background != defaultBg
-					|| cell.Decorations != TextDecoration.None;
+			writer.Close();
+			return sb.ToString();
+		}
 
-				// Close the current run if the style changed (or we're leaving a styled run for a plain one).
-				if (open && (cell.Foreground != curFg || cell.Background != curBg || cell.Decorations != curDec))
+		/// <summary>
+		/// Writes cells as markup, opening a tag only where the style changes.
+		/// </summary>
+		/// <remarks>
+		/// Shared by the soft-wrap path (<see cref="CellsToMarkup"/>, which re-emits a wrapped
+		/// line's inline style) and by surface export. They differ only in
+		/// <c>alwaysTag</c>: a wrapped line sits inside a control that already has a default
+		/// style, so a run matching it needs no tag, while an exported screenshot has no
+		/// ambient default and must state every colour.
+		/// </remarks>
+		internal struct MarkupRunWriter
+		{
+			private readonly System.Text.StringBuilder _sb;
+			private readonly Color _defaultFg;
+			private readonly Color _defaultBg;
+			private readonly bool _alwaysTag;
+
+			private bool _open;
+			private Color _curFg;
+			private Color _curBg;
+			private TextDecoration _curDec;
+
+			internal MarkupRunWriter(System.Text.StringBuilder sb, Color defaultFg, Color defaultBg,
+				bool alwaysTag)
+			{
+				_sb = sb;
+				_defaultFg = defaultFg;
+				_defaultBg = defaultBg;
+				_alwaysTag = alwaysTag;
+				_open = false;
+				_curFg = defaultFg;
+				_curBg = defaultBg;
+				_curDec = TextDecoration.None;
+			}
+
+			/// <summary>Appends one cell, opening or closing a run as the style requires.</summary>
+			internal void Append(Rune character, Color fg, Color bg, TextDecoration dec,
+				bool isWideContinuation, string? combiners)
+			{
+				// A wide glyph is carried by its lead cell and spans both columns; emitting
+				// the continuation too would double it.
+				if (isWideContinuation) return;
+
+				if (_open && (fg != _curFg || bg != _curBg || dec != _curDec))
 				{
-					sb.Append("[/]");
-					open = false;
+					_sb.Append("[/]");
+					_open = false;
 				}
 
-				if (styled && !open)
+				bool styled = _alwaysTag
+					|| fg != _defaultFg || bg != _defaultBg || dec != TextDecoration.None;
+
+				if (styled && !_open)
 				{
-					sb.Append('[').Append('#').Append(ColorHex(cell.Foreground));
-					if (cell.Background != defaultBg)
-						sb.Append(" on #").Append(ColorHex(cell.Background));
-					AppendDecorations(sb, cell.Decorations);
-					sb.Append(']');
-					open = true;
-					curFg = cell.Foreground; curBg = cell.Background; curDec = cell.Decorations;
+					_sb.Append('[').Append('#').Append(ColorHex(fg));
+					if (_alwaysTag || bg != _defaultBg)
+						_sb.Append(" on #").Append(ColorHex(bg));
+					AppendDecorations(_sb, dec);
+					_sb.Append(']');
+					_open = true;
+					_curFg = fg; _curBg = bg; _curDec = dec;
 				}
 
 				// Escape a literal '[' so it is not read as a tag on re-parse.
-				var s = cell.Character.ToString();
-				if (s == "[") sb.Append("[[");
-				else sb.Append(s);
+				var text = character.ToString();
+				if (text == "[") _sb.Append("[[");
+				else _sb.Append(text);
+
+				// Re-emit the combiner tail. Without this a grapheme is silently truncated to
+				// its base rune - "e" loses its accent, and a ZWJ family emoji loses all but
+				// its first member. The tail holds combining marks and ZWJ cluster
+				// continuations, never a '[', so it needs no escaping.
+				if (combiners != null) _sb.Append(combiners);
 			}
 
-			if (open) sb.Append("[/]");
-			return sb.ToString();
+			/// <summary>Closes any open run.</summary>
+			internal void Close()
+			{
+				if (_open) _sb.Append("[/]");
+				_open = false;
+			}
 		}
 
 		private static string ColorHex(Color c) => $"{c.R:X2}{c.G:X2}{c.B:X2}";
@@ -694,6 +799,48 @@ namespace SharpConsoleUI.Parsing
 		}
 
 		/// <summary>
+		/// Removes markup, stopping once <paramref name="maxVisible"/> characters survive.
+		/// </summary>
+		/// <param name="markup">The text to strip.</param>
+		/// <param name="maxVisible">How many stripped characters the caller can use.</param>
+		/// <remarks>
+		/// For a caller that only looks at what fits on screen, stripping the
+		/// rest of a cell that may hold a whole file allocates a second copy of
+		/// it to throw away. The bound is on the OUTPUT, so a value that is
+		/// mostly tags still yields as much text as asked for.
+		/// </remarks>
+		public static string Remove(string markup, int maxVisible)
+		{
+			if (string.IsNullOrEmpty(markup) || maxVisible <= 0)
+				return string.Empty;
+
+			// Already short enough that the bound cannot bite; the ordinary path
+			// is simpler and this keeps the two from disagreeing on small input.
+			if (markup.Length <= maxVisible)
+				return Remove(markup);
+
+			return Remove(markup[..Math.Min(markup.Length, Capped(maxVisible))]);
+		}
+
+		/// <summary>
+		/// How much input to read to be sure of producing a bounded amount of output.
+		/// </summary>
+		/// <remarks>
+		/// Markup only ever removes characters, so the output is never longer
+		/// than the input: reading the bound is enough. A little slack is added
+		/// so a tag sitting across the boundary does not cost the caller a
+		/// character it was entitled to.
+		/// </remarks>
+		private static int Capped(int maxVisible) => maxVisible + TagSlack;
+
+		/// <summary>Extra input read so a tag at the boundary does not eat a visible character.</summary>
+		/// <remarks>
+		/// A generous single tag. Reading a few more characters is free next to
+		/// the copy this exists to avoid.
+		/// </remarks>
+		private const int TagSlack = 64;
+
+		/// <summary>
 		/// Removes all markup tags from a string, returning only the plain text content.
 		/// Escaped brackets ([[, ]]) are converted to single brackets.
 		/// </summary>
@@ -797,6 +944,16 @@ namespace SharpConsoleUI.Parsing
 		/// </summary>
 		public static List<List<Cell>> ParseLines(string markup, int width, Color defaultFg, Color defaultBg, out List<List<LinkSpan>> linksPerLine, out List<bool> softWrapContinuation, Configuration.MarkdownStyle? markdownStyle = null)
 		{
+			// Markdown expansion is width-dependent (tables and rules). The cell parser and
+			// wrapping can also be used with already expanded content by MarkupControl.
+			if (!string.IsNullOrEmpty(markup) && width > 0)
+				markup = PreProcessMarkdownTags(markup, markdownStyle, width);
+			return ParseExpandedLines(markup, width, defaultFg, defaultBg, out linksPerLine, out softWrapContinuation);
+		}
+
+		internal static List<List<Cell>> ParseExpandedLines(string markup, int width, Color defaultFg, Color defaultBg,
+			out List<List<LinkSpan>> linksPerLine, out List<bool> softWrapContinuation)
+		{
 			linksPerLine = new List<List<LinkSpan>>();
 			softWrapContinuation = new List<bool>();
 			if (string.IsNullOrEmpty(markup) || width <= 0)
@@ -805,10 +962,6 @@ namespace SharpConsoleUI.Parsing
 				softWrapContinuation.Add(false);
 				return new List<List<Cell>> { new List<Cell>() };
 			}
-
-			// Expand any [markdown]…[/] regions before splitting on newlines,
-			// otherwise a multi-line region would be torn apart by the split.
-			markup = PreProcessMarkdownTags(markup, markdownStyle, width);
 
 			var result = new List<List<Cell>>();
 
@@ -821,10 +974,7 @@ namespace SharpConsoleUI.Parsing
 			// flagged unsafe and is not a bracket), so it preserves the style run AND marks exactly where the
 			// line break was; we then split the cell list on the sentinel cells (dropping them). This leaves
 			// the public Parse contract and all its other callers untouched.
-			string sentinelized = markup
-				.Replace("\r\n", RowBreakSentinel)
-				.Replace("\r", RowBreakSentinel)
-				.Replace("\n", RowBreakSentinel);
+			string sentinelized = SentinelizeLineBreaks(markup);
 
 			var flatCells = Parse(sentinelized, defaultFg, defaultBg, out var flatSpans);
 
@@ -837,7 +987,7 @@ namespace SharpConsoleUI.Parsing
 					continue;
 
 				int lineEnd = idx; // exclusive; the sentinel (if any) is excluded
-				var lineCells = flatCells.GetRange(lineStart, lineEnd - lineStart);
+				var lineCells = new CellSlice(flatCells, lineStart, lineEnd - lineStart);
 				// Re-base this logical line's link spans to line-local columns.
 				var lineSpans = new List<LinkSpan>();
 				foreach (var s in flatSpans)
@@ -845,12 +995,12 @@ namespace SharpConsoleUI.Parsing
 					int a = Math.Max(s.StartCol, lineStart);
 					int b = Math.Min(s.EndCol, lineEnd);
 					if (b > a)
-						lineSpans.Add(new LinkSpan(a - lineStart, b - lineStart, s.Url, s.Text));
+						lineSpans.Add(new LinkSpan(a - lineStart, b - lineStart, s.Url, s.Text, s.LinkIndex));
 				}
 
 				if (lineCells.Count <= width)
 				{
-					result.Add(lineCells);
+					result.Add(lineCells.GetRange(0, lineCells.Count));
 					linksPerLine.Add(lineSpans);
 					softWrapContinuation.Add(false); // single row of a hard logical line
 				}
@@ -1033,11 +1183,20 @@ namespace SharpConsoleUI.Parsing
 				}
 			}
 
-			// Parse background color
+			// Parse the background part. Tokenised like the foreground, because decorations
+			// may trail the background colour - "[red on blue bold]" is a natural way to
+			// write it, and parsing the remainder as one colour name silently dropped the
+			// decoration (the whole string "blue bold" is not a colour, so nothing matched).
 			if (!string.IsNullOrEmpty(bgPart))
 			{
-				if (TryParseColor(bgPart.Trim(), out var bgColor))
-					bg = bgColor;
+				var bgTokens = bgPart.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+				foreach (var token in bgTokens)
+				{
+					if (TryParseDecoration(token, out var d))
+						dec |= d;
+					else if (bg == null && TryParseColor(token, out var c))
+						bg = c;
+				}
 			}
 
 			return new MarkupStyle(fg, bg, dec);
@@ -1152,6 +1311,30 @@ namespace SharpConsoleUI.Parsing
 
 		#region Word Wrapping
 
+		// A logical line is a view of the flat parse. Only the final output rows own copies,
+		// avoiding a second full-line allocation before wrapping long lines.
+		private readonly struct CellSlice
+		{
+			private readonly IReadOnlyList<Cell> _cells;
+			private readonly int _offset;
+
+			public CellSlice(IReadOnlyList<Cell> cells, int offset, int count)
+			{
+				_cells = cells;
+				_offset = offset;
+				Count = count;
+			}
+
+			public int Count { get; }
+			public Cell this[int index] => _cells[_offset + index];
+			public List<Cell> GetRange(int start, int count)
+			{
+				var result = new List<Cell>(count);
+				for (int i = 0; i < count; i++) result.Add(this[start + i]);
+				return result;
+			}
+		}
+
 		/// <summary>True if the cell is a literal space usable as a wrap break point (not a wide-char continuation).</summary>
 		private static bool IsBreakableSpace(Cell cell)
 			=> cell.Character == new Rune(' ') && !cell.IsWideContinuation;
@@ -1163,7 +1346,7 @@ namespace SharpConsoleUI.Parsing
 		/// so each ideograph is its own break point, letting a long run fill the available width (#63).
 		/// Never breaks inside a wide-char pair.
 		/// </summary>
-		private static bool CanBreakBefore(List<Cell> cells, int idx, int start)
+		private static bool CanBreakBefore(CellSlice cells, int idx, int start)
 		{
 			if (idx <= start || idx >= cells.Count) return false;
 			// Never split a wide char from its continuation cell.
@@ -1186,22 +1369,62 @@ namespace SharpConsoleUI.Parsing
 		/// Returns the base <see cref="Rune"/> of the cell at <paramref name="idx"/>, stepping back over a
 		/// wide-char continuation cell to its lead cell so classification sees the real character.
 		/// </summary>
-		private static System.Text.Rune BaseRuneOf(List<Cell> cells, int idx)
+		private static System.Text.Rune BaseRuneOf(CellSlice cells, int idx)
 		{
 			if (idx > 0 && cells[idx].IsWideContinuation)
 				idx--;
 			return cells[idx].Character;
 		}
 
-		private static void WrapCellLine(List<Cell> cells, int width, List<List<Cell>> output)
+		private interface IWrappedRowSink
 		{
+			void Add(int start, int count, bool fillToWidth);
+		}
+
+		private readonly struct MaterializedRowSink(CellSlice cells, List<List<Cell>> output) : IWrappedRowSink
+		{
+			public void Add(int start, int count, bool fillToWidth)
+			{
+				var row = cells.GetRange(start, count);
+				if (fillToWidth && row.Count > 0)
+				{
+					var last = row[^1];
+					last.FillToWidth = true;
+					row[^1] = last;
+				}
+				output.Add(row);
+			}
+		}
+
+		private static void WrapCellLine(CellSlice cells, int width, List<List<Cell>> output)
+		{
+			var sink = new MaterializedRowSink(cells, output);
+			WrapCellRanges(cells, width, ref sink);
+		}
+
+		private static void WrapCellRanges<TSink>(CellSlice cells, int width, ref TSink output)
+			where TSink : struct, IWrappedRowSink
+		{
+			// [fillwidth] rides on the LINE's last cell, but the painter reads the flag from each
+			// PAINTED ROW's last cell — so wrapping has to re-attach it to every row it produces, not
+			// just the one that happens to inherit the original final cell.
+			//
+			// Two ways it was lost, both visible as a code block whose shading stops at the last
+			// character instead of running to the right edge:
+			//   1. GetRange gives the original last cell to the FINAL row only, so every earlier row
+			//      of a wrapped line painted an unshaded tail.
+			//   2. The emitter ends each code line with a PAD SPACE, and that space IS the flagged
+			//      cell — trailing-space trimming below discarded it along with the flag, so even the
+			//      final row lost it.
+			bool fillToWidth = cells.Count > 0 && cells[^1].FillToWidth;
+
 			int start = 0;
 			while (start < cells.Count)
 			{
 				int remaining = cells.Count - start;
 				if (remaining <= width)
 				{
-					output.Add(cells.GetRange(start, remaining));
+					output.Add(start, remaining, fillToWidth);
 					break;
 				}
 
@@ -1246,18 +1469,19 @@ namespace SharpConsoleUI.Parsing
 					count = 1;
 					while (start + count < cells.Count && cells[start + count].IsWideContinuation)
 						count++;
-					output.Add(cells.GetRange(start, count));
+					output.Add(start, count, fillToWidth);
 					start += count;
 					continue;
 				}
 
-				output.Add(cells.GetRange(start, count));
+				output.Add(start, count, fillToWidth);
 
 				// Skip leading spaces on next line
 				start = wordBreak;
 				while (start < cells.Count && IsBreakableSpace(cells[start]))
 					start++;
 			}
+
 		}
 
 		/// <summary>
@@ -1268,11 +1492,10 @@ namespace SharpConsoleUI.Parsing
 		/// so <c>linksPerLine</c> stays index-aligned with <c>rows</c>.
 		/// </summary>
 		private static void SliceSpansAcrossRows(
-			List<Cell> originalCells, List<List<Cell>> rows, int beforeRows,
+			CellSlice originalCells, List<List<Cell>> rows, int beforeRows,
 			List<LinkSpan> lineSpans, List<List<LinkSpan>> linksPerLine)
 		{
 			int cursor = 0;
-			var rowWindows = new List<(int from, int to)>();
 			for (int r = beforeRows; r < rows.Count; r++)
 			{
 				// Skip leading spaces between rows (WrapCellLine skips them).
@@ -1281,19 +1504,15 @@ namespace SharpConsoleUI.Parsing
 				int from = cursor;
 				int rowLen = rows[r].Count;
 				int to = Math.Min(originalCells.Count, from + rowLen);
-				rowWindows.Add((from, to));
 				cursor = to;
-			}
 
-			foreach (var (from, to) in rowWindows)
-			{
 				var rowSpans = new List<LinkSpan>();
 				foreach (var s in lineSpans)
 				{
 					int a = Math.Max(s.StartCol, from);
 					int b = Math.Min(s.EndCol, to);
 					if (b > a)
-						rowSpans.Add(new LinkSpan(a - from, b - from, s.Url, s.Text));
+						rowSpans.Add(new LinkSpan(a - from, b - from, s.Url, s.Text, s.LinkIndex));
 				}
 				linksPerLine.Add(rowSpans);
 			}
@@ -1456,7 +1675,7 @@ namespace SharpConsoleUI.Parsing
 		/// Each span overwrites the foreground color with interpolated gradient colors.
 		/// Inner decorations and background colors are preserved.
 		/// </summary>
-		private static void ApplyGradientSpans(List<Cell> cells, List<GradientSpan> spans)
+		private static void ApplyGradientSpans<TSink>(ref TSink cells, List<GradientSpan> spans) where TSink : struct, ICellSink
 		{
 			foreach (var span in spans)
 			{

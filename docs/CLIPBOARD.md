@@ -6,8 +6,9 @@ explains how copy and paste work, the remote/SSH behavior, and the configuration
 
 ## TL;DR
 
-- **Copy** writes the system clipboard via the local tool (`xclip`/`wl-copy`/`pbcopy`/`clip.exe`)
-  **and** emits an [OSC 52](#osc-52-the-remote-clipboard-escape) escape so the text also reaches the
+- **Copy** writes the system clipboard via the local tool (`xclip`/`wl-copy`/`pbcopy`/`clip.exe`) —
+  or, on a Linux desktop with none of those installed, [directly over X11](#linux-without-a-clipboard-tool)
+  — **and** emits an [OSC 52](#osc-52-the-remote-clipboard-escape) escape so the text also reaches the
   **local** clipboard over SSH. Belt-and-braces — it works whether the session is local or remote.
 - **Paste** uses the terminal's own paste. [Bracketed paste](#bracketed-paste) is enabled so a
   multi-line paste inserts as one atomic block (no runaway auto-indent), and `Ctrl+V` reads the
@@ -26,18 +27,96 @@ string text = ClipboardHelper.GetText(); // read back (local tool / in-process b
 
 `SetText` never throws — clipboard operations are best-effort.
 
+```csharp
+byte[]? png = ClipboardHelper.GetImage();              // may block, like GetText
+byte[]? ui  = ClipboardHelper.GetImageWithTimeout();   // bounded; use this on the UI thread
+```
+
+### Telling a timeout from an empty clipboard
+
+`GetTextWithTimeout` serves the in-process buffer when it gives up, so an empty clipboard and a
+slow owner come back looking identical. That is the right default for pasting, and wrong for
+anything choosing between formats.
+
+```csharp
+if (ClipboardHelper.TryGetTextWithTimeout(out string text) && text.Length > 0)
+    Paste(text);                                  // the clipboard really holds text
+else if (ClipboardHelper.GetImageWithTimeout() is { } bytes)
+    Attach(bytes);                                // no text, or the read never answered
+```
+
+False means the read did not finish in time. The text is still handed back, so a caller that
+ignores the bool behaves exactly as `GetTextWithTimeout` does. An empty clipboard returns true
+with an empty string: that is an answer, not a failure.
+
+## Reading images
+
+`GetImage` returns the clipboard image as **encoded file bytes**, or `null` when the clipboard holds
+no image or the backend cannot read one. The bytes decode with `PixelBuffer.FromStream`, so they are
+PNG, JPEG, BMP or GIF. PNG is asked for first wherever the clipboard offers it: it is lossless, every
+backend speaks it, and it is what a screenshot tool puts there.
+
+```csharp
+byte[]? bytes = ClipboardHelper.GetImageWithTimeout();
+if (bytes is not null)
+{
+    using var stream = new MemoryStream(bytes);
+    window.AddControl(Controls.Image(PixelBuffer.FromStream(stream)));
+}
+```
+
+Use `GetImageWithTimeout` from anything on the UI thread. It runs the read on a background thread and
+gives up when it does not finish, for the reason the text read does (issue #42): a stalled child
+process must never hold the render loop. **Unlike `GetTextWithTimeout` there is no fallback value.** A
+timeout returns `null` rather than the in-process buffer, because that buffer holds text and handing
+it back as an image would be a wrong answer rather than a degraded one.
+
+### What each backend can do
+
+| Backend | Image read | How |
+|---------|-----------|-----|
+| `WindowsClip` | yes | Win32, in-process. The registered `PNG` format first, else `CF_DIBV5`/`CF_DIB` with a reconstructed file header. Never spawns PowerShell. |
+| `WlClipboard` | yes | `wl-paste --list-types`, then `--type` the best image it names. |
+| `Xclip` | yes | `xclip -t TARGETS -o`, then `-t <type> -o`. |
+| `X11` | yes | `TARGETS` over the existing connection, then a conversion to `image/png`, reassembling INCR chunks as bytes. |
+| `Pbcopy` (macOS) | yes | AppleScript writes `«class PNGf»` to a temp file, which is read back and deleted. `pbpaste` itself is text only. |
+| **`Xsel`** | **no** | xsel cannot read a binary target at all. Returns `null`. |
+| `InternalFallback` | no | The in-process buffer holds text; there is no image in it. Returns `null`. |
+
+A clipboard DIB is headerless: it starts at `BITMAPINFOHEADER`, and a BMP file is that preceded by a
+14-byte `BITMAPFILEHEADER`. The pixel offset in that header is computed rather than copied, since it
+has to account for the DIB header's own size, a colour table when the depth has one, and the colour
+masks `BI_BITFIELDS` inserts. Getting it wrong does not fail; it decodes the palette as pixels.
+
+TIFF is never requested, even when a clipboard offers it, because no TIFF decoder is linked into the
+library. See [Image rendering](IMAGE_RENDERING.md).
+
 ## Opening URLs
 
-`SharpConsoleUI.Helpers.UrlLauncher` opens a URL in the platform's default browser — the natural
+`SharpConsoleUI.Helpers.UrlLauncher` opens a URL in the platform's default browser. The natural
 companion to the clickable links you can embed in markup and markdown:
 
 ```csharp
 UrlLauncher.Open("https://example.com");
+
+// Or ask whether anything was launched, and offer something else when not:
+if (!UrlLauncher.TryOpen(path))
+    ShowMessage($"No desktop to open it with. The file is at {path}");
 ```
 
-Cross-platform (uses the OS shell, falling back to `xdg-open` / `open`), **best-effort, and never
-throws** — a `null`/whitespace URL is a safe no-op, and a failed launch is swallowed. Wire it into a
-link click or an "Open in browser" action.
+Cross-platform, **best-effort, and never throws**: a null or whitespace URL is a safe no-op, and a
+failed launch is swallowed. Wire it into a link click or an "Open in browser" action.
+
+**It will not write over your UI.** On Linux and macOS the launcher runs with its stdin, stdout and
+stderr redirected away, because otherwise it and whatever it starts inherit the terminal this
+application is drawing on: xdg-open's own warnings land in the middle of the screen, and a handler
+that turns out to be a text browser takes the screen over completely. Windows keeps
+`UseShellExecute`, which is how a scheme reaches its registered handler there.
+
+**With no desktop it does not launch at all.** On Linux with neither `DISPLAY` nor
+`WAYLAND_DISPLAY`, xdg-open falls back to a text browser, so over SSH or on a server there is
+nothing good to launch into. `TryOpen` returns false in that case, which is what lets a caller print
+a path instead of silently doing nothing.
 
 ## How copy works
 
@@ -45,9 +124,9 @@ link click or an "Open in browser" action.
 
 1. **Emit OSC 52** (when enabled — see below) through the terminal's output stream. This is what
    reaches the **local** clipboard over SSH.
-2. **Run the local clipboard tool** (unchanged from earlier versions): `clip.exe` (Windows),
-   `pbcopy` (macOS), `wl-copy` / `xclip` / `xsel` (Linux), or an in-process buffer when none is
-   found.
+2. **Write the system clipboard**: through the Win32 clipboard API (Windows), `pbcopy` (macOS), or on
+   Linux the first backend that can reach the session — see [Linux backends](#linux-backends) — or an
+   in-process buffer when none can.
 
 Both run on every copy. On a local desktop the OSC 52 is harmless (the terminal either honors it —
 setting the same clipboard the local tool just set — or silently ignores an unknown escape). Over
@@ -63,6 +142,44 @@ the text to your machine.
 > expects: the POSIX tools (`xclip`/`wl-copy`/`pbcopy`/`xsel`) receive **UTF-8** on stdin, while
 > Windows `clip.exe` receives **UTF-16LE with a BOM** — `clip.exe` reads BOM-less stdin as the
 > legacy OEM/ANSI code page, so forcing UTF-8 into it would garble non-Latin-1 text.
+
+### Linux backends
+
+The backend is chosen once, on the first copy or paste, by what the **session** can reach — not only by
+what is installed:
+
+| Order | Backend | Used when |
+|---|---|---|
+| 1 | `wl-copy` / `wl-paste` | a Wayland session (`WAYLAND_DISPLAY`, or the default `wayland-0` socket) and wl-clipboard is installed |
+| 2 | `xclip` | an X11 display (`DISPLAY`) and xclip is installed |
+| 3 | `xsel` | an X11 display and xsel is installed |
+| 4 | **X11, built in** | an X11 display and **none** of the tools is installed |
+| 5 | in-process buffer | no display at all (SSH, a console) — OSC 52 still carries copies to your terminal |
+
+The tools keep their order, so a machine that copied through one still does. A tool is skipped when the
+session cannot use it — wl-copy with no Wayland compositor, xclip over SSH with no display — where it used to
+be chosen and fail every copy silently. `ClipboardHelper.Backend` reports the choice.
+
+Tools are found by a PATH lookup, not by running them, and their output is captured: a tool's error message
+("Nothing is copied", "Can't open display") never lands on the rendered UI.
+
+### Linux without a clipboard tool
+
+A stock GNOME or KDE desktop ships none of `wl-copy`, `xclip` or `xsel`, and VTE terminals (GNOME Terminal,
+Ptyxis, Console) ignore OSC 52 — so a copy used to reach nothing. The built-in X11 backend talks to
+**libX11** directly, which every X11 desktop has, and which GNOME and KDE also run under Wayland as
+**Xwayland**, bridged to the Wayland clipboard. Nothing to install, nothing to configure.
+
+- **Copy** makes the app the clipboard's owner; other apps' pastes are answered from a background thread.
+  Text of any size is sent — large copies in pieces (the X11 INCR protocol), as strict clients require.
+- **Paste** (`Ctrl+V`) reads the clipboard the same way, bounded by the usual timeout.
+- **On exit** the text is handed to the desktop's clipboard manager (the ICCCM `SAVE_TARGETS` handshake),
+  so a paste after the app has quit still finds it. GNOME keeps the copy itself instead, up to a size limit
+  — a copy of several hundred KB or more is pasteable while the app runs but not after it exits, as with any
+  X11 app on GNOME.
+- **Failures stay silent**: a missing libX11, a refused connection, or a lost display falls back to the
+  in-process buffer. Nothing is printed and the process is never ended by Xlib.
+- AOT-compatible: plain `DllImport` and function pointers, no runtime code generation.
 
 ### OSC 52: the remote-clipboard escape
 
@@ -81,7 +198,7 @@ library always emits a correct sequence when enabled; the terminal decides wheth
 |---|---|---|
 | Local (X11 / Wayland / macOS / Windows) | emitted (redundant) | Local clipboard via the local tool (and OSC 52 if the terminal honors it) |
 | SSH, plain terminal | emitted | **Local** clipboard (if the terminal supports OSC 52) |
-| SSH + **tmux** | emitted, **passthrough-wrapped** | **Local** clipboard — no `~/.tmux.conf` change needed |
+| SSH + **tmux** | emitted **twice**: plain, then passthrough-wrapped | **Local** clipboard, once tmux forwards either form — see below |
 | SSH + **screen** (`STY` set) | **skipped** | Server-side tool / in-process buffer (OSC 52 is unreliable under screen) |
 | Copy larger than ~74 KB | **skipped** | Local tool only (OSC 52 has terminal size limits) |
 
@@ -90,9 +207,20 @@ Session detection happens once at startup and is exposed (read-only) on
 
 ```csharp
 TerminalCapabilities.IsRemoteSession  // SSH_TTY or SSH_CONNECTION set
-TerminalCapabilities.IsTmux           // TMUX set — OSC 52 is passthrough-wrapped
+TerminalCapabilities.IsTmux           // TMUX set — OSC 52 is sent plain and passthrough-wrapped
 TerminalCapabilities.IsScreen         // STY set — OSC 52 skipped
 TerminalCapabilities.SupportsOsc52    // whether OSC 52 will be attempted (false under screen)
+```
+
+### tmux
+
+tmux forwards an application's OSC 52 to the outer terminal only when told to, and its defaults forward
+neither form (measured on tmux 3.6). Each form needs its own setting, so both are sent and either line in
+`~/.tmux.conf` is enough:
+
+```tmux
+set -g set-clipboard on        # forwards the plain sequence (and keeps a tmux buffer of it)
+set -g allow-passthrough on    # forwards the passthrough-wrapped one
 ```
 
 ## Configuration
@@ -146,8 +274,9 @@ public interface IPasteTarget
 
 Built-in editors implement it (`MultilineEditControl`, `PromptControl`, `TableControl`). `Ctrl+V`
 reads `ClipboardHelper.GetText()` (the local-session source); bracketed paste uses the
-terminal-delivered text. A read-only editor's `Paste` is a no-op; `PromptControl` (single-line)
-flattens embedded newlines to spaces.
+terminal-delivered text. A read-only editor's `Paste` is a no-op. `PromptControl` flattens embedded
+newlines to spaces when it is single-line (the default) and inserts them verbatim when
+`Multiline` is set; text longer than its `MaxLength` is truncated to fit rather than rejected.
 
 > **Remote paste note:** reading the clipboard *back* (`GetText`, the `Ctrl+V` source) reads the
 > **server-side** clipboard over SSH — most terminals disable OSC 52 clipboard *reads* for security,
@@ -174,8 +303,10 @@ dotnet run --project Examples/DemoApp
 
 ## Backward compatibility
 
-- The local clipboard tool still runs on every copy exactly as before; OSC 52 is added in front of
-  it and is a no-op on terminals that don't support it.
+- The local clipboard tool still runs on every copy exactly as before, wherever it can reach the
+  session; OSC 52 is added in front of it and is a no-op on terminals that don't support it.
+- The built-in X11 backend only takes the case that used to fall back to the in-process buffer, and
+  `ClipboardBackend.X11` is a new enum member added at the end.
 - `GetText` is unchanged.
 - All new surface (`Osc52Mode`, `MaxOsc52Bytes`, the `TerminalCapabilities` session flags,
   `IPasteTarget`) is additive; nothing existing was removed or changed in default behavior.

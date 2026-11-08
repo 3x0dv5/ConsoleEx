@@ -30,7 +30,12 @@ namespace SharpConsoleUI.Helpers
 		/// <summary>clip.exe / powershell Get-Clipboard (Windows).</summary>
 		WindowsClip,
 		/// <summary>In-process buffer — no system clipboard tool found.</summary>
-		InternalFallback
+		InternalFallback,
+		/// <summary>
+		/// The X11 clipboard through libX11 directly — no external tool. Used on an X11 display (including
+		/// Xwayland under GNOME and KDE Wayland sessions) when none of the clipboard tools is installed.
+		/// </summary>
+		X11
 	}
 
 	/// <summary>Controls whether OSC 52 clipboard escapes are emitted on copy.</summary>
@@ -46,17 +51,54 @@ namespace SharpConsoleUI.Helpers
 
 	/// <summary>
 	/// Cross-platform clipboard helper for console applications.
-	/// On Linux tries wl-clipboard, xclip, xsel.
-	/// Falls back to an in-process buffer when no external tool is available.
+	/// On Linux tries wl-clipboard (on a Wayland session), then xclip and xsel, then the X11 clipboard directly
+	/// through libX11 (on an X11 display), so a desktop needs no tool installed.
+	/// Falls back to an in-process buffer when no system clipboard is reachable.
 	/// Operations are best-effort and will not throw on failure.
 	/// </summary>
-	public static class ClipboardHelper
+	public static partial class ClipboardHelper
 	{
 		private const int ProcessTimeoutMs = 1000;
 
+		/// <summary>
+		/// The least a paste waits on the X11 owner to answer. A cross-client read wakes another application and
+		/// waits for its reply, which is slower than reading a pipe from a tool we started — and a paste that
+		/// gives up too early does nothing at all, which reads as a broken key.
+		/// </summary>
+		private const int X11PasteTimeoutMs = 600;
+
 		private static ClipboardBackend _backend = ClipboardBackend.Unknown;
+
+		// THE NATIVE X11 CONNECTION, when that is the backend. It is the clipboard's owner for the whole run — an X11
+		// copy is served from this process, not stored by the server — and hands the text to the desktop's clipboard
+		// manager when the process exits.
+		private static X11Clipboard? _x11;
 		private static readonly object _lock = new();
 		private static string _internalBuffer = string.Empty;
+
+		// Count of Windows clipboard writes queued to the ThreadPool but not yet finished. A read
+		// that finds the clipboard empty while one is in flight prefers the in-process buffer, which
+		// already holds the copied text. See ReadWindowsClipboardOrBuffer.
+		private static int _pendingWindowsWrites;
+
+		// Serializes this process's OWN native clipboard access. OpenClipboard(NULL) associates the
+		// clipboard with the calling *task*, not the calling thread, so a second thread in the same
+		// process opens it successfully while the first still holds it — Windows gives us no
+		// cross-thread exclusion here. SetText runs its write on the ThreadPool (issue #42, so a copy
+		// never stalls the UI thread), so a write and a read overlap routinely: the writer's
+		// EmptyClipboard() frees the very block the reader has just obtained from GetClipboardData and
+		// locked, and the reader then locks, reads and unlocks freed memory. That corrupts the process
+		// heap, and Windows fast-fails with STATUS_HEAP_CORRUPTION (0xC0000374) — below the CLR, so
+		// there is no managed exception, no crash dump and nothing on stderr; the process simply
+		// vanishes mid-call. Two queued writes racing each other are unsafe for the same reason.
+		//
+		// Cost: a read can now wait behind an in-flight write. In the normal case the holder finishes
+		// in microseconds; the worst case is bounded by OpenClipboardWithRetry (8 x 25ms = 200ms) and
+		// only arises when another PROCESS is holding the clipboard for that whole budget — in which
+		// case the waiting call would have blocked on it anyway. That is well under the watchdog
+		// thresholds, but not far from the 250ms assertions in the clipboard tests; if those are ever
+		// tightened, this is the interaction to remember.
+		private static readonly object _nativeClipboardLock = new();
 
 		private static volatile Action<string>? _osc52Emitter;
 
@@ -88,9 +130,17 @@ namespace SharpConsoleUI.Helpers
 
 			try
 			{
-				var seq = Osc52.BuildSequence(text, tmuxWrap: TerminalCapabilities.IsTmux, MaxOsc52Bytes);
-				if (seq != null)
-					emitter(seq);
+				var seq = Osc52.BuildSequence(text, tmuxWrap: false, MaxOsc52Bytes);
+				if (seq == null)
+					return;
+				emitter(seq);
+
+				// UNDER TMUX, BOTH FORMS, because each needs a different tmux setting and neither is the default: tmux
+				// forwards the plain sequence to the outer terminal with `set-clipboard on`, and the passthrough-wrapped
+				// one with `allow-passthrough on`. Sending both makes either setting enough. A form tmux does not
+				// forward is dropped there, and where both are forwarded the second sets the same text again.
+				if (TerminalCapabilities.IsTmux && Osc52.BuildSequence(text, tmuxWrap: true, MaxOsc52Bytes) is { } wrapped)
+					emitter(wrapped);
 			}
 			catch
 			{
@@ -140,13 +190,22 @@ namespace SharpConsoleUI.Helpers
 					// Run it OFF the UI thread: OpenClipboard can block or fail when another process holds the
 					// clipboard (Windows clipboard-history, the terminal's own paste handling, AV), so a copy
 					// right after a paste could otherwise stall the UI thread and trip the watchdog
-					// (issue #42: "UI unresponsive after multiple copies"). The value is already mirrored into
-					// the in-process buffer synchronously above, so GetText() is correct immediately regardless
-					// of the background write's timing. Falls back to clip.exe if the native write fails.
+					// (issue #42: "UI unresponsive after multiple copies"). The value is mirrored into the
+					// in-process buffer synchronously above, and GetText() prefers that buffer while this
+					// write is still in flight, so a copy is readable immediately either way
+					// (see ReadWindowsClipboardOrBuffer). Falls back to clip.exe if the native write fails.
+					Interlocked.Increment(ref _pendingWindowsWrites);
 					ThreadPool.QueueUserWorkItem(_ =>
 					{
-						if (!TryWriteWindowsClipboard(text))
-							WriteToExternalTool(ClipboardBackend.WindowsClip, text);
+						try
+						{
+							if (!TryWriteWindowsClipboard(text))
+								WriteToExternalTool(ClipboardBackend.WindowsClip, text);
+						}
+						finally
+						{
+							Interlocked.Decrement(ref _pendingWindowsWrites);
+						}
 					});
 					break;
 				case ClipboardBackend.Pbcopy:
@@ -156,6 +215,10 @@ namespace SharpConsoleUI.Helpers
 					// External tools that block on a child process run off the UI thread.
 					var backend = _backend;
 					ThreadPool.QueueUserWorkItem(_ => WriteToExternalTool(backend, text));
+					break;
+				case ClipboardBackend.X11:
+					// Posted to the X11 thread, which takes ownership there: nothing here blocks.
+					_x11?.SetText(text);
 					break;
 				case ClipboardBackend.InternalFallback:
 				default:
@@ -217,7 +280,7 @@ namespace SharpConsoleUI.Helpers
 					// spawn was slow enough to trip the unresponsive-watchdog). UTF-16 native, so CJK/Cyrillic
 					// round-trip without code-page re-encoding. Falls back to powershell only if it returns null.
 					ClipboardBackend.WindowsClip =>
-						TryReadWindowsClipboard() ?? RunProcessRead("powershell.exe", "-command", "Get-Clipboard"),
+						ReadWindowsClipboardOrBuffer(),
 					ClipboardBackend.Pbcopy =>
 						RunProcessRead("pbpaste"),
 					ClipboardBackend.WlClipboard =>
@@ -226,6 +289,9 @@ namespace SharpConsoleUI.Helpers
 						RunProcessRead("xclip", "-selection", "clipboard", "-o"),
 					ClipboardBackend.Xsel =>
 						RunProcessRead("xsel", "--clipboard", "--output"),
+					// A READ THAT GOT NO ANSWER is not an empty clipboard: the buffer holds this process's last copy.
+					ClipboardBackend.X11 =>
+						_x11?.GetText(ProcessTimeoutMs) ?? GetInternalBuffer(),
 					_ =>
 						GetInternalBuffer()
 				};
@@ -253,6 +319,16 @@ namespace SharpConsoleUI.Helpers
 			if (_backend is ClipboardBackend.WindowsClip or ClipboardBackend.InternalFallback)
 				return GetText();
 
+			// The X11 read already runs on its own thread; waiting on it is the bound.
+			//
+			// AND IT WAITS ON ANOTHER APPLICATION. An X11 selection is served by whoever owns it, so a paste is a
+			// round trip to a browser or editor that must wake up and answer. 200ms is a sensible ceiling for a
+			// child process we spawn ourselves, but it is under what a cold owner takes, and the paste then
+			// silently did nothing. Nothing is being held here — the X thread does the waiting — so this path
+			// takes the longer bound while the default stays as it is for every other backend.
+			if (_backend == ClipboardBackend.X11)
+				return _x11?.GetText(Math.Max(timeoutMs, X11PasteTimeoutMs)) ?? GetInternalBuffer();
+
 			// Unix process-backed read: do it off-thread, bounded by the timeout.
 			string? result = null;
 			var done = new ManualResetEventSlim(false);
@@ -270,6 +346,63 @@ namespace SharpConsoleUI.Helpers
 			return GetInternalBuffer();
 		}
 
+		/// <summary>
+		/// Reads the clipboard text, reporting whether the read actually answered.
+		/// </summary>
+		/// <param name="text">The clipboard text, or the in-process buffer when this returns false.</param>
+		/// <param name="timeoutMs">How long to wait before giving up.</param>
+		/// <returns>False when the read timed out or failed, true when the answer is the clipboard's.</returns>
+		/// <remarks>
+		/// <para>
+		/// <see cref="GetTextWithTimeout"/> cannot tell a caller which happened: on a timeout it
+		/// serves the in-process buffer, which is whatever this application last copied, and an
+		/// empty clipboard and a slow owner come back looking the same.
+		/// </para>
+		/// <para>
+		/// That matters to anything choosing between formats. A composer that pastes text when the
+		/// clipboard holds text and an image otherwise reads a stalled owner as "there is text" and
+		/// never looks for the image. With this it can tell the difference and go and ask.
+		/// </para>
+		/// </remarks>
+		public static bool TryGetTextWithTimeout(out string text, int timeoutMs = 200)
+		{
+			EnsureDetected();
+
+			// In-process reads cannot stall on another application: whatever they say is the answer.
+			if (_backend is ClipboardBackend.WindowsClip or ClipboardBackend.InternalFallback)
+			{
+				text = GetText();
+				return true;
+			}
+
+			if (_backend == ClipboardBackend.X11)
+			{
+				string? x11 = _x11?.GetText(Math.Max(timeoutMs, X11PasteTimeoutMs));
+				text = x11 ?? GetInternalBuffer();
+				return x11 != null;
+			}
+
+			string? result = null;
+			var done = new ManualResetEventSlim(false);
+			ThreadPool.QueueUserWorkItem(_ =>
+			{
+				try { result = GetText(); }
+				catch { /* a failed read is not an answer */ }
+				finally { done.Set(); }
+			});
+
+			if (done.Wait(timeoutMs) && result != null)
+			{
+				text = result;
+				return true;
+			}
+
+			// The buffer is still handed back, so a caller that does not care can ignore the bool
+			// and behave exactly as GetTextWithTimeout does.
+			text = GetInternalBuffer();
+			return false;
+		}
+
 		private static string GetInternalBuffer()
 		{
 			lock (_lock) { return _internalBuffer; }
@@ -280,6 +413,22 @@ namespace SharpConsoleUI.Helpers
 		/// clipboard round-trips can be made hermetic (use <see cref="ClipboardBackend.InternalFallback"/>
 		/// to route through the in-process buffer and avoid touching the real system clipboard).
 		/// </summary>
+		/// <summary>
+		/// Waits for background clipboard writes queued by <see cref="SetText"/> to finish, so a test
+		/// cannot observe a write queued by an earlier one. Returns false if they did not settle in time.
+		/// </summary>
+		internal static bool DrainPendingWritesForTests(int timeoutMs = 2000)
+		{
+			var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+			while (Volatile.Read(ref _pendingWindowsWrites) > 0)
+			{
+				if (DateTime.UtcNow >= deadline)
+					return false;
+				Thread.Sleep(10);
+			}
+			return true;
+		}
+
 		internal static void ForceBackendForTests(ClipboardBackend backend)
 		{
 			lock (_lock)
@@ -310,59 +459,157 @@ namespace SharpConsoleUI.Helpers
 				}
 				else
 				{
-					// Linux / FreeBSD — try Wayland first, then X11 tools
-					if (CanRun("wl-copy", "--version"))
-						_backend = ClipboardBackend.WlClipboard;
-					else if (CanRun("xclip", "-version"))
-						_backend = ClipboardBackend.Xclip;
-					else if (CanRun("xsel", "--version"))
-						_backend = ClipboardBackend.Xsel;
-					else
-						_backend = ClipboardBackend.InternalFallback;
+					// Linux / FreeBSD — by what the session can reach; see ChooseUnixBackend.
+					_backend = ChooseUnixBackend(UnixClipboardSession.Current, IsOnPath, OpenX11);
 				}
 			}
 		}
 
-		private static bool CanRun(string cmd, params string[] args)
+		/// <summary>What a Unix session can reach: a Wayland compositor, an X11 display, or neither.</summary>
+		/// <param name="HasWayland">A Wayland compositor's socket is reachable.</param>
+		/// <param name="HasX11Display">An X11 display is named — a real X server, or Xwayland.</param>
+		internal readonly record struct UnixClipboardSession(bool HasWayland, bool HasX11Display)
 		{
-			try
+			/// <summary>The session this process runs in, read from its environment.</summary>
+			public static UnixClipboardSession Current
 			{
-				var psi = new ProcessStartInfo(cmd)
+				get
 				{
-					RedirectStandardOutput = true,
-					RedirectStandardError = true,
-					UseShellExecute = false,
-					CreateNoWindow = true
-				};
-				foreach (var arg in args)
-					psi.ArgumentList.Add(arg);
-				using var p = Process.Start(psi);
-				if (p == null) return false;
-				p.WaitForExit(ProcessTimeoutMs);
-				return true;
+					// WAYLAND_DISPLAY, OR THE DEFAULT SOCKET: libwayland connects to $XDG_RUNTIME_DIR/wayland-0 when
+					// the variable is unset, so wl-copy still works in a shell that lost it (sudo -E, an old tmux server).
+					string? runtime = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
+					bool wayland = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY"))
+						|| (!string.IsNullOrEmpty(runtime) && File.Exists(Path.Combine(runtime, "wayland-0")));
+					bool x11 = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY"));
+					return new UnixClipboardSession(wayland, x11);
+				}
 			}
-			catch
+		}
+
+		/// <summary>
+		/// Picks the Linux/BSD backend: the first one that can reach this session's clipboard.
+		/// </summary>
+		/// <remarks>
+		/// <para>BY SESSION, NOT ONLY BY WHAT IS INSTALLED. wl-copy needs a Wayland compositor and xclip/xsel an X11
+		/// display; a tool chosen without one fails on every copy, silently, while another route would have worked —
+		/// wl-clipboard installed on an X11 session, or xclip over SSH with no display.</para>
+		///
+		/// <para>THE TOOLS KEEP THEIR ORDER AND COME FIRST, so a setup that copied before copies exactly as it did. The
+		/// native X11 clipboard takes only the case that used to fall to the in-process buffer: an X11 display —
+		/// including Xwayland, which GNOME and KDE bridge to the Wayland clipboard — with no tool installed.</para>
+		/// </remarks>
+		/// <param name="session">What the session can reach.</param>
+		/// <param name="isOnPath">Whether a tool is installed.</param>
+		/// <param name="openX11">Connects the native X11 clipboard; false when it cannot.</param>
+		internal static ClipboardBackend ChooseUnixBackend(UnixClipboardSession session, Func<string, bool> isOnPath,
+			Func<bool> openX11)
+		{
+			if (session.HasWayland && isOnPath("wl-copy"))
+				return ClipboardBackend.WlClipboard;
+			if (session.HasX11Display)
 			{
-				return false;
+				if (isOnPath("xclip"))
+					return ClipboardBackend.Xclip;
+				if (isOnPath("xsel"))
+					return ClipboardBackend.Xsel;
+				if (openX11())
+					return ClipboardBackend.X11;
 			}
+			return ClipboardBackend.InternalFallback;
+		}
+
+		/// <summary>
+		/// Whether <paramref name="command"/> is an executable file on PATH.
+		/// </summary>
+		/// <remarks>
+		/// A LOOKUP, NOT A RUN. Detection happens on the first copy, on the UI thread; starting each candidate tool to
+		/// see whether it exists cost a process per tool there, and up to a second each if one hung.
+		/// </remarks>
+		internal static bool IsOnPath(string command)
+		{
+			string? path = Environment.GetEnvironmentVariable("PATH");
+			if (string.IsNullOrEmpty(path))
+				return false;
+			foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+			{
+				try
+				{
+					string candidate = Path.Combine(dir, command);
+					if (!File.Exists(candidate))
+						continue;
+					if (OperatingSystem.IsWindows())
+						return true;
+					const UnixFileMode anyExecute = UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+					if ((File.GetUnixFileMode(candidate) & anyExecute) != 0)
+						return true;
+				}
+				catch
+				{
+					// An unreadable PATH entry is skipped, as a shell would.
+				}
+			}
+			return false;
+		}
+
+		private static bool OpenX11()
+		{
+			_x11 = X11Clipboard.TryOpen();
+			if (_x11 == null)
+				return false;
+
+			// THE TEXT OUTLIVES THE APP: an X11 copy is served by its owner, so without the handoff a paste after the
+			// app quits finds nothing. A process killed outright skips this, as it does with xclip's own owner.
+			AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+			{
+				try { _x11?.HandOffBeforeExit(); }
+				catch { }
+			};
+			return true;
 		}
 
 		private static void RunProcessWithInput(string cmd, string input, params string[] args)
 		{
+			var psi = ToolStartInfo(cmd, args);
+			psi.RedirectStandardInput = true;
+			psi.StandardInputEncoding = System.Text.Encoding.UTF8;
+			using var p = Process.Start(psi);
+			if (p == null) return;
+			DiscardOutput(p);
+			p.StandardInput.Write(input);
+			p.StandardInput.Close();
+			p.WaitForExit(ProcessTimeoutMs);
+		}
+
+		/// <summary>
+		/// The start info every clipboard tool runs with: no shell, no window, and its stdout and stderr captured.
+		/// </summary>
+		/// <remarks>
+		/// CAPTURED, BECAUSE AN INHERITED STREAM IS THE APP'S TERMINAL. A tool's message — "Nothing is copied" from
+		/// wl-paste on an empty clipboard, "Can't open display" from xclip over SSH — would otherwise be written over
+		/// the rendered UI, and stay there until the next full repaint.
+		/// </remarks>
+		internal static ProcessStartInfo ToolStartInfo(string cmd, params string[] args)
+		{
 			var psi = new ProcessStartInfo(cmd)
 			{
-				RedirectStandardInput = true,
-				StandardInputEncoding = System.Text.Encoding.UTF8,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
 				UseShellExecute = false,
 				CreateNoWindow = true
 			};
 			foreach (var arg in args)
 				psi.ArgumentList.Add(arg);
-			using var p = Process.Start(psi);
-			if (p == null) return;
-			p.StandardInput.Write(input);
-			p.StandardInput.Close();
-			p.WaitForExit(ProcessTimeoutMs);
+			return psi;
+		}
+
+		// DRAINED, NOT LEFT IN THE PIPE: xclip and wl-copy fork a child that serves the clipboard and inherits these
+		// pipes, and a tool that filled an unread pipe would block on its next write.
+		private static void DiscardOutput(Process p)
+		{
+			p.OutputDataReceived += static (_, _) => { };
+			p.ErrorDataReceived += static (_, _) => { };
+			p.BeginOutputReadLine();
+			p.BeginErrorReadLine();
 		}
 
 		/// <summary>
@@ -372,14 +619,11 @@ namespace SharpConsoleUI.Helpers
 		/// </summary>
 		private static void RunProcessWithUtf16BomInput(string cmd, string input)
 		{
-			var psi = new ProcessStartInfo(cmd)
-			{
-				RedirectStandardInput = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			};
+			var psi = ToolStartInfo(cmd);
+			psi.RedirectStandardInput = true;
 			using var p = Process.Start(psi);
 			if (p == null) return;
+			DiscardOutput(p);
 			// Write the raw bytes ourselves: BOM + UTF-16LE. Going through the BaseStream avoids
 			// the StreamWriter re-encoding to the console code page.
 			byte[] payload = BuildUtf16BomBytes(input);
@@ -407,22 +651,44 @@ namespace SharpConsoleUI.Helpers
 			return payload;
 		}
 
-		private static string RunProcessRead(string cmd, params string[] args)
+		/// <summary>
+		/// Number of times a clipboard read has fallen back to spawning an external process.
+		/// </summary>
+		/// <remarks>
+		/// Exists so a test can assert WHICH path ran instead of inferring it from a stopwatch. The
+		/// regression it guards is issue #42: a read that spawns powershell.exe on the UI thread was
+		/// slow enough to trip the unresponsive watchdog. Timing that indirectly needs many live
+		/// round-trips against the real system clipboard, which is machine-global shared state.
+		/// </remarks>
+		internal static int ProcessReadCount => Volatile.Read(ref _processReadCount);
+
+		private static int _processReadCount;
+
+		/// <summary>Resets <see cref="ProcessReadCount"/>. For tests.</summary>
+		internal static void ResetProcessReadCountForTests() => Volatile.Write(ref _processReadCount, 0);
+
+		internal static string RunProcessRead(string cmd, params string[] args)
 		{
-			var psi = new ProcessStartInfo(cmd)
-			{
-				RedirectStandardOutput = true,
-				StandardOutputEncoding = System.Text.Encoding.UTF8,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			};
-			foreach (var arg in args)
-				psi.ArgumentList.Add(arg);
+			Interlocked.Increment(ref _processReadCount);
+
+			var psi = ToolStartInfo(cmd, args);
+			psi.StandardOutputEncoding = System.Text.Encoding.UTF8;
 			using var p = Process.Start(psi);
 			if (p == null) return string.Empty;
-			string result = p.StandardOutput.ReadToEnd();
+			p.ErrorDataReceived += static (_, _) => { };
+			p.BeginErrorReadLine();
+
+			// THE TIMEOUT BOUNDS THE READ, not only the exit. Reading to the end first waited for the tool however long
+			// it took — and a paste from an owner that never answers takes forever, holding this thread with it.
+			var output = p.StandardOutput.ReadToEndAsync();
+			if (!output.Wait(ProcessTimeoutMs))
+			{
+				try { p.Kill(entireProcessTree: true); }
+				catch { }
+				return string.Empty;
+			}
 			p.WaitForExit(ProcessTimeoutMs);
-			return result;
+			return output.Result;
 		}
 
 		#region Windows native clipboard (Win32 API)
@@ -463,11 +729,66 @@ namespace SharpConsoleUI.Helpers
 		/// Reads CF_UNICODETEXT from the Windows clipboard via the Win32 API. Returns the text, or
 		/// <c>null</c> on any failure (so the caller can fall back to the powershell path). Never throws.
 		/// </summary>
+		/// <summary>
+		/// Reads the Windows clipboard, falling back to the in-process buffer when the system
+		/// clipboard cannot be read or has not caught up with a copy still in flight.
+		/// </summary>
+		/// <remarks>
+		/// Two cases make the system clipboard the wrong answer, and both used to surface as an
+		/// empty string:
+		///
+		/// <para>The system clipboard cannot be read at all — no window station (a service, a CI
+		/// runner), or another process holding it past the retry budget. <see cref="TryReadWindowsClipboard"/>
+		/// reports that as null, distinct from the empty string it returns when the clipboard genuinely
+		/// holds no text, so the two are not conflated here.</para>
+		///
+		/// <para><see cref="SetText"/> writes the system clipboard on a background thread (issue #42:
+		/// doing it inline stalled the UI thread). A read immediately after a copy can therefore
+		/// observe the clipboard before that write lands, while the in-process buffer already holds
+		/// the copied text. A caller that just copied must never be told the clipboard is empty.</para>
+		/// </remarks>
+		private static string ReadWindowsClipboardOrBuffer()
+		{
+			string? system = TryReadWindowsClipboard();
+
+			if (system == null)
+			{
+				// The Win32 read failed outright. When this process is the one that last copied, the
+				// buffer already holds that text — answer from it rather than spawning powershell.exe,
+				// which costs up to ProcessTimeoutMs and is the very stall the native path exists to
+				// avoid (issue #42).
+				string buffered = GetInternalBuffer();
+				if (buffered.Length > 0)
+					return buffered;
+
+				// Nothing copied by us: fall back to powershell for text another process put there.
+				try { return RunProcessRead("powershell.exe", "-command", "Get-Clipboard"); }
+				catch { return string.Empty; }
+			}
+
+			// A copy of ours is still in flight, so whatever the clipboard currently holds predates it
+			// — an empty clipboard on a headless host, or the PREVIOUS value on a real desktop, where
+			// the read succeeds and returns stale text. Either way the buffer holds what SetText was
+			// asked to copy, so it is the answer until the write lands.
+			if (Volatile.Read(ref _pendingWindowsWrites) > 0)
+				return GetInternalBuffer();
+
+			return system;
+		}
+
 		private static string? TryReadWindowsClipboard()
 		{
 			if (!OperatingSystem.IsWindows())
 				return null;
 
+			// A concurrent write must not EmptyClipboard() the block this read has locked.
+			lock (_nativeClipboardLock)
+				return TryReadWindowsClipboardCore();
+		}
+
+		/// <summary>The body of <see cref="TryReadWindowsClipboard"/>, called under the native lock.</summary>
+		private static string? TryReadWindowsClipboardCore()
+		{
 			try
 			{
 				if (!OpenClipboardWithRetry())
@@ -483,7 +804,22 @@ namespace SharpConsoleUI.Helpers
 						return null;
 					try
 					{
-						return Marshal.PtrToStringUni(pointer) ?? string.Empty;
+						// Bound the read by the block's real size. Marshal.PtrToStringUni(pointer) walks
+						// memory until it finds a NUL, so a CF_UNICODETEXT block that is not
+						// NUL-terminated — which a misbehaving producer can put on the clipboard — reads
+						// past the end of the allocation. An access violation there is not catchable and
+						// takes the process down. The format's contract says terminated; nothing enforces
+						// it, and this code is reading another process's memory.
+						nuint bytes = GlobalSize(handle);
+						if (bytes == 0)
+							return string.Empty;
+
+						int chars = (int)Math.Min(bytes / sizeof(char), int.MaxValue);
+						string raw = Marshal.PtrToStringUni(pointer, chars) ?? string.Empty;
+
+						// The block is sized, not trimmed: everything from the terminator on is padding.
+						int nul = raw.IndexOf('\0');
+						return nul >= 0 ? raw.Substring(0, nul) : raw;
 					}
 					finally
 					{
@@ -511,6 +847,15 @@ namespace SharpConsoleUI.Helpers
 			if (!OperatingSystem.IsWindows())
 				return false;
 
+			// EmptyClipboard() below frees the handle the clipboard currently owns, which a concurrent
+			// read may have locked.
+			lock (_nativeClipboardLock)
+				return TryWriteWindowsClipboardCore(text);
+		}
+
+		/// <summary>The body of <see cref="TryWriteWindowsClipboard"/>, called under the native lock.</summary>
+		private static bool TryWriteWindowsClipboardCore(string text)
+		{
 			try
 			{
 				if (!OpenClipboardWithRetry())
@@ -582,6 +927,9 @@ namespace SharpConsoleUI.Helpers
 
 		[DllImport("kernel32.dll", SetLastError = true)]
 		private static extern nint GlobalFree(nint hMem);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		private static extern nuint GlobalSize(nint hMem);
 
 		[DllImport("kernel32.dll", SetLastError = true)]
 		private static extern nint GlobalLock(nint hMem);

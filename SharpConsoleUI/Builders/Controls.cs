@@ -193,6 +193,12 @@ public static class Controls
 	public static TreeControlBuilder Tree() => new TreeControlBuilder();
 
 	/// <summary>
+	/// Creates a new standalone scrollbar control builder
+	/// </summary>
+	/// <returns>A new scrollbar control builder</returns>
+	public static ScrollbarBuilder Scrollbar() => new ScrollbarBuilder();
+
+	/// <summary>
 	/// Creates a new multiline edit control builder
 	/// </summary>
 	/// <param name="content">Optional initial content</param>
@@ -210,9 +216,9 @@ public static class Controls
 	/// </summary>
 	/// <param name="text">The FIGlet ASCII art text</param>
 	/// <returns>A new Figlet control builder</returns>
-	public static FigleControlBuilder Figlet(string? text = null)
+	public static FigletControlBuilder Figlet(string? text = null)
 	{
-		var builder = new FigleControlBuilder();
+		var builder = new FigletControlBuilder();
 		if (text != null)
 			builder.WithText(text);
 		return builder;
@@ -273,6 +279,12 @@ public static class Controls
 	public static LineGraphBuilder LineGraph() => new LineGraphBuilder();
 
 	/// <summary>
+	/// Creates a new chart builder
+	/// </summary>
+	/// <returns>A new chart builder</returns>
+	public static ChartBuilder Chart() => new ChartBuilder();
+
+	/// <summary>
 	/// Creates a new progress bar builder
 	/// </summary>
 	/// <returns>A new progress bar builder</returns>
@@ -289,6 +301,12 @@ public static class Controls
 	/// </summary>
 	/// <returns>A new table control builder</returns>
 	public static TableControlBuilder Table() => new TableControlBuilder();
+
+	/// <summary>
+	/// Creates a new tree table control builder
+	/// </summary>
+	/// <returns>A new tree table control builder</returns>
+	public static TreeTableControlBuilder TreeTable() => new TreeTableControlBuilder();
 
 	/// <summary>
 	/// Creates a new panel builder for bordered content panels
@@ -355,6 +373,27 @@ public static class Controls
 	/// </summary>
 	/// <returns>A new image control builder.</returns>
 	public static ImageControlBuilder Image() => new ImageControlBuilder();
+
+	/// <summary>
+	/// Creates a new surface view builder.
+	/// </summary>
+	/// <remarks>
+	/// A surface view shows a grid of cells that came from somewhere else -
+	/// another application over a diagnostics socket, a remote host, a recorded
+	/// session - rather than content of its own.
+	/// </remarks>
+	/// <param name="width">Optional view width in cells.</param>
+	/// <param name="height">Optional view height in cells.</param>
+	/// <returns>A new surface view builder.</returns>
+	public static SurfaceViewBuilder SurfaceView(int? width = null, int? height = null)
+	{
+		var builder = new SurfaceViewBuilder();
+
+		if (width.HasValue) builder.WithWidth(width.Value);
+		if (height.HasValue) builder.WithHeight(height.Value);
+
+		return builder;
+	}
 
 	/// <summary>
 	/// Creates a new canvas control builder.

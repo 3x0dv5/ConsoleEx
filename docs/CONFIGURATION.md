@@ -8,6 +8,8 @@ SharpConsoleUI provides comprehensive configuration options through `ConsoleWind
 - [ConsoleWindowSystemOptions](#consolewindowsystemoptions)
 - [Panel Configuration](#panel-configuration)
 - [Environment Variables](#environment-variables)
+  - [Diagnostics Socket](#diagnostics-socket)
+- [ControlDefaults](#controldefaults)
 - [Complete Configuration Examples](#complete-configuration-examples)
 - [RegistryConfiguration](#registryconfiguration)
 
@@ -72,8 +74,11 @@ rather than assignment.
 |----------|------|---------|-------------|
 | `WindowCycleKey` | `ConsoleKey?` | `ConsoleKey.T` | Ctrl+key that cycles windows. `null` disables it |
 | `ExitKey` | `ConsoleKey?` | `ConsoleKey.Q` | Ctrl+key that exits. `null` disables it |
+| `AltDigitSelectsWindow` | `bool` | `true` | Alt+1..9 activates a top-level window by taskbar index. `false` leaves the chord to your app |
 | `Watchdog` | `WatchdogOptions?` | `null` | Main-loop watchdog settings. `null` uses `new WatchdogOptions()` |
 | `InstallSynchronizationContext` | `bool` | `false` | Install a UI `SynchronizationContext` for the duration of `Run()`. See the caveat below |
+| `PipedInput` | `PipedInputOptions?` | `null` | Piped-stdin capture settings. `null` uses `new PipedInputOptions()` |
+| `Time` | `TimeOptions?` | `null` | Which clock each part of the system runs on. `null` means the real clock everywhere. See [Clocks](#clocks) |
 
 #### Diagnostics and testing
 
@@ -84,6 +89,7 @@ rather than assignment.
 | `DiagnosticsLayers` | `DiagnosticsLayers` | `All` | Which layers to capture diagnostics for |
 | `EnableQualityAnalysis` | `bool` | `false` | Enable render quality analysis |
 | `EnablePerformanceProfiling` | `bool` | `false` | Enable detailed performance profiling |
+| `DiagnosticsSocket` | `string?` | `null` | Open a diagnostics socket at this path, without a consent prompt. `null` means none unless `SHARPCONSOLEUI_DIAGNOSTICS_SOCKET` asks for one. See [Diagnostics Socket](#diagnostics-socket) |
 
 ### InstallSynchronizationContext
 
@@ -252,6 +258,46 @@ windowSystem.PanelStateService.ShowTopPanel = false;
 windowSystem.PanelStateService.ShowBottomPanel = true;
 ```
 
+## Clocks
+
+A test that needs to tell one double click from two slow ones otherwise waits out
+the real multi-click window, once per assertion. `TimeOptions` lets an application
+supply the clock each part of the system runs on, so a test can move time instead:
+
+```csharp
+var clock = new FakeTimeProvider();   // Microsoft.Extensions.TimeProvider.Testing
+
+var system = new ConsoleWindowSystem(driver,
+    ConsoleWindowSystemOptions.Create() with
+    {
+        Time = new TimeOptions { All = clock }
+    });
+```
+
+| Property | Controls |
+|----------|----------|
+| `All` | every part that does not name its own |
+| `Mouse` | the multi-click window |
+| `ScheduleRepaint` | controls that repaint on a cadence: a panel clock, an FPS readout, an indeterminate progress bar |
+| `Animation` | the per-frame animation delta - every tween, and animated desktop backgrounds |
+
+Each resolves **named, then `All`, then `TimeProvider.System`**. Configuring nothing
+changes nothing: every part runs on the real clock.
+
+The named ones exist because the parts measure different things, and a test usually
+wants one of them still: freezing the mouse clock to step a double click apart
+should not also stop a progress bar.
+
+```csharp
+// The mouse stops; everything else keeps running.
+Time = new TimeOptions { Mouse = clock }
+```
+
+**Frame pacing is not here, deliberately.** Frame-rate limiting is a statement about
+the terminal - do not redraw more than `TargetFPS` times a second - so it stays on
+the machine clock. Pacing on a configurable clock means a frozen one renders nothing
+at all and an application cannot start.
+
 ## Environment Variables
 
 ### Debug Logging
@@ -291,6 +337,48 @@ This allows enabling metrics without code changes:
 // Will check SHARPCONSOLEUI_PERF_METRICS environment variable
 var options = ConsoleWindowSystemOptions.Create();
 ```
+
+### Diagnostics Socket
+
+Ask a running application to open its diagnostics socket, so another program can
+read what it displays and drive it:
+
+```bash
+# A path of your choosing
+export SHARPCONSOLEUI_DIAGNOSTICS_SOCKET=/tmp/myapp.sock
+
+# Or 1, to have one picked for you: $XDG_RUNTIME_DIR with the pid in the name,
+# falling back to an owner-only directory inside the temp directory
+export SHARPCONSOLEUI_DIAGNOSTICS_SOCKET=1
+```
+
+**This route always asks first.** The application prints a consent prompt on the plain
+console, before it paints anything, and a bare Enter means no. That is deliberate: an
+environment variable is not consent, because it can be inherited from a shell profile,
+baked into a `.desktop` file or a systemd unit, or left over in a terminal from hours
+ago — and the socket lets another program both read the screen and press keys.
+
+Two cases skip the prompt:
+
+| Case | Why |
+|------|-----|
+| `ConsoleWindowSystemOptions.DiagnosticsSocket` set in code | A property cannot be inherited from a shell or a unit file, so it can only be there because someone wrote it there. Intended for tests and for an application's own `--debug-socket` flag. |
+| `HeadlessConsoleDriver` | There is no user to ask and no screen on display. Being headless is itself a compiled-in decision that the program runs unattended. |
+
+If the variable is set but stdin is not interactive, the socket does **not** open — "nobody
+is watching" has to mean no, since that is exactly the case a stray variable would exploit.
+
+```csharp
+// The no-prompt route, for an app's own debug flag
+var options = ConsoleWindowSystemOptions.Create() with
+{
+    DiagnosticsSocket = "/tmp/myapp.sock"
+};
+```
+
+See [Debugging](DEBUGGING.md) for the wire protocol, its verbs, who can
+reach the socket, and `cxdbg` — the attach-and-drive debugger
+(`dotnet tool install -g cxdbg`).
 
 ## Complete Configuration Examples
 
@@ -466,6 +554,52 @@ SHARPCONSOLEUI_PERF_METRICS=true dotnet run
 SHARPCONSOLEUI_DEBUG_LOG=/tmp/app.log SHARPCONSOLEUI_DEBUG_LEVEL=Debug dotnet run
 ```
 
+## ControlDefaults
+
+`ConsoleWindowSystemOptions` configures the *system*; `ControlDefaults` holds library-wide defaults
+that individual controls start from. Most are compile-time constants, but a few are settable at
+runtime — set them once at startup, before building your windows.
+
+### Mouse wheel step
+
+```csharp
+using SharpConsoleUI.Configuration;
+
+// Every control that has not overridden it, and windows too:
+ControlDefaults.DefaultScrollWheelLines = 3;
+```
+
+| Member | Default | Applies to |
+|--------|---------|------------|
+| `DefaultScrollWheelLines` | `1` | Every scrolling control that has not set its own `MouseWheelScrollSpeed` |
+| `DefaultWindowScrollWheelLines` | `3` | Scrolling a window itself |
+
+Values below 1 are clamped to 1.
+
+`DefaultWindowScrollWheelLines` **follows** `DefaultScrollWheelLines` when your application sets
+that, so the single assignment above changes the wheel step everywhere. Setting it explicitly pins
+it and stops it following:
+
+```csharp
+ControlDefaults.DefaultScrollWheelLines = 3;        // controls AND windows now move 3
+ControlDefaults.DefaultWindowScrollWheelLines = 5;  // windows now move 5, controls stay at 3
+```
+
+Individual controls override the default:
+
+```csharp
+var log = Controls.ScrollablePanel()
+    .WithMouseWheelScrollSpeed(5)   // this panel only
+    .Build();
+```
+
+`MouseWheelScrollSpeed` (and a matching `WithMouseWheelScrollSpeed(int)` builder method) is
+available on `ScrollablePanelControl`, `TableControl`, `TreeControl`, `MultilineEditControl`,
+`ListControl` and `HtmlControl`.
+
+> `DefaultScrollWheelLines` was a `const` before 2.6.9. It is now a settable static property so a
+> value set here is observed by code compiled against an earlier version.
+
 ## RegistryConfiguration
 
 Persistent key-value storage is configured separately via `RegistryConfiguration`, passed at construction:
@@ -491,3 +625,4 @@ See the [Registry guide](REGISTRY.md) for full documentation.
 - [State Services](STATE-SERVICES.md) - Runtime state management
 - [Registry](REGISTRY.md) - Persistent key-value storage
 - [Themes](THEMES.md) - Theme system and customization
+- [Debugging](DEBUGGING.md) - The diagnostics socket, its verbs, and `cxdbg`

@@ -55,10 +55,19 @@ public sealed class AnimationManager
 
 	/// <summary>
 	/// Advances all active animations by deltaTime and removes completed ones.
-	/// Delta time is capped to prevent animations completing instantly after idle periods.
+	/// Delta time is capped to prevent animations completing instantly after idle
+	/// periods, except for animations that ask for the raw delta via
+	/// <see cref="IAnimation.WantsUncappedDelta"/>.
 	/// </summary>
+	/// <remarks>
+	/// The cap is decided per animation rather than once per call, because the two
+	/// policies are both correct for different work: a tween wants smoothness, a
+	/// simulation wants its own clock. Both can be running at once.
+	/// </remarks>
 	public void Update(TimeSpan deltaTime)
 	{
+		if (!_isEnabled) return;
+
 		var capped = deltaTime.TotalMilliseconds > AnimationDefaults.MaxFrameDeltaMs
 			? TimeSpan.FromMilliseconds(AnimationDefaults.MaxFrameDeltaMs)
 			: deltaTime;
@@ -67,8 +76,9 @@ public sealed class AnimationManager
 		{
 			for (int i = _animations.Count - 1; i >= 0; i--)
 			{
-				_animations[i].Update(capped);
-				if (_animations[i].IsComplete)
+				var animation = _animations[i];
+				animation.Update(animation.WantsUncappedDelta ? deltaTime : capped);
+				if (animation.IsComplete)
 					_animations.RemoveAt(i);
 			}
 		}
@@ -148,13 +158,40 @@ public sealed class AnimationManager
 	/// <summary>
 	/// Adds a pre-built animation to the manager.
 	/// </summary>
-	public void Add(IAnimation animation)
+	/// <remarks>
+	/// Ignored while <see cref="IsEnabled"/> is false. Setting that false cancels
+	/// what is running, so accepting new ones would mean animations reappeared
+	/// after a user turned them off - which is not what turning them off means.
+	/// </remarks>
+	public void Add(IAnimation animation) => TryAdd(animation);
+
+	/// <summary>
+	/// Adds a pre-built animation and reports whether it was registered.
+	/// </summary>
+	/// <param name="animation">The animation to register.</param>
+	/// <returns>
+	/// True when the animation is now running; false when it was refused because
+	/// <see cref="IsEnabled"/> is false or the manager already holds
+	/// <see cref="AnimationDefaults.MaxConcurrentAnimations"/>.
+	/// </returns>
+	/// <remarks>
+	/// <see cref="Add"/> drops a refused animation silently, which costs a
+	/// decorative tween nothing. An animation that carries real work - a loop that
+	/// drives a simulation, say - cannot tell a successful registration from a
+	/// silent refusal, and a thing that simply never runs is hard to diagnose.
+	/// This overload answers that question; Add behaves exactly as it always did.
+	/// </remarks>
+	public bool TryAdd(IAnimation animation)
 	{
 		lock (_lock)
 		{
+			if (!_isEnabled) return false;
+
 			if (_animations.Count >= AnimationDefaults.MaxConcurrentAnimations)
-				return;
+				return false;
+
 			_animations.Add(animation);
+			return true;
 		}
 	}
 

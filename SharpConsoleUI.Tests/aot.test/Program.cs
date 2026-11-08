@@ -8,7 +8,7 @@
 
 // NativeAOT smoke test. Exercises a BROAD slice of the library — the window system,
 // ~40 controls, the markup parser, the [markdown] tag (Markdig), syntax highlighters,
-// Spectre.Console integration, AngleSharp (HtmlControl), ImageSharp (ImageControl), and
+// Spectre.Console integration, AngleSharp (HtmlControl), StbImageSharp (ImageControl), and
 // the two subprocess-backed controls (TerminalControl / VideoControl) — under a native
 // executable, then exits cleanly. Run by CI after `dotnet publish -p:PublishAot=true` to
 // prove the library stays AOT-compatible: an AOT runtime failure (reflection that only
@@ -26,6 +26,7 @@
 //   Whatever we start, we Stop/Dispose so no subprocess or read thread is orphaned.
 
 using System.ComponentModel;
+using System.Net.Sockets;
 using SharpConsoleUI;
 using SharpConsoleUI.Builders;
 using SharpConsoleUI.Controls;
@@ -38,9 +39,11 @@ using SharpConsoleUI.Imaging;
 using SharpConsoleUI.Layout;
 using SharpConsoleUI.Parsing;
 using Spectre.Console;
-// Spectre.Console's namespace also defines Color and TreeNode; alias the SharpConsoleUI
+// Spectre.Console's namespace also defines Color, TreeNode, TableRow and TreeGuide; alias the SharpConsoleUI
 // types so the rest of the file keeps referring to the library's versions.
 using Color = SharpConsoleUI.Color;
+using TableRow = SharpConsoleUI.Controls.TableRow;
+using TreeGuide = SharpConsoleUI.Controls.TreeGuide;
 using TreeNode = SharpConsoleUI.Controls.TreeNode;
 
 // PTY SHIM RE-ENTRY GUARD — must be the FIRST executable statement.
@@ -138,8 +141,10 @@ try
 	if (string.IsNullOrEmpty(converted))
 		return Fail("MarkdownToMarkup.Convert returned empty");
 
-	// 4. Syntax highlighters — regex highlighters + registry. Tokenize one line each.
-	foreach (var lang in new[] { "csharp", "bash", "json" })
+	// 4. Syntax highlighters — TextMate grammars + registry. Tokenize one line each.
+	//    "rust" and "sql" have no built-in registration: they prove the lazy TextMate fallback
+	//    (grammar load + Oniguruma native regex) works under NativeAOT.
+	foreach (var lang in new[] { "csharp", "bash", "json", "rust", "sql" })
 	{
 		var hl = SyntaxHighlighters.For(lang);
 		if (hl == null)
@@ -148,11 +153,22 @@ try
 		{
 			"csharp" => "public int X = 42; // comment",
 			"bash" => "echo \"hello $USER\" # comment",
+			"rust" => "fn main() { let x = 42; }",
+			"sql" => "SELECT id FROM users WHERE n = 1;",
 			_ => "{ \"key\": \"value\", \"n\": 123 }",
 		};
 		var (tokens, _) = hl.Tokenize(sample, 0, SyntaxLineState.Initial);
 		if (tokens == null || tokens.Count == 0)
 			return Fail($"highlighter \"{lang}\" produced no tokens");
+	}
+
+	// 4b. Multi-line parser state must survive under NativeAOT (TextMate IStateStack).
+	{
+		var cs = SyntaxHighlighters.For("csharp")!;
+		var (_, openState) = cs.Tokenize("/* open", 0, SyntaxLineState.Initial);
+		var (contTokens, _) = cs.Tokenize("still comment */ int x;", 1, openState);
+		if (contTokens.Count == 0)
+			return Fail("TextMate line state did not carry across lines");
 	}
 
 	// ---- 5. Broad control coverage. Grouped across several windows so layout is realistic. ----
@@ -219,6 +235,19 @@ try
 			Controls.ScrollablePanel()
 				.AddControl(Controls.Label("scrollable child one"))
 				.AddControl(Controls.Label("scrollable child two"))
+				.Build(),
+			// Standalone scrollbar: exercises the shared scrollbar engine's geometry, glyph
+			// rendering and palette resolution under AOT, on both axes.
+			Controls.Scrollbar()
+				.WithMaximum(100)
+				.WithViewportLength(10)
+				.WithValue(30)
+				.Build(),
+			Controls.Scrollbar()
+				.WithOrientation(ScrollbarOrientation.Horizontal)
+				.WithMaximum(80)
+				.WithViewportLength(20)
+				.WithValue(10)
 				.Build(),
 			Controls.HorizontalGrid()
 				.Column(c => c.Add(Controls.Label("left col")))
@@ -360,6 +389,58 @@ try
 		return Fail($"CanvasControl: {ex.Message}");
 	}
 
+	// 5i. SurfaceViewControl — shows another app's screen as cells. The cell
+	//     grid comes from outside the library (a diagnostics socket, a remote
+	//     host), so the Cell/Color marshalling and the explicit-size measure
+	//     path are what a trim failure would take out.
+	try
+	{
+		var rows = new List<IReadOnlyList<Cell>>();
+		for (int y = 0; y < 10; y++)
+		{
+			var row = new List<Cell>();
+			for (int x = 0; x < 30; x++)
+				row.Add(new Cell((char)('a' + ((x + y) % 26)), Color.White, Color.Black));
+
+			rows.Add(row);
+		}
+
+		int clicked = 0;
+
+		var view = Controls.SurfaceView(20, 6)
+			.WithSurface(rows)
+			.OnCellClicked((_, _) => clicked++)
+			.Build();
+
+		controlCount++;
+
+		var viewWindow = new Window(system) { Width = 40, Height = 12, Top = 1, Left = 1, Title = "surface" };
+		viewWindow.AddControl(view);
+		system.AddWindow(viewWindow);
+		for (int i = 0; i < 3; i++) system.ProcessOnce();
+
+		// Scrolling reads the grid at an offset, which is the other way the
+		// cell data is walked.
+		view.ScrollX = 4;
+		view.ScrollY = 2;
+		for (int i = 0; i < 2; i++) system.ProcessOnce();
+
+		if (view.SurfaceWidth != 30 || view.SurfaceHeight != 10)
+			return Fail($"SurfaceViewControl: surface is {view.SurfaceWidth}x{view.SurfaceHeight}, expected 30x10");
+
+		// An explicit size wins over the surface's own, so the view holds still
+		// while the screen it shows changes size.
+		if (view.ActualWidth != 20)
+			return Fail($"SurfaceViewControl: explicit width ignored, got {view.ActualWidth}");
+
+		system.CloseWindow(viewWindow, force: true);
+		_ = clicked;
+	}
+	catch (Exception ex)
+	{
+		return Fail($"SurfaceViewControl: {ex.Message}");
+	}
+
 	// 6. SpectreRenderableControl — wraps a Spectre IRenderable. Exercises Spectre.Console under AOT.
 	try
 	{
@@ -402,7 +483,7 @@ try
 		return Fail($"HtmlControl: {ex.Message}");
 	}
 
-	// 8. ImageControl — ImageSharp PNG decode under AOT (ImageSharp is an AOT risk).
+	// 8. ImageControl — PNG decode under AOT (image decoding is an AOT risk).
 	//    Decode a tiny in-memory 2x2 PNG via PixelBuffer.FromStream (exercises the real decoder).
 	try
 	{
@@ -418,7 +499,7 @@ try
 	}
 	catch (Exception ex)
 	{
-		return Fail($"ImageControl (ImageSharp): {ex.Message}");
+		return Fail($"ImageControl (StbImageSharp): {ex.Message}");
 	}
 
 	// 9. TerminalControl — ACTUALLY START a PTY-backed shell under AOT.
@@ -693,6 +774,250 @@ try
 		return Fail($"FormXml: {ex.GetType().Name}: {ex.Message}");
 	}
 
+	// 16. TreeTableControl — a nested tree built through its builder, sorted among siblings,
+	//     filtered by the hierarchy, expanded and collapsed with its events (a lazily loaded row
+	//     included), and a subclass defined in THIS assembly overriding the protected extension
+	//     points, so the derived-table surface is proven from outside the library under AOT.
+	try
+	{
+		int expansions = 0;
+		var treeBuilder = Controls.TreeTable()
+			.AddColumn("Item")
+			.AddColumn("Pts", TextJustification.Right, 4)
+			.Interactive()
+			.WithSorting()
+			.WithFiltering()
+			.WithGuide(TreeGuide.Ascii)
+			.OnRowExpansionChanging((_, e) =>
+			{
+				if (e.IsExpanded && e.Row.HasUnrealizedChildren)
+				{
+					e.Row.AddChild("Loaded later", "1");
+					e.Row.HasUnrealizedChildren = false;
+				}
+			})
+			.OnRowExpansionChanged((_, _) => expansions++);
+		var epic = treeBuilder.AddRootRow("Epic", "8");
+		epic.AddChild("Story b", "5").AddChild("Task", "2");
+		epic.AddChild("Story a", "3");
+		treeBuilder.AddRootRow(new TreeTableRow("Lazy", "1") { IsExpanded = false, HasUnrealizedChildren = true });
+		var tree = treeBuilder.Build();
+
+		var subclass = new SmokeTreeTable();
+		subclass.AddColumn("Item");
+		var folder = subclass.AddRootRow("zeta folder");
+		folder.AddChild("file");
+		subclass.AddRootRow("alpha file");
+		subclass.SortByColumn(0);
+
+		var treeWindow = new Window(system) { Width = 60, Height = 20, Top = 1, Left = 1, Title = "treetable" };
+		treeWindow.AddControl(tree);
+		treeWindow.AddControl(subclass);
+		system.AddWindow(treeWindow);
+		for (int i = 0; i < 3; i++) system.ProcessOnce();
+
+		tree.SortByColumn(0);
+		tree.ApplyFilter("task");
+		if (tree.RowCount != 3)
+			return Fail($"TreeTableControl filter kept {tree.RowCount} rows, expected Epic > Story b > Task");
+		tree.ClearFilter();
+		tree.Expand((TreeTableRow)tree.RootRows[1]);
+		tree.CollapseAll();
+		tree.ExpandAll();
+		if (expansions == 0 || tree.RowCount != 6)
+			return Fail($"TreeTableControl expansion: {expansions} events, {tree.RowCount} rows");
+		if (subclass.FirstDisplayed != "zeta folder")
+			return Fail("TreeTableControl subclass CompareSiblings override not applied");
+
+		for (int i = 0; i < 2; i++) system.ProcessOnce();
+		system.CloseWindow(treeWindow, force: true);
+		controlCount++;
+		Console.Error.WriteLine("AOT SMOKE NOTE: TreeTableControl (builder, sort, filter, events, lazy row, external subclass) exercised");
+	}
+	catch (Exception ex)
+	{
+		if (IsAotFailure(ex))
+			return Fail($"TreeTableControl AOT failure: {ex}");
+		return Fail($"TreeTableControl: {ex.GetType().Name}: {ex.Message}");
+	}
+
+	// 17. TreeTableControl.BindItems — a tree table bound to ObservableCollections of INPC items,
+	//     then the collections and an item changed: add, move, remove, a property change and a
+	//     replaced child collection. Delegates only, so no Expression is compiled; the generic
+	//     binding instantiated over a type from THIS assembly is what NativeAOT must keep.
+	try
+	{
+		var crate = new SmokeTreeItem("Crate", new SmokeTreeItem("Apples"), new SmokeTreeItem("Pears"));
+		var shelf = new System.Collections.ObjectModel.ObservableCollection<SmokeTreeItem> { crate, new SmokeTreeItem("Barrel") };
+		var bound = Controls.TreeTable()
+			.AddColumn("Item")
+			.BindItems(shelf, item => item.Children, item => [item.Name])
+			.Build();
+
+		var boundWindow = new Window(system) { Width = 60, Height = 20, Top = 1, Left = 1, Title = "bound treetable" };
+		boundWindow.AddControl(bound);
+		system.AddWindow(boundWindow);
+		for (int i = 0; i < 2; i++) system.ProcessOnce();
+
+		shelf.Add(new SmokeTreeItem("Sack"));
+		shelf.Move(2, 0);
+		crate.Children.RemoveAt(0);
+		crate.Name = "Big crate";
+		crate.Children = new System.Collections.ObjectModel.ObservableCollection<SmokeTreeItem>(crate.Children.Append(new SmokeTreeItem("Plums")));
+
+		var names = string.Join(",", bound.Rows.Select(row => row.Cells[0]));
+		if (names != "Sack,Big crate,Pears,Plums,Barrel")
+			return Fail($"BindItems rows out of step: {names}");
+
+		for (int i = 0; i < 2; i++) system.ProcessOnce();
+		system.CloseWindow(boundWindow, force: true);
+		controlCount++;
+		Console.Error.WriteLine("AOT SMOKE NOTE: TreeTableControl.BindItems (ObservableCollection + INPC items) exercised");
+	}
+	catch (Exception ex)
+	{
+		if (IsAotFailure(ex))
+			return Fail($"BindItems AOT failure: {ex}");
+		return Fail($"BindItems: {ex.GetType().Name}: {ex.Message}");
+	}
+
+
+// 18. Diagnostics socket — the JSON-lines debug channel. It is the library's only
+// System.Text.Json.Nodes user, and JsonArray.Add<T> creates values REFLECTIVELY, so a
+// regression there throws only when executed. Opening a real socket and round-tripping
+// the two array-building replies ('commands' and the unknown-command reply) is therefore
+// the only way to prove it: a build-time check cannot see it, and nothing else in this
+// smoke test reaches the socket.
+try
+{
+	string sockPath = Path.Combine(Path.GetTempPath(), $"sharpconsoleui-aotsmoke-{Environment.ProcessId}.sock");
+	File.Delete(sockPath);
+
+	using var diagDriver = new HeadlessConsoleDriver(80, 24);
+	var diagSystem = new ConsoleWindowSystem(
+		diagDriver,
+		SharpConsoleUI.Configuration.ConsoleWindowSystemOptions.Create() with { DiagnosticsSocket = sockPath });
+	try
+	{
+
+	// The option path opens the socket without prompting, by design: a property can only
+	// be set by code, never inherited from an environment the user did not choose.
+	for (int i = 0; i < 100 && !File.Exists(sockPath); i++)
+		Thread.Sleep(20);
+
+	if (!File.Exists(sockPath))
+		return Fail("diagnostics socket never appeared");
+
+	using (var client = new System.Net.Sockets.Socket(
+		System.Net.Sockets.AddressFamily.Unix,
+		System.Net.Sockets.SocketType.Stream,
+		System.Net.Sockets.ProtocolType.Unspecified))
+	{
+		client.Connect(new System.Net.Sockets.UnixDomainSocketEndPoint(sockPath));
+		using var stream = new NetworkStream(client, ownsSocket: false);
+		using var reader = new StreamReader(stream);
+		using var writer = new StreamWriter(stream) { AutoFlush = true };
+
+		reader.ReadLine();   // the hello banner
+
+		// 'commands' builds a JsonArray of 16 strings; 'nope' builds the same list on the
+		// error path. Both went through JsonArray.Add<T> before being made AOT-safe.
+		writer.WriteLine("{\"cmd\":\"commands\"}");
+		string? commands = reader.ReadLine();
+		if (commands == null || !commands.Contains("snapshot", StringComparison.Ordinal))
+			return Fail($"diagnostics 'commands' reply malformed: {commands ?? "<null>"}");
+
+		writer.WriteLine("{\"cmd\":\"nope\"}");
+		string? unknown = reader.ReadLine();
+		if (unknown == null || !unknown.Contains("known", StringComparison.Ordinal))
+			return Fail($"diagnostics unknown-command reply malformed: {unknown ?? "<null>"}");
+
+		// 'windows' and 'snapshot' cover the serializer's other array paths.
+		writer.WriteLine("{\"cmd\":\"windows\"}");
+		if (reader.ReadLine() is not { } windows || !windows.Contains("windows", StringComparison.Ordinal))
+			return Fail("diagnostics 'windows' reply malformed");
+
+		// Give the system a painted window so 'image' has a real buffer to encode.
+		var pngWindow = new Window(diagSystem) { Width = 40, Height = 10, Top = 1, Left = 1, Title = "PngProbe" };
+		pngWindow.AddControl(new MarkupControl(new List<string> { "[red]pixels[/]" }));
+		diagSystem.AddWindow(pngWindow);
+		for (int i = 0; i < 3; i++) diagSystem.ProcessOnce();
+
+		// 'image' runs StbImageWriteSharp over that buffer and base64s the result.
+		// Encoding is native code behind a managed wrapper, so only running it proves it.
+		writer.WriteLine("{\"cmd\":\"image\",\"window\":\"PngProbe\",\"cellWidth\":2,\"cellHeight\":4}");
+		if (reader.ReadLine() is not { } png)
+			return Fail("diagnostics 'image' produced no reply");
+		if (png.Contains("\"ok\":false", StringComparison.Ordinal))
+		{
+			// No composed buffer in this headless fixture is an environment skip, not an
+			// AOT failure - but anything else is real.
+			if (!png.Contains("console snapshot", StringComparison.OrdinalIgnoreCase))
+				return Fail($"diagnostics 'image' failed: {png}");
+			skips.Add("diagnostics image: no composed buffer in headless fixture");
+		}
+		else
+		{
+			if (!png.Contains("\"format\":\"png\"", StringComparison.Ordinal))
+				return Fail($"diagnostics 'image' reply malformed: {png[..Math.Min(200, png.Length)]}");
+
+			// Decode and check the PNG magic, so this cannot pass on a reply that merely
+			// SAYS png while the encoder produced nothing usable.
+			int di = png.IndexOf("\"data\":\"", StringComparison.Ordinal);
+			if (di < 0) return Fail("diagnostics 'image' returned no inline data");
+			di += 8;
+			int de = png.IndexOf('"', di);
+			byte[] raw = Convert.FromBase64String(png[di..de].Replace('-', '+').Replace('_', '/'));
+			if (raw.Length < 8 || raw[0] != 0x89 || raw[1] != (byte)'P' || raw[2] != (byte)'N' || raw[3] != (byte)'G')
+				return Fail($"diagnostics 'image' data is not a PNG ({raw.Length} bytes)");
+
+			Console.Error.WriteLine($"AOT SMOKE NOTE: diagnostics image encoded {raw.Length} bytes (PNG magic verified)");
+
+			// TGA and JPEG are separate native encoders in the same library, so passing
+			// on PNG says nothing about either. Each is checked by its own magic bytes.
+			foreach ((string fmt, Func<byte[], bool> ok, string shape) in new (string, Func<byte[], bool>, string)[]
+			{
+				("tga",  b => b.Length > 18, "header"),
+				("jpeg", b => b.Length > 3 && b[0] == 0xFF && b[1] == 0xD8, "SOI marker"),
+			})
+			{
+				writer.WriteLine($"{{\"cmd\":\"image\",\"format\":\"{fmt}\",\"window\":\"PngProbe\",\"cellWidth\":2,\"cellHeight\":4}}");
+				if (reader.ReadLine() is not { } reply)
+					return Fail($"diagnostics 'image' ({fmt}) produced no reply");
+				if (reply.Contains("\"ok\":false", StringComparison.Ordinal))
+					return Fail($"diagnostics 'image' ({fmt}) failed: {reply}");
+
+				int fi = reply.IndexOf("\"data\":\"", StringComparison.Ordinal);
+				if (fi < 0) return Fail($"diagnostics 'image' ({fmt}) returned no inline data");
+				fi += 8;
+				int fe = reply.IndexOf('"', fi);
+				byte[] bytes = Convert.FromBase64String(reply[fi..fe].Replace('-', '+').Replace('_', '/'));
+
+				if (!ok(bytes))
+					return Fail($"diagnostics 'image' ({fmt}) data has no valid {shape} ({bytes.Length} bytes)");
+
+				Console.Error.WriteLine($"AOT SMOKE NOTE: diagnostics image/{fmt} encoded {bytes.Length} bytes ({shape} verified)");
+			}
+		}
+	}
+
+	}
+	finally
+	{
+		// Shutdown closes the socket and removes its file.
+		diagSystem.Shutdown();
+	}
+
+	File.Delete(sockPath);
+	Console.Error.WriteLine("AOT SMOKE NOTE: diagnostics socket (JsonArray/JsonObject round-trip) exercised");
+}
+catch (Exception ex)
+{
+	if (IsAotFailure(ex))
+		return Fail($"diagnostics socket AOT failure: {ex}");
+	return Fail($"diagnostics socket: {ex.GetType().Name}: {ex.Message}");
+}
+
 }
 catch (Exception ex)
 {
@@ -710,10 +1035,12 @@ Console.Error.WriteLine(
 	$"AOT SMOKE OK: {controlCount} controls exercised (incl. NavigationView, TerminalControl + VideoControl actually started); " +
 	$"data binding (Bind/BindTwoWay via Expression interpreter) + [gradient=...] markup (typeof(Color).GetProperty) exercised; " +
 	$"markdown+highlighters+spectre+image AOT-clean; " +
-	$"HtmlControl exercised (AngleSharp + CSS calc(); IL2072 cleared via scoped suppression); " +
+	$"HtmlControl exercised (AngleSharp + CSS calc(), no trim suppression needed); " +
 	$"ChatTranscriptControl (thinking/streaming/gradient/alpha) exercised; " +
 	$"FormControl (builder, AddRadio<T>, GetValues, Submit) exercised; " +
 	$"FormXml (XDocument parse + runtime Regex validator) exercised; " +
+	$"TreeTableControl (builder, sort, filter, events, external subclass) + BindItems exercised; " +
+	$"diagnostics socket (System.Text.Json.Nodes round-trip) exercised; " +
 	$"{driver.ScreenSize.Width}x{driver.ScreenSize.Height} rendered.");
 return 0;
 
@@ -727,6 +1054,68 @@ static TreeNode[] MakeTree()
 	b.AddChild(new TreeNode("Grandchild B1"));
 	root.AddChild(b);
 	return new[] { root };
+}
+
+// An item for the BindItems section (17): a name and an observable collection of children, both
+// raising PropertyChanged, so the binding follows the item as well as its collections.
+sealed class SmokeTreeItem : INotifyPropertyChanged
+{
+	private string _name;
+	private System.Collections.ObjectModel.ObservableCollection<SmokeTreeItem> _children;
+
+	public SmokeTreeItem(string name, params SmokeTreeItem[] children)
+	{
+		_name = name;
+		_children = new System.Collections.ObjectModel.ObservableCollection<SmokeTreeItem>(children);
+	}
+
+	public event PropertyChangedEventHandler? PropertyChanged;
+
+	public string Name
+	{
+		get => _name;
+		set { _name = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Name))); }
+	}
+
+	public System.Collections.ObjectModel.ObservableCollection<SmokeTreeItem> Children
+	{
+		get => _children;
+		set { _children = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Children))); }
+	}
+}
+
+// A tree table derived OUTSIDE the library (section 16): its own row type, rows with children
+// sorted first, tags searched by the filter, and a two-cell expander. Everything it overrides is
+// protected API, so a trim or AOT gap in that surface fails here.
+sealed class SmokeTreeTable : TreeTableControl
+{
+	// Read through the protected mapping, as a derived table would.
+	public string FirstDisplayed => GetRow(GetDataRowIndex(0)).Cells[0];
+
+	protected override TreeTableRow CreateTreeRow(IReadOnlyList<string> cells) => new SmokeTreeRow(cells);
+
+	protected override int CompareSiblings(TableRow x, TableRow y, int columnIndex, SortDirection direction)
+	{
+		bool xNests = x is TreeTableRow { Children.Count: > 0 };
+		bool yNests = y is TreeTableRow { Children.Count: > 0 };
+		return xNests != yNests ? (xNests ? -1 : 1) : base.CompareSiblings(x, y, columnIndex, direction);
+	}
+
+	protected override bool IsFilterMatch(TableRow row, CompoundFilterExpression filter)
+		=> row.Tag is string tag && tag.Contains(filter.RawText, StringComparison.OrdinalIgnoreCase)
+			|| base.IsFilterMatch(row, filter);
+
+	protected override string GetExpanderMarkup(in TreeTableRowContext context)
+	{
+		if (context.HasChildren)
+			return context.IsExpanded ? "v " : "> ";
+		return context.ShowsExpanderGutter ? "  " : string.Empty;
+	}
+}
+
+sealed class SmokeTreeRow : TreeTableRow
+{
+	public SmokeTreeRow(IEnumerable<string> cells) : base(cells) { }
 }
 
 // Value enum for the RadioControl<T> / RadioGroup<T> AOT exercise (section 5f1).

@@ -22,9 +22,11 @@ namespace SharpConsoleUI.Controls
 		private Color? _messageRailColor;
 
 		/// <summary>
-		/// Gets or sets whether a message that has a footer shows a dim role-tinted left rail down its
-		/// body and footer. Defaults to <c>true</c>. The rail is footer-gated: plain (no-footer) messages
-		/// are unaffected.
+		/// Gets or sets whether messages show a dim role-tinted left rail down their body and footer.
+		/// Defaults to <c>true</c>. Railing is footer-gated by default — plain (no-footer) messages are
+		/// unaffected — but an individual message can opt in or out via
+		/// <see cref="SetMessageRail(ChatMessageId, bool?)"/>. This property is the transcript-wide switch:
+		/// setting it <c>false</c> suppresses every rail regardless of per-message overrides.
 		/// </summary>
 		public bool MessageRailEnabled
 		{
@@ -62,6 +64,73 @@ namespace SharpConsoleUI.Controls
 			set => SetProperty(ref _messageRailColor, value);
 		}
 
+		/// <summary>
+		/// Shows or hides ONE message's left rail explicitly, independently of whether it has footer chrome.
+		/// </summary>
+		/// <remarks>
+		/// By default the rail is footer-gated: a message is railed only when it has an actions row and/or a
+		/// status row. That makes the rail unreachable for a plain message — the only way to get one was to
+		/// add footer chrome the message did not otherwise need.
+		///
+		/// <para>Tri-state: <c>true</c> rails the message even with no footer, <c>false</c> suppresses the
+		/// rail even when it has one, and <c>null</c> restores the inherited footer-gated default so a
+		/// caller can undo an override without tracking what the default would have been.</para>
+		///
+		/// <para>Per-message rather than a property on the rows themselves, mirroring
+		/// <see cref="SetCompactFooter(ChatMessageId, bool)"/>: <see cref="ApplyGutter"/> re-derives the
+		/// gutter on every footer mutation, so a margin set directly would be silently overwritten by the
+		/// next status update.</para>
+		///
+		/// <para><see cref="MessageRailEnabled"/> still wins — it is the transcript-wide switch, and an
+		/// explicit per-message request cannot turn a rail on while rails are globally off.</para>
+		/// </remarks>
+		/// <param name="id">The message id.</param>
+		/// <param name="rail"><c>true</c> to rail, <c>false</c> to suppress, <c>null</c> to inherit.</param>
+		/// <exception cref="KeyNotFoundException">No message with the id exists.</exception>
+		public void SetMessageRail(ChatMessageId id, bool? rail)
+		{
+			var entry = Require(id);
+			if (entry.RailOverride == rail)
+				return;
+
+			entry.RailOverride = rail;
+			ApplyGutter(entry);
+			Invalidate(Invalidation.Relayout);
+		}
+
+		/// <summary>
+		/// Gets whether a message currently shows the left rail, whether from an explicit
+		/// <see cref="SetMessageRail(ChatMessageId, bool?)"/> or the footer-gated default.
+		/// </summary>
+		/// <param name="id">The message id.</param>
+		/// <exception cref="KeyNotFoundException">No message with the id exists.</exception>
+		public bool HasMessageRail(ChatMessageId id) => _messageRailEnabled && Require(id).WantsRail;
+
+		/// <summary>
+		/// Gives ONE message's rail its own colour, over its role's <see cref="ChatRoleStyle.RailColor"/>,
+		/// <see cref="MessageRailColor"/> and the derived default — so a message of a different kind can
+		/// be told apart at a glance. Does not turn the rail on; see <see cref="SetMessageRail"/>.
+		/// </summary>
+		/// <param name="id">The message id.</param>
+		/// <param name="color">The colour, or <c>null</c> to inherit.</param>
+		/// <exception cref="KeyNotFoundException">No message with the id exists.</exception>
+		public void SetMessageRailColor(ChatMessageId id, Color? color)
+		{
+			var entry = Require(id);
+			if (entry.RailColorOverride == color)
+				return;
+			entry.RailColorOverride = color;
+			Invalidate(Invalidation.Repaint);
+		}
+
+		/// <summary>The colour <see cref="SetMessageRailColor"/> gave a message's rail, or <c>null</c>
+		/// when it inherits.</summary>
+		/// <param name="id">The message id.</param>
+		public Color? GetMessageRailColor(ChatMessageId id) => Require(id).RailColorOverride;
+
+		/// <summary>Test-only: the colour a message's rail is painted in.</summary>
+		internal Color RailColorForTest(ChatMessageId id) => ResolveRailColor(Require(id));
+
 		#endregion
 
 		#region Gutter margin
@@ -73,12 +142,15 @@ namespace SharpConsoleUI.Controls
 		/// when the rail is enabled AND the message has a footer, otherwise <c>0</c>.
 		/// </summary>
 		/// <remarks>
-		/// Recomputes from <see cref="MessageEntry.HasFooter"/> on every call, so calling it after any
-		/// footer mutation self-corrects (footer gone → 0).
+		/// Recomputes from <see cref="MessageEntry.WantsRail"/> on every call, so calling it after any
+		/// footer mutation self-corrects (footer gone → 0, unless an explicit override says otherwise).
 		/// </remarks>
 		private void ApplyGutter(MessageEntry entry)
 		{
-			int g = (_messageRailEnabled && entry.HasFooter) ? _messageRailGutterWidth : 0;
+			// WantsRail, not HasFooter: an explicit SetMessageRail overrides footer presence in BOTH
+			// directions. PaintMessageRails reads the same rule, so the reserved column and the drawn
+			// glyph cannot disagree (an inset with no rail, or a rail painted over body text).
+			int g = (_messageRailEnabled && entry.WantsRail) ? _messageRailGutterWidth : 0;
 
 			// Inset the CHILDREN, never the panel (the header the panel draws stays flush at col 0). The
 			// collapsed peek row (when present) is part of the same bracketed unit, so it is inset too.
@@ -172,7 +244,7 @@ namespace SharpConsoleUI.Controls
 
 			foreach (var entry in _order)
 			{
-				if (!entry.HasFooter)
+				if (!entry.WantsRail)
 					continue;
 
 				// Find this message's panel slot and the bottom of its last footer sibling row. A slot's Height
@@ -186,7 +258,11 @@ namespace SharpConsoleUI.Controls
 					{
 						panelTop = slot.Top;
 						headerHeight = entry.Panel.HeaderHeight;
-						int b = slot.Top + slot.Height;
+						// Subtract the panel's own bottom margin, exactly as the footer rows below do. When
+						// footer/peek rows follow, ApplyGutter has already collapsed it to 0 and this is a
+						// no-op; a railed message with NO footer keeps its role bottom margin (the gap before
+						// the next message), and railing through it paints one row past the last body row.
+						int b = slot.Top + slot.Height - entry.Panel.Margin.Bottom;
 						if (b > bottom) bottom = b;
 					}
 					else if (ReferenceEquals(slot.Control, entry.PeekRow)
@@ -228,6 +304,11 @@ namespace SharpConsoleUI.Controls
 		/// </summary>
 		private Color ResolveRailColor(MessageEntry entry, Color defaultBg)
 		{
+			// The most specific colour wins: the message's own, then its role's, then the transcript's.
+			if (entry.RailColorOverride is { } own)
+				return own;
+			if (GetRoleStyle(entry.Role).RailColor is { } roleRail)
+				return roleRail;
 			if (_messageRailColor.HasValue)
 				return _messageRailColor.Value;
 
@@ -255,6 +336,9 @@ namespace SharpConsoleUI.Controls
 
 		/// <summary>Returns the left margin currently applied to the message's body (0 when it has none) (test-only seam).</summary>
 		internal int BodyLeftMarginForTest(ChatMessageId id) => Require(id).Body?.Margin.Left ?? 0;
+
+		/// <summary>Test-only: a message's body control.</summary>
+		internal MarkupControl? BodyForTest(ChatMessageId id) => Require(id).Body;
 
 		/// <summary>Returns the left margin of the message's <see cref="CollapsiblePanel"/> — must stay 0 so the header is flush (test-only seam).</summary>
 		internal int PanelLeftMarginForTest(ChatMessageId id) => Require(id).Panel.Margin.Left;

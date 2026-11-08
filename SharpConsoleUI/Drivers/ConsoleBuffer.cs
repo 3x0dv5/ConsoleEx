@@ -6,6 +6,7 @@
 // License: MIT
 // -----------------------------------------------------------------------
 
+using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 using SharpConsoleUI.Drivers.Input;
@@ -59,6 +60,45 @@ namespace SharpConsoleUI.Drivers
 		}
 
 		/// <summary>
+		/// How many frames this buffer has presented.
+		/// </summary>
+		/// <remarks>
+		/// Monotonic, and deliberately free of the diagnostics subsystem: a client that only
+		/// wants to know "has the screen changed since I last looked" should not have to
+		/// enable per-frame recording to find out. That is the common case for anything
+		/// streaming the screen, and the expensive answer is the wrong one for it.
+		/// <para><see cref="long"/>, not <see cref="int"/>: at 60fps an int overflows in
+		/// about thirteen months, and this library runs dashboards and monitors that stay up
+		/// for longer than that. Wrapping to negative would tell a client tracking the count
+		/// that the screen had gone backwards, and it would wait forever. A long outlasts
+		/// the hardware.</para>
+		/// <para>Read without a lock. A reader that sees a slightly stale value asks for one
+		/// more frame than it needed, which is harmless. A 64-bit read can tear on a 32-bit
+		/// runtime, so it is read through <see cref="Interlocked"/>.</para>
+		/// <para>MUST only ever increase, including across a resize - which replaces this
+		/// buffer entirely. A counter that restarted at zero would tell a client holding a
+		/// higher number that nothing had changed, and it would wait forever on a screen
+		/// that was in fact moving. <see cref="ResumeFrameNumberFrom"/> carries it over.</para>
+		/// </remarks>
+		public long FrameNumber => Interlocked.Read(ref _frameNumber);
+
+		private long _frameNumber;
+
+		/// <summary>
+		/// Continues the frame count from a buffer this one replaces.
+		/// </summary>
+		/// <param name="previous">The count reached by the outgoing buffer.</param>
+		/// <remarks>
+		/// A resize builds a new buffer. Monotonicity is the whole contract of the counter,
+		/// so the new one picks up where the old left off rather than restarting.
+		/// </remarks>
+		public void ResumeFrameNumberFrom(long previous)
+		{
+			if (previous > Interlocked.Read(ref _frameNumber))
+				Interlocked.Exchange(ref _frameNumber, previous);
+		}
+
+		/// <summary>
 		/// Gets or sets the diagnostics system for capturing rendering metrics.
 		/// </summary>
 		public Diagnostics.RenderingDiagnostics? Diagnostics
@@ -66,6 +106,20 @@ namespace SharpConsoleUI.Drivers
 			get => _diagnostics;
 			set => _diagnostics = value;
 		}
+
+		/// <summary>
+		/// When true, rendered frames are composed and diffed as usual but never written to the
+		/// process's stdout.
+		/// </summary>
+		/// <remarks>
+		/// For a driver that has no real console to write to. Without this, the fallback in
+		/// <c>WriteOutput</c> — <c>Console.Out.Write</c> whenever raw mode is inactive, which is always
+		/// on Windows and always for a headless driver — paints ANSI escape sequences into whatever
+		/// stdout happens to be. That is measurable: a headless render emitted ~4.6KB of frames,
+		/// contradicting the driver's own contract of capturing output rather than writing it, and
+		/// landing in the caller's data when stdout is redirected.
+		/// </remarks>
+		public bool SuppressConsoleOutput { get; set; }
 
 		/// <summary>
 		/// Initializes a new instance of the <see cref="ConsoleBuffer"/> class with the specified dimensions.
@@ -113,6 +167,12 @@ namespace SharpConsoleUI.Drivers
 		private Color _lastCellFg;
 		private Color _lastCellBg;
 		private TextDecoration _lastCellDecorations;
+
+		/// <summary>
+		/// Drops the cached SGR sequence, so the next cell rebuilds from scratch rather than matching
+		/// a value that does not describe the colours it is keyed on.
+		/// </summary>
+		private void InvalidateCellAnsiCache() => _lastCellAnsi = null;
 
 		/// <summary>
 		/// The foreground to actually emit for <paramref name="character"/>: the cell's own, unless it is a
@@ -203,12 +263,26 @@ namespace SharpConsoleUI.Drivers
 
 			sb.Append('m');
 
-			try { _lastCellAnsi = sb.ToString(); }
-			catch (ArgumentOutOfRangeException) { _lastCellAnsi = "\x1b[0m"; }
+			string ansi;
+			try
+			{
+				ansi = sb.ToString();
+			}
+			catch (ArgumentOutOfRangeException)
+			{
+				// A BARE RESET MUST NOT BE CACHED UNDER THESE COLOURS. Caching it keyed on the colours
+				// that were asked for made every later cell of the same colour return the reset too, so
+				// one transient failure left a whole run of cells unformatted with nothing to show why.
+				// Drop the cache instead: the next cell rebuilds, and only this one is wrong.
+				InvalidateCellAnsiCache();
+				return "\x1b[0m";
+			}
+
+			_lastCellAnsi = ansi;
 			_lastCellFg = fg;
 			_lastCellBg = bg;
 			_lastCellDecorations = decorations;
-			return _lastCellAnsi;
+			return ansi;
 		}
 
 		/// <summary>
@@ -490,6 +564,16 @@ namespace SharpConsoleUI.Drivers
 			return !_frontBuffer[x, y].Equals(_backBuffer[x, y]);
 		}
 
+		/// <summary>Milliseconds since a <see cref="Stopwatch"/> timestamp.</summary>
+		/// <remarks>
+		/// <see cref="Stopwatch.GetTimestamp"/> rather than a Stopwatch instance: the
+		/// stages are timed on the render path, and a long pair costs nothing to take
+		/// where allocating and starting an object per stage per frame would show up
+		/// in the very measurement it is taking.
+		/// </remarks>
+		private static double ElapsedMs(long since) =>
+			(Stopwatch.GetTimestamp() - since) * 1000.0 / Stopwatch.Frequency;
+
 		/// <summary>
 		/// Renders the back buffer to the console, updating only the changed portions.
 		/// </summary>
@@ -503,6 +587,11 @@ namespace SharpConsoleUI.Drivers
 		{
 			if (Lock)
 				return;
+
+			// Counted here rather than on a successful write: a frame that composed to no
+			// change is still a frame the caller has seen the result of, and a counter that
+			// stalled on an idle UI would be indistinguishable from a stalled render loop.
+			Interlocked.Increment(ref _frameNumber);
 
 			// Lock Console I/O to prevent concurrent input operations from being corrupted
 			lock (_consoleLock)
@@ -522,6 +611,11 @@ namespace SharpConsoleUI.Drivers
 				{
 					CaptureConsoleBufferSnapshot();
 				}
+
+				// Timed only when something is collecting: a Stopwatch per stage per
+				// frame is cheap, but not free, and the normal path should not pay for
+				// a measurement nobody asked for.
+				long compareStart = metrics != null ? Stopwatch.GetTimestamp() : 0;
 
 				// Pre-process wide character dirty pair coherence.
 				// The terminal treats wide chars as atomic 2-cell units, so when either half
@@ -552,12 +646,23 @@ namespace SharpConsoleUI.Drivers
 					}
 				}
 
+				if (metrics != null)
+				{
+					metrics.BufferComparisonTimeMs = ElapsedMs(compareStart);
+
+					// Measured by the render coordinator earlier in this same frame and
+					// left for us, since layout finishes before the buffer paints.
+					metrics.DomLayoutTimeMs = _diagnostics?.PendingLayoutMs ?? 0;
+				}
+
 				// Hide cursor during render — use raw write on Unix to bypass .NET entirely
 				WriteOutput("\x1b[?25l");
 
 				// Build entire screen in one string for atomic output
 				// This eliminates flickering by doing a single write instead of multiple cursor moves
 				_screenBuilder.Clear();
+
+				long ansiStart = metrics != null ? Stopwatch.GetTimestamp() : 0;
 
 				int cellsRendered = 0;
 
@@ -629,12 +734,20 @@ namespace SharpConsoleUI.Drivers
 					}
 				}
 
+				if (metrics != null)
+					metrics.AnsiGenerationTimeMs = ElapsedMs(ansiStart);
+
 				// Single atomic write of entire screen via raw libc write() on Unix
 				// Completely bypasses .NET's Console/StreamWriter/SyncTextWriter
+				long outputStart = metrics != null ? Stopwatch.GetTimestamp() : 0;
+
 				if (_screenBuilder.Length > 0)
 				{
 					WriteOutput(_screenBuilder);
 				}
+
+				if (metrics != null)
+					metrics.ConsoleOutputTimeMs = ElapsedMs(outputStart);
 
 				// Diagnostics: Capture output metrics
 				if (metrics != null)
@@ -796,8 +909,11 @@ namespace SharpConsoleUI.Drivers
 		/// Raw write completely bypasses .NET's Console/StreamWriter/SyncTextWriter infrastructure,
 		/// eliminating any possibility of .NET runtime code touching termios during output.
 		/// </summary>
-		private static void WriteOutput(string text)
+		private void WriteOutput(string text)
 		{
+			if (SuppressConsoleOutput)
+				return;
+
 			if (TerminalRawMode.IsRawModeActive)
 				TerminalRawMode.WriteStdout(text);
 			else
@@ -808,8 +924,11 @@ namespace SharpConsoleUI.Drivers
 		/// Writes a StringBuilder directly to stdout, avoiding the intermediate ToString() allocation.
 		/// Falls back to ToString() for the Console.Out path (non-raw mode).
 		/// </summary>
-		private static void WriteOutput(StringBuilder sb)
+		private void WriteOutput(StringBuilder sb)
 		{
+			if (SuppressConsoleOutput)
+				return;
+
 			if (TerminalRawMode.IsRawModeActive)
 				TerminalRawMode.WriteStdout(sb);
 			else
@@ -1026,6 +1145,55 @@ namespace SharpConsoleUI.Drivers
 			}
 		}
 
+		/// <summary>
+		/// Copies the composed desktop - every window, stacked, as last presented.
+		/// </summary>
+		/// <returns>An immutable snapshot of the front buffer.</returns>
+		/// <remarks>
+		/// <para>
+		/// The front buffer already holds the composed result permanently, because the diff
+		/// engine needs it to decide what to send to the terminal. This is simply a way to
+		/// read it, and needs no diagnostics subsystem: capture costs one copy per call,
+		/// not one per frame.
+		/// </para>
+		/// <para>
+		/// Taken under the render lock. A reader walking the buffer while the renderer
+		/// writes it would mix two frames, and a capture whose whole value is faithfulness
+		/// must not do that. Copying under the lock also keeps the lock held for a memcpy
+		/// rather than for however long the caller takes to consume the result.
+		/// </para>
+		/// </remarks>
+		public Diagnostics.Snapshots.ConsoleBufferSnapshot CaptureComposed()
+		{
+			var cells = new Diagnostics.Snapshots.ConsoleCell[_width, _height];
+
+			lock (_consoleLock)
+			{
+				for (int y = 0; y < _height; y++)
+				{
+					for (int x = 0; x < _width; x++)
+					{
+						ref var c = ref _frontBuffer[x, y];
+						cells[x, y] = new Diagnostics.Snapshots.ConsoleCell(
+							c.Character, c.AnsiEscape ?? string.Empty,
+							c.IsWideContinuation, c.Combiners);
+					}
+				}
+			}
+
+			// Front and back are the same array here: the caller is asking what is on
+			// screen, and GetBack is what every existing reader of a composed snapshot
+			// calls. Handing back one array for both keeps those readers working.
+			return new Diagnostics.Snapshots.ConsoleBufferSnapshot
+			{
+				FrontBuffer = cells,
+				BackBuffer = cells,
+				Width = _width,
+				Height = _height,
+				Timestamp = DateTime.Now,
+			};
+		}
+
 		#region Diagnostics Helper Methods
 
 		/// <summary>
@@ -1043,13 +1211,20 @@ namespace SharpConsoleUI.Drivers
 			{
 				for (int x = 0; x < _width; x++)
 				{
+					// Carry the grapheme state across, not just the rune: without it a
+					// composed capture truncates an accented letter to its base and cannot
+					// tell a wide glyph's second column from a real cell.
 					frontCopy[x, y] = new Diagnostics.Snapshots.ConsoleCell(
 						_frontBuffer[x, y].Character,
-						_frontBuffer[x, y].AnsiEscape ?? string.Empty);
+						_frontBuffer[x, y].AnsiEscape ?? string.Empty,
+						_frontBuffer[x, y].IsWideContinuation,
+						_frontBuffer[x, y].Combiners);
 
 					backCopy[x, y] = new Diagnostics.Snapshots.ConsoleCell(
 						_backBuffer[x, y].Character,
-						_backBuffer[x, y].AnsiEscape ?? string.Empty);
+						_backBuffer[x, y].AnsiEscape ?? string.Empty,
+						_backBuffer[x, y].IsWideContinuation,
+						_backBuffer[x, y].Combiners);
 				}
 			}
 

@@ -29,7 +29,7 @@ namespace SharpConsoleUI.Controls
 	/// keyboard activation, and the optional height animation are implemented in companion
 	/// partials added by later tasks.
 	/// </remarks>
-	public partial class CollapsiblePanel : BaseControl, IContainer, IContainerControl, IControlHost, IMouseAwareControl, IInteractiveControl, IFocusableControl, IFocusableContainerWithHeader, ILogicalCursorProvider, IColorRoleableControl
+	public partial class CollapsiblePanel : BaseControl, IContainer, IContainerControl, IControlHost, IMouseAwareControl, IInteractiveControl, IFocusableControl, IFocusableContainerWithHeader, ILogicalCursorProvider, IColorRoleableControl, Parsing.MarkupSpinnerClock.IInlineSpinnerHost
 	{
 
 		#region ColorRole
@@ -343,10 +343,23 @@ namespace SharpConsoleUI.Controls
 
 			(this as IWindowControl).GetParentWindow()?.ForceRebuildLayout();
 			Invalidate(Invalidation.Relayout);
+			if (!value && _animationMode == CollapsibleAnimationMode.None)
+				ReleaseHiddenLayouts(this);
 
 			// INPC for IsExpanded so data binding sees toggles (property setter + Toggle/Expand/Collapse all route here).
 			OnPropertyChanged(nameof(IsExpanded));
 			ExpandedChanged?.Invoke(this, _isExpanded);
+		}
+
+		private static void ReleaseHiddenLayouts(IContainerControl container)
+		{
+			foreach (var child in container.GetChildren())
+			{
+				if (child is MarkupControl markup)
+					markup.ReleaseHiddenLayout();
+				if (child is IContainerControl nested)
+					ReleaseHiddenLayouts(nested);
+			}
 		}
 
 		// Animation hook. Implemented in Task 7 (Animations partial). No-op until then.
@@ -590,6 +603,23 @@ namespace SharpConsoleUI.Controls
 				bg = ColorResolver.ResolveCollapsibleHeaderFocusedBackground(_focusedBackgroundValue, Container);
 			}
 
+			// AN INLINE [spinner] IN THE HEADER needs this panel on the clock's registry, or it never
+			// animates. MarkupSpinnerClock.Tick invalidates its registered hosts; the render loop
+			// skips a clean window; and this panel parses its OWN header markup rather than hosting a
+			// MarkupControl — which is the only type that registers. So the clock ran on time and had
+			// nobody to tell.
+			//
+			// The symptom is subtle rather than absent: the glyph still advances whenever anything
+			// else dirties the window, so a header spinner keeps whatever cadence the app's busiest
+			// timer happens to have. Measured in a chat transcript: ~960ms per frame, which was the
+			// application's one-second panel clock, not the 60ms the tag asked for.
+			//
+			// Registered BEFORE the bordered/borderless branch because both paths draw the header
+			// (PaintBorderedHeader composes the same text). Registration is idempotent and held
+			// weakly, so doing it per paint costs nothing and needs no teardown.
+			if (EffectiveShowHeader && HeaderHasInlineSpinner())
+				Parsing.MarkupSpinnerClock.RegisterHost(this);
+
 			if (IsBordered)
 			{
 				PaintBorderedHeader(buffer, bounds, clipRect, fg, bg); // Task 5 implements
@@ -603,8 +633,20 @@ namespace SharpConsoleUI.Controls
 			int left = bounds.X + Margin.Left;
 			int right = bounds.X + bounds.Width - Margin.Right;
 
-			for (int x = left; x < right; x++)
-				buffer.SetNarrowCell(x, headerY, ' ', fg, bg);
+			// EVERY WRITE BELOW IS CLIPPED. This header used to paint at its arranged position with no
+			// regard for clipRect, unlike the bordered path (which routes through PanelBorderRenderer)
+			// and unlike the body (painted by the layout engine). A panel scrolled above its host's
+			// viewport still drew its header row — landing on whatever chrome owned that row, e.g. the
+			// tab header strip of an enclosing TabControl.
+			bool headerVisible = headerY >= clipRect.Y && headerY < clipRect.Bottom;
+			int clippedLeft = Math.Max(left, clipRect.X);
+			int clippedRight = Math.Min(right, clipRect.Right);
+
+			if (headerVisible)
+			{
+				for (int x = clippedLeft; x < clippedRight; x++)
+					buffer.SetNarrowCell(x, headerY, ' ', fg, bg);
+			}
 
 			// The title follows BorderColor when one is set (so WithBorderColor colors the title even in
 			// borderless mode, issue #49); otherwise the resolved foreground. Markup in the title still
@@ -616,15 +658,20 @@ namespace SharpConsoleUI.Controls
 			int textWidth = Math.Min(cells.Count, avail);
 			int startX = left + HorizontalOffset(textWidth, avail, _headerAlignment);
 
-			var headerClip = new LayoutRect(left, headerY, avail, 1);
+			// Intersected with the INHERITED clip, not just the header row: on its own this rect would
+			// happily place the title outside the host viewport.
+			var headerClip = new LayoutRect(left, headerY, avail, 1).Intersect(clipRect);
 			buffer.WriteCellsClipped(startX, headerY, cells, headerClip);
 
 			if (_showHeaderSeparator)
 			{
 				int sepY = headerY + 1;
-				Color sep = ResolveChromeColor(fg);
-				for (int x = left; x < right; x++)
-					buffer.SetNarrowCell(x, sepY, '─', sep, bg);
+				if (sepY >= clipRect.Y && sepY < clipRect.Bottom)
+				{
+					Color sep = ResolveChromeColor(fg);
+					for (int x = clippedLeft; x < clippedRight; x++)
+						buffer.SetNarrowCell(x, sepY, '─', sep, bg);
+				}
 			}
 		}
 
@@ -658,6 +705,18 @@ namespace SharpConsoleUI.Controls
 		/// (borderless): the current indicator glyph followed by the title. Shared by both
 		/// header styles to avoid duplication.
 		/// </summary>
+		/// <summary>Repaints when the inline spinner advances a frame.</summary>
+		/// <remarks>
+		/// Repaint, not Relayout: a spinner's reserved width is constant per style, so the glyph can
+		/// never reflow the header.
+		/// </remarks>
+		void Parsing.MarkupSpinnerClock.IInlineSpinnerHost.InvalidateForInlineSpinner()
+			=> Invalidate(Invalidation.Repaint);
+
+		/// <summary>Whether the composed header text contains an inline spinner tag.</summary>
+		private bool HeaderHasInlineSpinner()
+			=> ComposeHeaderText().Contains("[spinner", StringComparison.Ordinal);
+
 		private string ComposeHeaderText()
 		{
 			string icon = CurrentIcon ?? string.Empty;
@@ -834,5 +893,16 @@ namespace SharpConsoleUI.Controls
 		#endregion
 
 		// Mouse activation (IMouseAwareControl) is implemented in CollapsiblePanel.Mouse.cs (Task 6).
+
+		/// <inheritdoc/>
+		public override void DescribeState(IStateWriter w)
+		{
+			ArgumentNullException.ThrowIfNull(w);
+			base.DescribeState(w);
+
+			w.Expansion(IsExpanded);
+			w.Text(StateVocabulary.Shorten(Title));
+		}
+
 	}
 }

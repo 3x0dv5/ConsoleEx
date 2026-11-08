@@ -194,6 +194,99 @@ namespace SharpConsoleUI.Controls
 			Invalidate(Invalidation.Relayout);
 		}
 
+		#endregion
+
+		#region Pixel surface
+
+		private Drawing.PixelSurface? _pixels;
+
+		/// <summary>
+		/// A <see cref="Drawing.PixelSurface"/> sized to this canvas, for drawing in
+		/// pixels rather than characters.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// Opt-in and lazy: nothing is allocated until something asks, so a canvas
+		/// that only draws text costs nothing. Each read resizes the surface to the
+		/// current canvas, which is the step easiest to forget and the one whose
+		/// units are easiest to get wrong - it takes CELLS, and the surface is twice
+		/// as tall in pixels.
+		/// </para>
+		/// <para>
+		/// A convenience, not the only way. <see cref="Drawing.PixelSurface"/> is an
+		/// ordinary type: allocate your own, size it to a region rather than the whole
+		/// canvas, keep several, and present any of them into any canvas with
+		/// <see cref="Drawing.PixelSurface.Present(Drawing.CanvasGraphics, Color)"/>.
+		/// Both example games do exactly that, because one of them presents with a
+		/// screen-shake offset.
+		/// </para>
+		/// </remarks>
+		/// <example>
+		/// <code>
+		/// canvas.Paint += (_, e) =>
+		/// {
+		///     var px = canvas.Pixels;              // already the right size
+		///     px.Fill(background);
+		///     px.FillCircle(20, 14, 6, Color.Red);
+		///     px.Text(2, 1, "[bold]signal[/]", Color.White);
+		///     canvas.PresentPixels(background);
+		/// };
+		/// </code>
+		/// </example>
+		public Drawing.PixelSurface Pixels
+		{
+			get
+			{
+				_pixels ??= new Drawing.PixelSurface();
+				_pixels.EnsureSize(_canvasWidth, _canvasHeight);
+				return _pixels;
+			}
+		}
+
+		/// <summary>
+		/// Whether <see cref="Pixels"/> has been used, without creating it.
+		/// </summary>
+		/// <remarks>
+		/// Reading <see cref="Pixels"/> allocates. A caller that only wants to know
+		/// whether there is anything to present asks this instead.
+		/// </remarks>
+		public bool HasPixelSurface => _pixels != null;
+
+		/// <summary>
+		/// Composites <see cref="Pixels"/> into the canvas and repaints.
+		/// </summary>
+		/// <param name="voidColor">Shown where the surface does not reach.</param>
+		/// <remarks>
+		/// Takes the same paint lock as <see cref="BeginPaint"/>, because it writes
+		/// the same buffer. Does nothing if the surface was never used.
+		/// </remarks>
+		public void PresentPixels(Color voidColor) => PresentPixels(0, 0, voidColor);
+
+		/// <summary>
+		/// Composites <see cref="Pixels"/> into the canvas, displaced by an offset.
+		/// </summary>
+		/// <param name="offsetX">Horizontal displacement, in pixels.</param>
+		/// <param name="offsetY">Vertical displacement, in pixels.</param>
+		/// <param name="voidColor">Shown where the surface does not reach.</param>
+		public void PresentPixels(int offsetX, int offsetY, Color voidColor)
+		{
+			if (_pixels == null) return;
+
+			var g = BeginPaint();
+			try
+			{
+				_pixels.Present(g, offsetX, offsetY, voidColor);
+			}
+			finally
+			{
+				EndPaint();
+			}
+		}
+
+		#endregion
+
+		#region Painting
+
 		/// <summary>
 		/// Triggers a repaint without painting.
 		/// </summary>
@@ -238,7 +331,49 @@ namespace SharpConsoleUI.Controls
 		/// <summary>
 		/// Fires when the canvas is left-clicked, with canvas-local coordinates.
 		/// </summary>
+		/// <remarks>
+		/// A click is reported on RELEASE. When the press itself is the event that
+		/// matters - a fire button, a drag handle, starting a selection - use
+		/// <see cref="CanvasMouseDown"/>, which fires the moment the button goes
+		/// down.
+		/// </remarks>
 		public event EventHandler<CanvasMouseEventArgs>? CanvasMouseClick;
+
+		/// <summary>
+		/// Fires the moment the left button goes down, with canvas-local coordinates.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// <see cref="CanvasMouseClick"/> is reported on release, which is the right
+		/// default for a button but feels late for anything that should respond to
+		/// the press: a game's fire control, the start of a drag, or painting a
+		/// stroke. This fires on the press instead.
+		/// </para>
+		/// <para>
+		/// Press, release and click arrive as separate events, so a full press and
+		/// release raises <see cref="CanvasMouseDown"/>, then
+		/// <see cref="CanvasMouseUp"/>, then <see cref="CanvasMouseClick"/>. Handle
+		/// one or the other, not both, unless you want the action twice.
+		/// </para>
+		/// <para>
+		/// Every press raises this, including the second and third of a fast run:
+		/// a multi-click carries its press as well as the derived gesture. A caller
+		/// that needs to tell them apart reads
+		/// <see cref="CanvasMouseEventArgs.OriginalArgs"/>.
+		/// </para>
+		/// </remarks>
+		public event EventHandler<CanvasMouseEventArgs>? CanvasMouseDown;
+
+		/// <summary>
+		/// Fires when the left button is released over the canvas, with canvas-local
+		/// coordinates.
+		/// </summary>
+		/// <remarks>
+		/// The other half of <see cref="CanvasMouseDown"/>: together they bracket a
+		/// drag. A release that completes a click is also followed by
+		/// <see cref="CanvasMouseClick"/>.
+		/// </remarks>
+		public event EventHandler<CanvasMouseEventArgs>? CanvasMouseUp;
 
 		/// <summary>
 		/// Fires when the mouse moves over the canvas, with canvas-local coordinates.
@@ -312,6 +447,8 @@ namespace SharpConsoleUI.Controls
 		{
 			Paint = null;
 			CanvasMouseClick = null;
+			CanvasMouseDown = null;
+			CanvasMouseUp = null;
 			CanvasMouseMove = null;
 			CanvasMouseRightClick = null;
 			CanvasKeyPressed = null;
@@ -325,5 +462,18 @@ namespace SharpConsoleUI.Controls
 		}
 
 		#endregion
+
+		/// <inheritdoc/>
+		public override void DescribeState(IStateWriter w)
+		{
+			ArgumentNullException.ThrowIfNull(w);
+			base.DescribeState(w);
+
+			// The drawing surface in its own units, which are not the cell bounds the
+			// layout tree reports - a pixel canvas has two rows per cell.
+			w.Write("canvasWidth", CanvasWidth);
+			w.Write("canvasHeight", CanvasHeight);
+		}
+
 	}
 }

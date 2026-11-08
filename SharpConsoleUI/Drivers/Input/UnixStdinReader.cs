@@ -15,27 +15,22 @@ namespace SharpConsoleUI.Drivers.Input
 	/// Replaces Console.ReadKey-based InputLoop on Unix platforms to eliminate
 	/// the echo leak caused by .NET's per-keystroke tcsetattr toggling.
 	/// </summary>
-	internal class UnixStdinReader
+	internal class UnixStdinReader : IDisposable
 	{
 		private const int ReadBufferSize = 256;
 		private const int EscTimeoutMs = 50; // vim/tmux convention for ESC vs ESC-prefix
-		private const int ContinuousPressIntervalMs = 100;
-		private const int DoubleClickTimeMs = 500;
-		private const int DuplicateReleaseThresholdMs = 50;
 
 		private readonly Stream _stdin;
 		private readonly AnsiInputParser _parser;
 
-		// Mouse state — mirrors SequenceHelper's static state
-		private volatile bool _isButtonPressed;
+		// Mouse state. Only what is needed to repeat a held button; clicks and
+		// double-clicks are derived once, upstream, by MouseGestureRecognizer.
+
+		/// <summary>The auto-repeat for a held button, shared with the Windows path.</summary>
+		private readonly ContinuousPress _continuousPress = new();
 		private readonly object _mouseStateLock = new();
 		private MouseFlags _lastMouseButtonPressed;
 		private Point _lastMousePoint;
-		private bool _isButtonClicked;
-		private bool _isButtonDoubleClicked;
-		private bool _isButtonTripleClicked;
-		private DateTime _lastClickTime = DateTime.MinValue;
-		private Point? _lastClickPosition;
 
 		public UnixStdinReader(Stream stdin, AnsiInputParser parser)
 		{
@@ -167,188 +162,132 @@ namespace SharpConsoleUI.Drivers.Input
 		}
 
 		/// <summary>
-		/// Processes raw SGR mouse flags through a state machine that mirrors SequenceHelper.GetMouse.
-		/// Generates Clicked/DoubleClicked/TripleClicked flags, manages continuous press handler lifecycle.
-		/// Returns the flags to dispatch, or null to suppress the event.
+		/// Reports what the terminal said, and nothing else.
 		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// Clicks, double-clicks, triple-clicks and drags are NOT derived here. They
+		/// are gestures - judgements about timing and position - and they are made
+		/// once, for every platform, by <c>MouseGestureRecognizer</c> in the input
+		/// coordinator. This method only reports presses, releases, motion and wheel.
+		/// </para>
+		/// <para>
+		/// This used to be a ~130-line state machine mirroring SequenceHelper's, with
+		/// five pieces of state and two background expiry timers. Having two copies of
+		/// that logic meant they could disagree, and they did. Worse, a press inside
+		/// the click window was REPLACED by the derived double-click rather than
+		/// accompanied by it, so a control watching for presses silently lost half of
+		/// a fast click run.
+		/// </para>
+		/// <para>
+		/// The continuous-press loop stays, because it is not a gesture: it is the
+		/// terminal's missing auto-repeat, and only the thing reading stdin knows a
+		/// button is still physically down.
+		/// </para>
+		/// </remarks>
 		private List<MouseFlags>? ProcessMouseEvent(
 			List<MouseFlags> rawFlags,
 			Point position,
 			Action<List<MouseFlags>, Point> onMouse,
 			Action<MouseFlags, Point> continuousButtonPressedHandler)
 		{
-			var buttonState = rawFlags.Count > 0 ? rawFlags[0] : (MouseFlags)0;
+			// The BUTTON flag, not rawFlags[0]: AnsiInputParser prepends modifier flags
+			// (ButtonShift/ButtonAlt/ButtonCtrl) before the button, so rawFlags[0] is the
+			// modifier whenever one is held.
+			var buttonState = ExtractButtonState(rawFlags);
 
-			// --- Button press ---
-			if (!_isButtonClicked && !_isButtonDoubleClicked &&
-				(buttonState == MouseFlags.Button1Pressed ||
-				 buttonState == MouseFlags.Button2Pressed ||
-				 buttonState == MouseFlags.Button3Pressed) &&
-				_lastMouseButtonPressed == 0)
+			if (buttonState == MouseFlags.Button1Pressed ||
+				buttonState == MouseFlags.Button2Pressed ||
+				buttonState == MouseFlags.Button3Pressed)
 			{
+				bool alreadyDown;
 				lock (_mouseStateLock)
 				{
+					alreadyDown = _lastMouseButtonPressed == buttonState;
 					_lastMouseButtonPressed = buttonState;
 					_lastMousePoint = position;
 				}
-				_isButtonPressed = true;
 
-				// Start continuous press loop (stops when _isButtonPressed becomes false)
-				var capturedFlag = buttonState;
-				_ = Task.Run(async () =>
+				// A second press of a button already held is the terminal repeating
+				// itself mid-drag; one repeat loop is enough.
+				if (!alreadyDown)
 				{
-					while (_isButtonPressed)
-					{
-						await Task.Delay(ContinuousPressIntervalMs);
-						Point mousePoint;
-						MouseFlags mouseBtn;
-						lock (_mouseStateLock)
-						{
-							mousePoint = _lastMousePoint;
-							mouseBtn = _lastMouseButtonPressed;
-						}
-						if (_isButtonPressed && mouseBtn != 0)
-						{
-							continuousButtonPressedHandler(capturedFlag, mousePoint);
-						}
-					}
-				});
-
-				return new List<MouseFlags> { buttonState };
-			}
-
-			// --- Button press during double-click window → triple click ---
-			if (_isButtonDoubleClicked &&
-				(buttonState == MouseFlags.Button1Pressed ||
-				 buttonState == MouseFlags.Button2Pressed ||
-				 buttonState == MouseFlags.Button3Pressed))
-			{
-				var tripleFlag = GetButtonTripleClicked(buttonState);
-				_isButtonDoubleClicked = false;
-				_isButtonTripleClicked = true;
-				return new List<MouseFlags> { tripleFlag };
-			}
-
-			// --- Button press during click window → double click ---
-			if (_isButtonClicked &&
-				(buttonState == MouseFlags.Button1Pressed ||
-				 buttonState == MouseFlags.Button2Pressed ||
-				 buttonState == MouseFlags.Button3Pressed))
-			{
-				var doubleFlag = GetButtonDoubleClicked(buttonState);
-				_isButtonClicked = false;
-				_isButtonDoubleClicked = true;
-				_ = Task.Run(async () =>
-				{
-					await Task.Delay(Configuration.ControlDefaults.DefaultDebounceMs);
-					_isButtonDoubleClicked = false;
-				});
-				return new List<MouseFlags> { doubleFlag };
-			}
-
-			// --- Button release ---
-			if (!_isButtonClicked && !_isButtonDoubleClicked &&
-				(buttonState == MouseFlags.Button1Released ||
-				 buttonState == MouseFlags.Button2Released ||
-				 buttonState == MouseFlags.Button3Released))
-			{
-				_isButtonPressed = false; // Stops the continuous press loop
-
-				if (_isButtonTripleClicked)
-				{
-					_isButtonTripleClicked = false;
-				}
-				else if (position.X == _lastMousePoint.X && position.Y == _lastMousePoint.Y)
-				{
-					// Release at same position → click
-					var timeSinceLastClick = (DateTime.Now - _lastClickTime).TotalMilliseconds;
-
-					// Duplicate release guard
-					if (_lastClickPosition?.X == position.X &&
-						_lastClickPosition?.Y == position.Y &&
-						timeSinceLastClick < DuplicateReleaseThresholdMs)
-					{
-						_lastMouseButtonPressed = 0;
-						return null; // Suppress duplicate
-					}
-
-					var clickFlag = GetButtonClicked(buttonState);
-					_isButtonClicked = true;
-					_lastClickPosition = position;
-					_lastClickTime = DateTime.Now;
-
-					_ = Task.Run(async () =>
-					{
-						await Task.Delay(Configuration.ControlDefaults.DefaultDebounceMs);
-						_isButtonClicked = false;
-					});
-
-					_lastMouseButtonPressed = 0;
-					return new List<MouseFlags> { buttonState, clickFlag };
+					StartContinuousPress(buttonState, continuousButtonPressedHandler);
 				}
 
-				_lastMouseButtonPressed = 0;
-				return new List<MouseFlags> { buttonState };
-			}
-
-			// --- Motion with button held (drag) ---
-			if (_isButtonPressed && _lastMouseButtonPressed != 0 &&
-				rawFlags.Contains(MouseFlags.ReportMousePosition))
-			{
-				_lastMousePoint = position;
 				return new List<MouseFlags>(rawFlags);
 			}
 
-			// --- Motion without button (hover) ---
+			if (buttonState == MouseFlags.Button1Released ||
+				buttonState == MouseFlags.Button2Released ||
+				buttonState == MouseFlags.Button3Released)
+			{
+				_continuousPress.End(ContinuousPress.PressFor(buttonState));
+				lock (_mouseStateLock) _lastMouseButtonPressed = 0;
+				return new List<MouseFlags>(rawFlags);
+			}
+
+			// Motion keeps the last point current so a held button repeats at the
+			// pointer's position rather than where it went down.
 			if (rawFlags.Contains(MouseFlags.ReportMousePosition))
 			{
-				return new List<MouseFlags>(rawFlags);
+				lock (_mouseStateLock) _lastMousePoint = position;
+
+				// So a held button repeats where the pointer is now.
+				_continuousPress.Moved(position);
 			}
 
-			// --- Wheel events ---
-			if (rawFlags.Contains(MouseFlags.WheeledUp) ||
-				rawFlags.Contains(MouseFlags.WheeledDown) ||
-				rawFlags.Contains(MouseFlags.WheeledLeft) ||
-				rawFlags.Contains(MouseFlags.WheeledRight))
-			{
-				return new List<MouseFlags>(rawFlags);
-			}
-
-			// Unhandled — pass through
 			return new List<MouseFlags>(rawFlags);
 		}
 
-		private static MouseFlags GetButtonClicked(MouseFlags released)
+		/// <summary>
+		/// Repeats a held button so it keeps scrolling, which a terminal never does.
+		/// </summary>
+		/// <summary>Stops the auto-repeat when the reader is finished with.</summary>
+		/// <remarks>
+		/// The repeat outlives a single event by design, so something has to end
+		/// it when the reader does. Without this a loop started by the last press
+		/// before shutdown would go on calling a handler whose driver is gone.
+		/// </remarks>
+		public void Dispose() => _continuousPress.Dispose();
+
+		/// <summary>Starts the auto-repeat for a held button.</summary>
+		/// <remarks>
+		/// The loop itself lives in <see cref="ContinuousPress"/>, shared with the
+		/// Windows path. This copy used to be a bare unawaited <c>Task.Run</c>
+		/// with no cancellation, which leaked three ways: a driver shutting down
+		/// mid-press spun forever against a dead handler, a missed release stacked
+		/// a second loop on the first, and nothing could stop either.
+		/// </remarks>
+		private void StartContinuousPress(
+			MouseFlags button, Action<MouseFlags, Point> continuousButtonPressedHandler)
 		{
-			return released switch
-			{
-				MouseFlags.Button1Released => MouseFlags.Button1Clicked,
-				MouseFlags.Button2Released => MouseFlags.Button2Clicked,
-				MouseFlags.Button3Released => MouseFlags.Button3Clicked,
-				_ => MouseFlags.AllEvents
-			};
+			Point at;
+			lock (_mouseStateLock) at = _lastMousePoint;
+
+			_continuousPress.Begin(button, at, continuousButtonPressedHandler);
 		}
 
-		private static MouseFlags GetButtonDoubleClicked(MouseFlags pressed)
+		/// <summary>
+		/// Returns the button flag from a raw SGR flag set, ignoring any modifier flags that precede it.
+		/// </summary>
+		private static MouseFlags ExtractButtonState(List<MouseFlags> rawFlags)
 		{
-			return pressed switch
+			for (int i = 0; i < rawFlags.Count; i++)
 			{
-				MouseFlags.Button1Pressed => MouseFlags.Button1DoubleClicked,
-				MouseFlags.Button2Pressed => MouseFlags.Button2DoubleClicked,
-				MouseFlags.Button3Pressed => MouseFlags.Button3DoubleClicked,
-				_ => MouseFlags.AllEvents
-			};
+				if (!IsModifier(rawFlags[i]))
+					return rawFlags[i];
+			}
+			return (MouseFlags)0;
 		}
 
-		private static MouseFlags GetButtonTripleClicked(MouseFlags pressed)
-		{
-			return pressed switch
-			{
-				MouseFlags.Button1Pressed => MouseFlags.Button1TripleClicked,
-				MouseFlags.Button2Pressed => MouseFlags.Button2TripleClicked,
-				MouseFlags.Button3Pressed => MouseFlags.Button3TripleClicked,
-				_ => MouseFlags.AllEvents
-			};
-		}
+
+
+		private static bool IsModifier(MouseFlags flag) =>
+			flag == MouseFlags.ButtonShift || flag == MouseFlags.ButtonAlt || flag == MouseFlags.ButtonCtrl;
+
+
+
+
 	}
 }

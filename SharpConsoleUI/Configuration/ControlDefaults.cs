@@ -55,6 +55,34 @@ namespace SharpConsoleUI.Configuration
 		public const int DefaultEllipsisLength = 3;
 
 		/// <summary>
+		/// Single-character ellipsis marking a truncated bordered title (U+2026). Reliably 1 cell
+		/// wide, unlike three dots, which would cost two more columns of the title.
+		/// </summary>
+		public const char TitleEllipsis = '\u2026';
+
+		/// <summary>Display columns <see cref="TitleEllipsis"/> occupies.</summary>
+		public const int TitleEllipsisWidth = 1;
+
+		/// <summary>
+		/// Single-character ellipsis marking a prompt token whose label is wider than the row it
+		/// has to fit in (U+2026). Reliably 1 cell wide, so the truncation costs one column rather
+		/// than the three that spelling it with dots would.
+		/// </summary>
+		public const char PromptTokenEllipsis = '…';
+
+		/// <summary>
+		/// Halves a channel when deriving the fallback token colour, so the red component drops and
+		/// the result reads as an accent rather than as ordinary text.
+		/// </summary>
+		public const int PromptTokenColorDampen = 2;
+
+		/// <summary>The maximum value of a colour channel, for the same derivation.</summary>
+		public const int PromptTokenColorChannelMax = 255;
+
+		/// <summary>Display columns <see cref="PromptTokenEllipsis"/> occupies.</summary>
+		public const int PromptTokenEllipsisWidth = 1;
+
+		/// <summary>
 		/// Minimum width for text fields (default: 3)
 		/// </summary>
 		public const int DefaultMinTextWidth = 3;
@@ -69,6 +97,16 @@ namespace SharpConsoleUI.Configuration
 		/// Multiplier for page up/down scrolling (default: 5x viewport height)
 		/// </summary>
 		public const int DefaultPageScrollMultiplier = 5;
+
+		/// <summary>
+		/// Default minimum vertical scrollbar thumb height in rows (default: 1)
+		/// </summary>
+		public const int DefaultMinScrollbarThumbSize = 1;
+
+		/// <summary>
+		/// Shortest scrollbar track that still gets arrow buttons at both ends (default: 3).
+		/// </summary>
+		public const int MinArrowTrackLength = 3;
 
 		// Input defaults
 		/// <summary>
@@ -201,9 +239,50 @@ namespace SharpConsoleUI.Configuration
 		public const int DefaultEditorViewportHeight = 10;
 
 		/// <summary>
-		/// Number of lines to scroll per mouse wheel tick (default: 1)
+		/// Number of lines scrolled per mouse wheel notch, library-wide (default: 1).
 		/// </summary>
-		public const int DefaultScrollWheelLines = 1;
+		/// <remarks>
+		/// Settable at runtime so an application can change the wheel step everywhere in one line.
+		/// Individual controls override it with their own <c>MouseWheelScrollSpeed</c>. Values below
+		/// 1 are clamped to 1. This is a property rather than a <c>const</c> so that consumers
+		/// compiled against an earlier version observe the value set here instead of a compile-time
+		/// copy.
+		/// </remarks>
+		public static int DefaultScrollWheelLines
+		{
+			get => _defaultScrollWheelLines;
+			set => _defaultScrollWheelLines = Math.Max(1, value);
+		}
+
+		private static int _defaultScrollWheelLines = 1;
+
+		/// <summary>
+		/// Number of lines a scrolling window moves per mouse wheel notch (default: 3).
+		/// </summary>
+		/// <remarks>
+		/// Windows have always scrolled faster than controls. This preserves that, while still
+		/// following <see cref="DefaultScrollWheelLines"/> when an application sets it, so a single
+		/// assignment changes the wheel step everywhere. Setting this explicitly pins the window
+		/// step and stops it following. Values below 1 are clamped to 1.
+		/// </remarks>
+		public static int DefaultWindowScrollWheelLines
+		{
+			get => _defaultWindowScrollWheelLines ?? (DefaultScrollWheelLines != 1 ? DefaultScrollWheelLines : 3);
+			set => _defaultWindowScrollWheelLines = Math.Max(1, value);
+		}
+
+		private static int? _defaultWindowScrollWheelLines;
+
+		/// <summary>
+		/// Unpins <see cref="DefaultWindowScrollWheelLines"/> so it resumes following
+		/// <see cref="DefaultScrollWheelLines"/>. Test-only: assigning through the public setter
+		/// has no way to express "go back to following," since any concrete value pins it. Internal
+		/// so tests can restore true process-wide default state between runs.
+		/// </summary>
+		internal static void ResetDefaultWindowScrollWheelLinesForTests()
+		{
+			_defaultWindowScrollWheelLines = null;
+		}
 
 		/// <summary>
 		/// Default tab size in spaces for multiline editor (default: 4)
@@ -389,15 +468,24 @@ namespace SharpConsoleUI.Configuration
 		public const int NavigationViewHeaderTopMargin = 1;
 
 		/// <summary>
-		/// Width threshold at or above which Auto display mode resolves to Expanded (default: 80).
+		/// Width threshold at or above which Auto display mode resolves to Expanded (default: 72).
 		/// </summary>
-		public const int DefaultNavigationViewExpandedThreshold = 80;
+		/// <remarks>
+		/// Lowered from 80: the pane collapsed to Compact while there was still room to show labels,
+		/// so a window a few cells short of 80 lost its navigation text for no visual benefit. The
+		/// Compact threshold moved by the same amount, so each band keeps its width.
+		/// </remarks>
+		public const int DefaultNavigationViewExpandedThreshold = 72;
 
 		/// <summary>
-		/// Width threshold at or above which Auto display mode resolves to Compact (default: 50).
+		/// Width threshold at or above which Auto display mode resolves to Compact (default: 42).
 		/// Below this threshold, Auto resolves to Minimal.
 		/// </summary>
-		public const int DefaultNavigationViewCompactThreshold = 50;
+		/// <remarks>
+		/// Lowered from 50 alongside the Expanded threshold, by the same amount, so the Compact band
+		/// keeps its width instead of being squeezed.
+		/// </remarks>
+		public const int DefaultNavigationViewCompactThreshold = 42;
 
 		/// <summary>
 		/// Width of the navigation pane in Compact display mode (default: 5).
@@ -602,6 +690,19 @@ namespace SharpConsoleUI.Configuration
 		/// Uses small triangle (U+25B4) which is reliably 1-column wide across terminals.
 		/// </summary>
 		public const string DropdownOpenArrow = "\u25B4";
+
+		/// <summary>
+		/// Up-arrow cap for the window border's vertical scrollbar. U+25B4 (small triangle),
+		/// not U+25B2: the larger glyph is East Asian Ambiguous Width and renders 2 cells wide
+		/// in many terminals, which would overflow a 1-column border.
+		/// </summary>
+		public const char BorderScrollUpArrow = '\u25B4';
+
+		/// <summary>
+		/// Down-arrow cap for the window border's vertical scrollbar. See
+		/// <see cref="BorderScrollUpArrow"/> for why this is the small triangle.
+		/// </summary>
+		public const char BorderScrollDownArrow = '\u25BE';
 
 		/// <summary>
 		/// Scroll-up indicator for dropdown portal.
@@ -1049,6 +1150,21 @@ namespace SharpConsoleUI.Configuration
 		/// </summary>
 		public const int MarkupViewportOverscanRows = 2;
 
+		/// <summary>Whole-document parse slots for measure/paint and natural-width probes of the current content.</summary>
+		internal const int MarkupParseCacheCapacity = 4;
+
+		/// <summary>Minimum entry budget for width/style variants of the current markup groups.</summary>
+		internal const int MarkupGroupCacheMinimumBudget = 512;
+
+		/// <summary>Group-cache entries budgeted per live group for recent parse variants.</summary>
+		internal const int MarkupGroupCacheBudgetMultiplier = 4;
+
+		/// <summary>Build generations retained by budget-based eviction to keep width probes hot.</summary>
+		internal const int MarkupGroupCacheRecentBuilds = 4;
+
+		/// <summary>Hard-reset threshold relative to the group-cache entry budget.</summary>
+		internal const int MarkupGroupCacheResetMultiplier = 2;
+
 		#region ScrollablePanel
 
 		/// <summary>
@@ -1072,8 +1188,25 @@ namespace SharpConsoleUI.Configuration
 		/// <summary>Default auto-dismiss timeout for error (danger) toasts, in milliseconds.</summary>
 		public const int ToastErrorTimeoutMs = 6000;
 
-		/// <summary>Maximum width of a toast overlay, in display columns.</summary>
+		/// <summary>
+		/// Baseline maximum width of a toast overlay, in display columns. The automatic cap is half the
+		/// desktop but never narrower than this, so narrow and standard terminals keep the width they
+		/// have always had while wide ones get more room. Also the value to pass explicitly for the
+		/// classic fixed width.
+		/// </summary>
 		public const int ToastMaxWidth = 48;
+
+		/// <summary>The fraction of the desktop width the automatic toast cap uses (2 = one half).</summary>
+		public const int ToastAutoWidthDivisor = 2;
+
+		/// <summary>Default maximum number of wrapped content lines in a toast before it ellipsizes.</summary>
+		public const int ToastMaxLines = 2;
+
+		/// <summary>Chrome consumed by a toast's borders, accent bar and padding, in display columns.</summary>
+		public const int ToastChromeWidth = 5;
+
+		/// <summary>Chrome consumed by a toast's top and bottom borders, in rows.</summary>
+		public const int ToastChromeHeight = 2;
 
 		/// <summary>Margin between the stacked toasts and the screen edge, in cells.</summary>
 		public const int ToastEdgeMargin = 1;
@@ -1139,5 +1272,256 @@ namespace SharpConsoleUI.Configuration
 		public const string LogViewerExportDefaultFileName = "export.log";
 
 		#endregion
+
+		/// <summary>Minimum luminance gap between syntax colours and the code background.</summary>
+		public const double SyntaxMinimumContrastGap = 80.0;
+
+		/// <summary>Milliseconds a single line may spend in the TextMate tokenizer before it gives up.</summary>
+		public const int SyntaxTokenizeTimeoutMs = 500;
+
+		/// <summary>Lines of tokenized output retained per grammar before the least-recently-used is dropped.</summary>
+		public const int SyntaxTokenCacheSize = 4096;
+
+		/// <summary>Minimum text columns a multiline editor needs beside its gutter and scrollbar.</summary>
+		public const int MultilineEditMinimumTextColumns = 8;
+
+		#region Tab Control
+
+		/// <summary>Glyph marking that a TabControl header row has tabs before the first one drawn
+		/// (single left-pointing angle quotation mark, U+2039). Reliably 1-cell wide.</summary>
+		public const char TabScrollLeftGlyph = '‹';
+
+		/// <summary>Glyph marking that a TabControl header row has tabs after the last one drawn
+		/// (single right-pointing angle quotation mark, U+203A). Reliably 1-cell wide.</summary>
+		public const char TabScrollRightGlyph = '›';
+
+		/// <summary>Cells one scroll indicator occupies on the tab header row while it is shown.</summary>
+		public const int TabScrollIndicatorWidth = 1;
+
+		#endregion
+
+		#region Table
+
+		/// <summary>Cells the checkbox column takes in a TableControl's checkbox mode, room for <c>"[x] "</c> (default: 4).</summary>
+		public const int TableCheckboxColumnWidth = 4;
+
+		/// <summary>The checkbox cell for a checked row. Exactly TableCheckboxColumnWidth wide.</summary>
+		public const string TableCheckboxChecked = "[x] ";
+
+		/// <summary>The checkbox cell for an unchecked row. Exactly TableCheckboxColumnWidth wide.</summary>
+		public const string TableCheckboxUnchecked = "[ ] ";
+
+		/// <summary>
+		/// The checkbox cell for a row whose descendants disagree. Exactly
+		/// TableCheckboxColumnWidth wide.
+		/// </summary>
+		public const string TableCheckboxIndeterminate = "[-] ";
+
+		/// <summary>
+		/// The checkbox cell for a row that draws no checkbox. Blank, but still exactly
+		/// TableCheckboxColumnWidth wide: the column is a fixed width, so an empty string here
+		/// would shift every column after it.
+		/// </summary>
+		public const string TableCheckboxHidden = "    ";
+
+		/// <summary>Narrowest a TableControl column can be dragged to while resizing it (default: 3).</summary>
+		public const int TableMinResizeColumnWidth = 3;
+
+		/// <summary>Cells either side of a TableControl column border where a press still starts a resize (default: 1).</summary>
+		public const int TableColumnResizeHitTolerance = 1;
+
+		/// <summary>Fewest rows a TableControl samples when sizing an auto-width column from its content (default: 50).</summary>
+		public const int TableColumnWidthSampleRows = 50;
+
+		/// <summary>
+		/// Most rows one insert into a sorted or filtered TableControl may add for the display rows to be
+		/// updated in place; a larger insert recomputes them, which is then cheaper (default: 64).
+		/// </summary>
+		public const int TableIncrementalUpdateMaxRows = 64;
+
+		#endregion
+
+		#region Tree Guides
+
+		/// <summary>Indicator in front of an expanded tree node with children, as plain text (narrow ASCII).</summary>
+		public const string TreeExpandedIndicator = "[-] ";
+
+		/// <summary>Indicator in front of a collapsed tree node with children, as plain text (narrow ASCII).</summary>
+		public const string TreeCollapsedIndicator = "[+] ";
+
+		/// <summary>What follows each ancestor level's guide line in a tree (default: two spaces).</summary>
+		public const string DefaultTreeIndent = "  ";
+
+		#endregion
+
+		/// <summary>Minimum cells between chart axis ticks, so labels do not collide.</summary>
+		public const int ChartMinCellsPerTick = 8;
+
+		/// <summary>Rows an axis needs before it labels both of its ends.</summary>
+		public const int ChartMinCellsPerEndTick = 3;
+
+		/// <summary>Tolerance when walking to the end of a tick run, as a fraction of the step.</summary>
+		public const double ChartTickEpsilon = 0.001;
+
+		/// <summary>Default numeric axis label format.</summary>
+		public const string ChartDefaultNumberFormat = "0.##";
+
+		/// <summary>Default time axis label format.</summary>
+		public const string ChartDefaultTimeFormat = "HH:mm";
+
+		/// <summary>Default plot height when the chart is not filling its container.</summary>
+		public const int ChartDefaultPlotHeight = 12;
+
+		/// <summary>Smallest plot height that can still show anything.</summary>
+		public const int ChartMinPlotHeight = 1;
+
+		/// <summary>Cells between an axis label and the plot edge.</summary>
+		public const int ChartAxisLabelPadding = 1;
+
+		/// <summary>Gridline colour: dim enough to sit behind the data.</summary>
+		public static readonly Color ChartGridlineColor = Color.Grey19;
+
+		/// <summary>Axis rule colour.</summary>
+		public static readonly Color ChartAxisLineColor = Color.Grey35;
+
+		/// <summary>How far a drag must travel, in cells, to be a zoom rather than a click.</summary>
+		public const int ChartMinDragCells = 2;
+
+		/// <summary>Cells each point takes when the chart uses a fixed step.</summary>
+		public const int ChartDefaultStepWidth = 2;
+
+		/// <summary>Smallest absolute X span a zoom may leave visible.</summary>
+		public const double ChartMinZoomSpan = 1e-9;
+
+		/// <summary>Smallest zoom span as a fraction of the data range.</summary>
+		public const double ChartMinZoomFraction = 0.001;
+
+		/// <summary>How much the wheel narrows the range per notch.</summary>
+		public const double ChartWheelZoomFactor = 0.8;
+
+		/// <summary>
+		/// Glyph marking the selected point.
+		/// </summary>
+		/// <remarks>
+		/// U+25AA, not the diamond U+25C6: the diamond is East Asian Ambiguous Width
+		/// and many terminals draw it two columns wide, which would shift every cell
+		/// after it (CLAUDE.md rule 12E).
+		/// </remarks>
+		public const char ChartSelectionMarker = '\u25aa';
+
+		/// <summary>Selected-point marker colour.</summary>
+		public static readonly Color ChartSelectionColor = Color.White;
+
+		/// <summary>Crosshair colour: visible but not competing with the data.</summary>
+		public static readonly Color ChartCrosshairColor = Color.Grey50;
+
+		/// <summary>Hover readout text colour.</summary>
+		public static readonly Color ChartReadoutColor = Color.White;
+
+		/// <summary>How near the pointer must be to a point, in cells, to hover it.</summary>
+		public const int ChartHoverRadiusCells = 3;
+
+		/// <summary>Pixels of clear space between one bar slot and the next.</summary>
+		public const int ChartBarGapPixels = 2;
+
+		/// <summary>How far an area fill is dimmed toward the plot background.</summary>
+		public const double ChartAreaFillDim = 0.55;
+
+		/// <summary>Cells between one legend entry and the next.</summary>
+		public const int ChartLegendGap = 2;
+
+		/// <summary>
+		/// The most of a chart's width a Left or Right legend may take, as a percentage.
+		/// </summary>
+		/// <remarks>
+		/// A side legend sizes itself to its longest series name, so one verbose
+		/// name would otherwise leave no plot to put a legend beside.
+		/// </remarks>
+		public const int ChartSideLegendMaxPercent = 40;
+
+		/// <summary>Colour of a legend entry whose series is hidden.</summary>
+		public static readonly Color ChartLegendHiddenColor = Color.Grey35;
+
+		/// <summary>
+		/// Colours walked for series the caller did not colour.
+		/// </summary>
+		/// <remarks>
+		/// Chosen to stay distinguishable from each other and to read on both light
+		/// and dark backgrounds. A chart with a ColorRole uses the role instead.
+		/// </remarks>
+		public static readonly Color[] ChartSeriesPalette =
+		{
+			new(96, 165, 250), new(251, 146, 60), new(74, 222, 128), new(244, 114, 182),
+			new(250, 204, 21), new(167, 139, 250), new(45, 212, 191), new(248, 113, 113),
+		};
+
+		/// <summary>Colour of the message shown when a chart has nothing to plot.</summary>
+		public static readonly Color ChartEmptyTextColor = Color.Grey54;
+
+		/// <summary>Colour of the message shown when a chart reports a failure.</summary>
+		/// <remarks>
+		/// Deliberately not the empty-state grey: "waiting" and "broken" must be
+		/// distinguishable at a glance, or a dead feed reads as a quiet one.
+		/// </remarks>
+		public static readonly Color ChartErrorTextColor = Color.Red;
+
+		/// <summary>The cell a colour-scale legend fills its bar with.</summary>
+		public const char ChartColorBarChar = ' ';
+
+		/// <summary>Below this width a colour bar shows no usable gradient.</summary>
+		public const int ChartColorBarMinWidth = 4;
+
+		/// <summary>Character the centre axis is drawn with.</summary>
+		public const char ChartCentreAxisChar = '\u2504';
+
+		/// <summary>Colour of the line between a split plot's two halves.</summary>
+		public static readonly Color ChartCentreAxisColor = Color.Grey42;
+
+		/// <summary>Horizontal reference line character.</summary>
+		public const char ChartReferenceLineChar = '\u2504';
+
+		/// <summary>Vertical reference line character.</summary>
+		public const char ChartReferenceVerticalChar = '\u2506';
+
+		/// <summary>Arrow pointing at a value marker.</summary>
+		public const char ChartMarkerArrow = '\u25c4';
+
+		/// <summary>Subtitle colour: dimmer than the title it sits under.</summary>
+		public static readonly Color ChartSubtitleColor = Color.Grey62;
+
+		/// <summary>Axis title colour.</summary>
+		public static readonly Color ChartAxisTitleColor = Color.Grey70;
+
+		/// <summary>Cells between a gauge's label, bar and value.</summary>
+		public const int ChartGaugeLabelGap = 1;
+
+		/// <summary>Filled portion of a gauge bar.</summary>
+		public const char ChartGaugeFillChar = ' ';
+
+		/// <summary>Unfilled remainder of a gauge bar.</summary>
+		public const char ChartGaugeTrackChar = '\u00b7';
+
+		/// <summary>Colour of a gauge's unfilled remainder.</summary>
+		public static readonly Color ChartGaugeTrackColor = Color.Grey35;
+
+		/// <summary>Plot character in ascii render mode.</summary>
+		public const char ChartAsciiPlotChar = '\u2588';
+
+		/// <summary>Gridline character in the modes that cannot colour a pixel.</summary>
+		public const char ChartGridlineChar = '\u00b7';
+
+		/// <summary>
+		/// Pixels drawn, then skipped, along a gridline in the pixel render path.
+		/// </summary>
+		/// <remarks>
+		/// The glyph path dots its gridlines by using a dotted character. The pixel
+		/// path has no characters to choose from, so it dashes the run instead -
+		/// otherwise the same chart draws a solid bar where the other draws a hint.
+		/// </remarks>
+		public const int ChartGridlineDashRun = 1;
+
+		/// <summary>The gap between dashes along a pixel gridline.</summary>
+		public const int ChartGridlineDashGap = 2;
+
 	}
 }

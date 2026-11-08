@@ -8,6 +8,7 @@
 
 using System.Text;
 using Markdig;
+using Markdig.Extensions.EmphasisExtras;
 using Markdig.Syntax;
 using Markdig.Syntax.Inlines;
 using SharpConsoleUI.Configuration;
@@ -24,8 +25,22 @@ namespace SharpConsoleUI.Parsing
 	/// </summary>
 	public static class MarkdownToMarkup
 	{
-		private static readonly MarkdownPipeline Pipeline =
-			new MarkdownPipelineBuilder().UseAdvancedExtensions().Build();
+		private static readonly MarkdownPipeline Pipeline = BuildPipeline();
+
+		/// <summary>
+		/// The advanced extensions, less superscript and subscript. A terminal cannot raise or
+		/// lower text, so those markers could only be dropped — and a dropped caret changes what
+		/// the text says: "between 2^31 and 2^32" pairs its carets and reads "between 231 and 232".
+		/// Strikethrough, inserted and marked text keep their meaning, so they stay.
+		/// </summary>
+		private static MarkdownPipeline BuildPipeline()
+		{
+			var builder = new MarkdownPipelineBuilder().UseAdvancedExtensions();
+			builder.Extensions.RemoveAll(e => e is EmphasisExtraExtension);
+			return builder.UseEmphasisExtras(
+				EmphasisExtraOptions.Strikethrough | EmphasisExtraOptions.Inserted | EmphasisExtraOptions.Marked)
+				.Build();
+		}
 
 		/// <summary>
 		/// Converts <paramref name="markdown"/> to native markup.
@@ -41,10 +56,24 @@ namespace SharpConsoleUI.Parsing
 				return string.Empty;
 
 			style ??= MarkdownStyle.Default;
-			var doc = Markdown.Parse(markdown, Pipeline);
-			var sb = new StringBuilder(markdown.Length);
+			return RenderDocument(ParseDocument(markdown), markdown.Length, style, availableWidth);
+		}
+
+		internal static MarkdownDocument ParseDocument(string markdown) => Markdown.Parse(markdown, Pipeline);
+
+		internal static string RenderDocument(MarkdownDocument doc, int sourceLength, MarkdownStyle style, int availableWidth)
+		{
+			var sb = new StringBuilder(sourceLength);
 			WriteBlocks(doc, sb, style, availableWidth);
 			return sb.ToString().TrimEnd('\n');
+		}
+
+		internal static string RenderFragment(IEnumerable<Block> document, MarkdownStyle style, int width, int prefix)
+		{
+			var sb = new StringBuilder();
+			if (prefix > 0) sb.Append('\n', prefix);
+			WriteBlocks(document, sb, style, width);
+			return sb.ToString(prefix, sb.Length - prefix);
 		}
 
 		private static void WriteBlocks(IEnumerable<Block> blocks, StringBuilder sb, MarkdownStyle style, int availableWidth)
@@ -61,12 +90,19 @@ namespace SharpConsoleUI.Parsing
 			switch (block)
 			{
 				case ParagraphBlock p:
+					// A paragraph needs air ABOVE it, the same way a heading does. Without it
+					// consecutive paragraphs ran flush together, unlike every standard markdown
+					// renderer. (Issue #79.)
+					SeparateBlock(sb);
 					Indent(sb, indent);
 					WriteInlines(p.Inline, sb, style);
 					sb.Append('\n');
 					break;
 
 				case HeadingBlock h:
+					// A heading needs air ABOVE it, not just below: it introduces what follows, so
+					// butting it against the previous block reads as part of that block.
+					SeparateBlock(sb);
 					Indent(sb, indent);
 					WriteHeading(h, sb, style);
 					break;
@@ -201,6 +237,26 @@ namespace SharpConsoleUI.Parsing
 			}
 		}
 
+		/// <summary>
+		/// Ensures exactly one blank line sits above the block about to be written.
+		/// </summary>
+		/// <remarks>
+		/// Blocks differ in what they leave behind — a heading already appends its own trailing
+		/// blank line, a paragraph appends a single newline — so each case appending air
+		/// unconditionally stacked up: heading-then-paragraph produced three newlines and a
+		/// double gap. Normalising here keeps one rule for block separation instead of one per
+		/// case, and does nothing at the very start of the output, where a leading blank line
+		/// would just be a gap.
+		/// </remarks>
+		/// <param name="sb">The output buffer.</param>
+		private static void SeparateBlock(StringBuilder sb)
+		{
+			if (sb.Length == 0) return;                       // start of output: no leading gap
+			if (sb.Length >= 2 && sb[sb.Length - 1] == '\n'
+							   && sb[sb.Length - 2] == '\n') return;  // blank line already there
+			sb.Append('\n');
+		}
+
 		private static void Indent(StringBuilder sb, int spaces)
 		{
 			for (int i = 0; i < spaces; i++) sb.Append(' ');
@@ -287,6 +343,18 @@ namespace SharpConsoleUI.Parsing
 					// splits the cell across lines. Other inline HTML tags are dropped as before. (#59)
 					if (IsBrTag(html.Tag))
 						sb.Append('\n');
+					break;
+
+				// A DELIMITER THAT FORMED NOTHING IS TEXT. A `|` in prose that is not a table row stays in the tree as
+				// the table extension's delimiter inline, and a container's children are all the fallback below
+				// writes — so the pipe vanished: `grep x | head` rendered as `grep x  head`. Its own literal goes
+				// first, then whatever it holds.
+				// Keep this arm below EmphasisInline and LinkInline: both derive from DelimiterInline, so moving
+				// it above them would swallow their cases and emit raw `*` and `[` instead of markup.
+				case DelimiterInline delimiter:
+					sb.Append(MarkupParser.Escape(delimiter.ToLiteral()));
+					foreach (var child in delimiter)
+						WriteInline(child, sb, style);
 					break;
 
 				default:

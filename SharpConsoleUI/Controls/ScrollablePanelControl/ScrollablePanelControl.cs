@@ -6,6 +6,7 @@
 // License: MIT
 // -----------------------------------------------------------------------
 
+using SharpConsoleUI.Configuration;
 using SharpConsoleUI.Drawing;
 using SharpConsoleUI.Events;
 using SharpConsoleUI.Extensions;
@@ -55,13 +56,24 @@ namespace SharpConsoleUI.Controls
 		private readonly object _childrenLock = new();
 		private int _verticalScrollOffset = 0;
 
+		/// <summary>
+		/// Raised after the vertical scroll offset changes. Subscribers are called on the UI thread and
+		/// may use the notification to maintain a virtualized transcript window.
+		/// </summary>
+		public event EventHandler<ScrollOffsetChangedEventArgs>? VerticalScrollOffsetChanged;
+
 		/// <summary>Single write choke-point for <see cref="_verticalScrollOffset"/>. Keeping every offset
 		/// mutation funneled through one setter makes the scroll paths easy to reason about (and to
 		/// instrument when diagnosing scroll bugs). The <paramref name="reason"/> documents the caller.</summary>
 		private void SetVerticalScrollOffset(int value, string reason)
 		{
 			_ = reason;
+			if (_verticalScrollOffset == value)
+				return;
+
+			int previous = _verticalScrollOffset;
 			_verticalScrollOffset = value;
+			VerticalScrollOffsetChanged?.Invoke(this, new ScrollOffsetChangedEventArgs(previous, value));
 		}
 		private int _horizontalScrollOffset = 0;
 		private int _contentHeight = 0;
@@ -126,7 +138,14 @@ namespace SharpConsoleUI.Controls
 		private ScrollMode _horizontalScrollMode = ScrollMode.None;
 		private ScrollMode _verticalScrollMode = ScrollMode.Scroll;
 		private bool _enableMouseWheel = true;
+		private int _mouseWheelScrollSpeed = ControlDefaults.DefaultScrollWheelLines;
 		private bool _autoScroll = false;
+
+		// Whether AutoScroll has ever been switched on for this panel. Scroll gestures may DETACH and
+		// RE-ATTACH _autoScroll (drag/wheel away from the bottom and back), but re-attaching must only
+		// restore a mode the panel already had — reaching the bottom must never turn AutoScroll on for a
+		// panel that never opted in.
+		private bool _autoScrollEverEnabled = false;
 
 		// Border and padding
 		private BorderStyle _borderStyle = BorderStyle.None;
@@ -286,6 +305,17 @@ namespace SharpConsoleUI.Controls
 		}
 
 		/// <summary>
+		/// Gets or sets the number of lines scrolled per mouse wheel notch.
+		/// Values below 1 are clamped to 1.
+		/// Default: <see cref="ControlDefaults.DefaultScrollWheelLines"/>.
+		/// </summary>
+		public int MouseWheelScrollSpeed
+		{
+			get => _mouseWheelScrollSpeed;
+			set { _mouseWheelScrollSpeed = Math.Max(1, value); OnPropertyChanged(); }
+		}
+
+		/// <summary>
 		/// Gets or sets whether to automatically scroll to bottom when content is added.
 		/// When enabled, scrolls to bottom on AddControl if currently at/near bottom.
 		/// Disables automatically when user scrolls up, re-enables when user scrolls to bottom.
@@ -293,7 +323,12 @@ namespace SharpConsoleUI.Controls
 		public bool AutoScroll
 		{
 			get => _autoScroll;
-			set { _autoScroll = value; OnPropertyChanged(); }
+			set
+			{
+				_autoScroll = value;
+				if (value) _autoScrollEverEnabled = true;
+				OnPropertyChanged();
+			}
 		}
 
 		/// <summary>
@@ -312,6 +347,18 @@ namespace SharpConsoleUI.Controls
 		/// this returns the height of the inner content that may extend beyond the viewport.
 		/// </summary>
 		public int TotalContentHeight => _contentHeight;
+
+		/// <inheritdoc/>
+		public override void DescribeState(IStateWriter w)
+		{
+			ArgumentNullException.ThrowIfNull(w);
+			base.DescribeState(w);
+
+			// The three numbers that answer every "why can I not see it" question
+			// about a scrolling panel: where it sits, how much shows, how much
+			// there is. An offset alone cannot say whether anything is below.
+			w.Scroll(VerticalScrollOffset, VisibleContentHeight, TotalContentHeight);
+		}
 
 		/// <summary>
 		/// Gets the total width of the scrollable content area in characters.
@@ -338,7 +385,7 @@ namespace SharpConsoleUI.Controls
 		/// <summary>
 		/// Gets whether the content can be scrolled downward (more content exists below the viewport).
 		/// </summary>
-		public bool CanScrollDown => _verticalScrollOffset < Math.Max(0, _contentHeight - _viewportHeight);
+		public bool CanScrollDown => _verticalScrollOffset < MaxVerticalScrollOffset;
 
 		/// <summary>
 		/// Gets whether the content can be scrolled left (horizontal offset is greater than zero).
@@ -439,6 +486,13 @@ namespace SharpConsoleUI.Controls
 		/// always reachable even when a vertical scrollbar steals columns (Bug A).
 		/// </summary>
 		private int MaxHorizontalScrollOffset => Math.Max(0, _contentWidth - VisibleContentWidth);
+
+		/// <summary>
+		/// The maximum vertical scroll offset: total content height minus the visible content
+		/// height. Computed against <see cref="VisibleContentHeight"/> so the last content line is
+		/// always reachable even when a horizontal scrollbar steals a row (#80).
+		/// </summary>
+		private int MaxVerticalScrollOffset => Math.Max(0, _contentHeight - VisibleContentHeight);
 
 		#endregion
 
@@ -611,19 +665,23 @@ namespace SharpConsoleUI.Controls
 		/// so the metrics are recomputed from the arranged bounds rather than served from a stale entry.
 		/// </remarks>
 		internal void SyncMetricsFromArrangedBounds()
+			=> TrySyncMetricsFromArrangedBounds();
+
+		private bool TrySyncMetricsFromArrangedBounds()
 		{
 			var node = this.GetParentWindow()?.Renderer?.GetLayoutNode(this);
 			if (node == null)
-				return;
+				return false;
 
 			var arranged = node.AbsoluteBounds;
 			if (arranged.Width <= 0 || arranged.Height <= 0)
-				return;
+				return false;
 
 			// Resolve from a position-independent outer box of the arranged size; ResolveContentMetrics
 			// only uses Width/Height (origins are relative), so X/Y are irrelevant here.
 			_metricsCacheValid = false;
 			ResolveContentMetrics(new LayoutRect(0, 0, arranged.Width, arranged.Height));
+			return _viewportWidth > 0 && _viewportHeight > 0;
 		}
 
 		/// <summary>

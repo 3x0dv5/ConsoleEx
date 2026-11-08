@@ -7,6 +7,7 @@
 // -----------------------------------------------------------------------
 
 using System.Drawing;
+using System.Threading;
 using SharpConsoleUI.Drivers;
 
 // Code from Terminal.Gui - https://github.com/gui-cs/Terminal.Gui
@@ -48,20 +49,28 @@ namespace SharpConsoleUI.Helpers
 		/// </summary>
 		public static readonly string CSI_EnableSgrExtModeMouse = CSI + "?1006h";
 
-		private static bool _isButtonClicked;
 
-		private static bool _isButtonDoubleClicked;
 
 		// QUESTION: What's the difference between isButtonClicked and isButtonPressed?
 		// Some clarity or comments would be handy, here.
 		// It also seems like some enforcement of valid states might be a good idea.
-		private static bool _isButtonPressed;
-
-		private static bool _isButtonTripleClicked;
-
-		private static MouseFlags? _lastMouseButtonPressed;
-		private static Point? _point;
-		private static DateTime _lastClickTime = DateTime.MinValue;
+		/// <summary>The auto-repeat for a held button.</summary>
+		/// <remarks>
+		/// <para>
+		/// Still static, because <see cref="GetMouse"/> and <see cref="Reset"/> are
+		/// public static and cannot become instance members without breaking every
+		/// caller. What changed is that one object owns the state rather than five
+		/// loose fields: a press, a release and a reset are now three calls on it,
+		/// and the cancellation discipline is the same code the Unix reader uses.
+		/// </para>
+		/// <para>
+		/// The hazard the old comment described - a new driver in the same process
+		/// inheriting a live loop from the previous one - is answered by
+		/// <see cref="Reset"/> disposing this and starting a fresh one, which the
+		/// driver already calls on shutdown.
+		/// </para>
+		/// </remarks>
+		private static Drivers.Input.ContinuousPress _press = new();
 
 		/// <summary>
 		/// Gets the C1 control character name for the specified character.
@@ -195,525 +204,125 @@ namespace SharpConsoleUI.Helpers
 		/// <param name="continuousButtonPressedHandler">Handler to invoke for continuous button press events.</param>
 		public static void GetMouse(ConsoleKeyInfo[] cki, out List<MouseFlags> mouseFlags, out Point pos, Action<MouseFlags, Point> continuousButtonPressedHandler)
 		{
+			// Decoded by the one parser rather than a second implementation of the
+			// same protocol. This used to carry its own SGR state machine, and the
+			// two drifted: the Windows path emitted no drag flag at all until #45,
+			// and the modifier-mask bug had to be found and fixed once per decoder.
+			//
+			// The bridge is cheap because SGR is pure ASCII. The Windows input loop
+			// collects an escape sequence as ConsoleKeyInfo, and those characters
+			// ARE the bytes the parser wants.
+			//
+			// What stays here is the continuous-press lifecycle below: that is not
+			// decoding, it is the terminal's missing auto-repeat, and only the code
+			// holding the input knows a button is still physically down.
+			var decoded = Drivers.Input.AnsiInputParser.DecodeSgrMouse(GetKeyCharArray(cki));
+
+			pos = decoded.Position;
+
+			// One flag per entry, as the parser produced them, rather than OR'd into
+			// a single value. The recogniser strips modifiers and compares for
+			// EQUALITY, so a drag collapsed into one value - Pressed, Dragged and
+			// ReportMousePosition together - matched no button constant and read as
+			// no button held, on Windows only.
+			mouseFlags = decoded.Flags;
+
+			if (mouseFlags.Count == 0)
+			{
+				// Not an SGR mouse report. An empty answer rather than an
+				// exception, as before: the caller tests the flags.
+				return;
+			}
+
+			// The lifecycle below reasons about one value, so the flags are folded
+			// together for it alone. What goes OUT is the list above.
 			MouseFlags buttonState = 0;
-			pos = Point.Empty;
-			var buttonCode = 0;
-			var foundButtonCode = false;
-			var foundPoint = 0;
-			string value = string.Empty;
-			char[] kChar = GetKeyCharArray(cki);
+			foreach (var flag in mouseFlags) buttonState |= flag;
 
-			// PERF: This loop could benefit from use of Spans and other strategies to avoid copies.
-			for (var i = 0; i < kChar.Length; i++)
+			const MouseFlags modifierMask = MouseFlags.ButtonShift | MouseFlags.ButtonAlt | MouseFlags.ButtonCtrl;
+			var actionState = buttonState & ~modifierMask;
+
+			// Report what the terminal said, and nothing else.
+			//
+			// Clicks, double-clicks and triple-clicks are NOT derived here. They are
+			// gestures - judgements about timing and position - made once, for every
+			// platform, by MouseGestureRecognizer in the input coordinator. This used
+			// to be a ~130-line state machine with five pieces of static state and two
+			// background expiry timers, duplicated almost line for line in
+			// UnixStdinReader. Two copies could disagree, and did; worse, a press
+			// inside the click window was REPLACED by the derived double-click rather
+			// than accompanied by it, so anything watching for presses lost half of a
+			// fast click run.
+			//
+			// The continuous-press loop stays: it is not a gesture, it is the
+			// terminal's missing auto-repeat, and only the code reading input knows a
+			// button is still physically down.
+			//
+			// Nothing is written back into mouseFlags here. It holds the parser's
+			// own entries, one flag each, and overwriting the first with the
+			// folded value left a list whose head carried every bit and whose
+			// tail repeated them - so a caller testing Contains for one flag
+			// could not find it.
+
+			if (actionState == MouseFlags.Button1Pressed
+				|| actionState == MouseFlags.Button2Pressed
+				|| actionState == MouseFlags.Button3Pressed
+				|| actionState == MouseFlags.Button4Pressed)
 			{
-				// PERF: Copy
-				char c = kChar[i];
-
-				if (c == '<')
-				{
-					foundButtonCode = true;
-				}
-				else if (foundButtonCode && c != ';')
-				{
-					// PERF: Ouch
-					value += c.ToString();
-				}
-				else if (c == ';')
-				{
-					if (foundButtonCode)
-					{
-						foundButtonCode = false;
-						buttonCode = int.Parse(value);
-					}
-
-					if (foundPoint == 1)
-					{
-						pos.X = int.Parse(value) - 1;
-					}
-
-					value = string.Empty;
-					foundPoint++;
-				}
-				else if (foundPoint > 0 && c != 'm' && c != 'M')
-				{
-					value += c.ToString();
-				}
-				else if (c == 'm' || c == 'M')
-				{
-					//pos.Y = int.Parse (value) + Console.WindowTop - 1;
-					pos.Y = int.Parse(value) - 1;
-
-					switch (buttonCode)
-					{
-						case 0:
-						case 8:
-						case 16:
-						case 24:
-						case 32:
-						case 36:
-						case 40:
-						case 48:
-						case 56:
-							buttonState = c == 'M'
-											  ? MouseFlags.Button1Pressed
-											  : MouseFlags.Button1Released;
-
-							break;
-
-						case 1:
-						case 9:
-						case 17:
-						case 25:
-						case 33:
-						case 37:
-						case 41:
-						case 45:
-						case 49:
-						case 53:
-						case 57:
-						case 61:
-							buttonState = c == 'M'
-											  ? MouseFlags.Button2Pressed
-											  : MouseFlags.Button2Released;
-
-							break;
-
-						case 2:
-						case 10:
-						case 14:
-						case 18:
-						case 22:
-						case 26:
-						case 30:
-						case 34:
-						case 42:
-						case 46:
-						case 50:
-						case 54:
-						case 58:
-						case 62:
-							buttonState = c == 'M'
-											  ? MouseFlags.Button3Pressed
-											  : MouseFlags.Button3Released;
-
-							break;
-
-						case 35:
-						case 39:
-						case 43:
-						case 47:
-						case 51:
-						case 55:
-						case 59:
-						case 63:
-							buttonState = MouseFlags.ReportMousePosition;
-
-							break;
-
-						case 64:
-							buttonState = MouseFlags.WheeledUp;
-
-							break;
-
-						case 65:
-							buttonState = MouseFlags.WheeledDown;
-
-							break;
-
-						case 68:
-						case 72:
-						case 80:
-							buttonState = MouseFlags.WheeledLeft; // Shift/Ctrl+WheeledUp
-
-							break;
-
-						case 69:
-						case 73:
-						case 81:
-							buttonState = MouseFlags.WheeledRight; // Shift/Ctrl+WheeledDown
-
-							break;
-					}
-
-					// Modifiers.
-					switch (buttonCode)
-					{
-						case 8:
-						case 9:
-						case 10:
-						case 43:
-							buttonState |= MouseFlags.ButtonAlt;
-
-							break;
-
-						case 14:
-						case 47:
-							buttonState |= MouseFlags.ButtonAlt | MouseFlags.ButtonShift;
-
-							break;
-
-						case 16:
-						case 17:
-						case 18:
-						case 51:
-							buttonState |= MouseFlags.ButtonCtrl;
-
-							break;
-
-						case 22:
-						case 55:
-							buttonState |= MouseFlags.ButtonCtrl | MouseFlags.ButtonShift;
-
-							break;
-
-						case 24:
-						case 25:
-						case 26:
-						case 59:
-							buttonState |= MouseFlags.ButtonCtrl | MouseFlags.ButtonAlt;
-
-							break;
-
-						case 30:
-						case 63:
-							buttonState |= MouseFlags.ButtonCtrl | MouseFlags.ButtonShift | MouseFlags.ButtonAlt;
-
-							break;
-
-						case 32:
-						case 33:
-						case 34:
-							buttonState |= MouseFlags.ReportMousePosition;
-
-							break;
-
-						case 36:
-						case 37:
-							buttonState |= MouseFlags.ReportMousePosition | MouseFlags.ButtonShift;
-
-							break;
-
-						case 39:
-						case 68:
-						case 69:
-							buttonState |= MouseFlags.ButtonShift;
-
-							break;
-
-						case 40:
-						case 41:
-						case 42:
-							buttonState |= MouseFlags.ReportMousePosition | MouseFlags.ButtonAlt;
-
-							break;
-
-						case 45:
-						case 46:
-							buttonState |= MouseFlags.ReportMousePosition | MouseFlags.ButtonAlt | MouseFlags.ButtonShift;
-
-							break;
-
-						case 48:
-						case 49:
-						case 50:
-							buttonState |= MouseFlags.ReportMousePosition | MouseFlags.ButtonCtrl;
-
-							break;
-
-						case 53:
-						case 54:
-							buttonState |= MouseFlags.ReportMousePosition | MouseFlags.ButtonCtrl | MouseFlags.ButtonShift;
-
-							break;
-
-						case 56:
-						case 57:
-						case 58:
-							buttonState |= MouseFlags.ReportMousePosition | MouseFlags.ButtonCtrl | MouseFlags.ButtonAlt;
-
-							break;
-
-						case 61:
-						case 62:
-							buttonState |= MouseFlags.ReportMousePosition | MouseFlags.ButtonCtrl | MouseFlags.ButtonShift | MouseFlags.ButtonAlt;
-
-							break;
-					}
-				}
+				// Begin replaces any repeat already running, so a press of a button
+				// already held - the terminal restating a drag - cannot stack a
+				// second loop on the first.
+				_press.Begin(buttonState, pos, continuousButtonPressedHandler);
+			}
+			else if (actionState == MouseFlags.Button1Released
+				|| actionState == MouseFlags.Button2Released
+				|| actionState == MouseFlags.Button3Released
+				|| actionState == MouseFlags.Button4Released)
+			{
+				_press.End(Drivers.Input.ContinuousPress.PressFor(actionState));
+			}
+			else if (buttonState.HasFlag(MouseFlags.ReportMousePosition))
+			{
+				// So a held button repeats where the pointer is now.
+				_press.Moved(pos);
 			}
 
-			// Consistency with the Unix AnsiInputParser path: an SGR motion-while-button-held report
-			// (motion bit 0x20 set, a real button 0/1/2 in the low 2 bits, not a wheel 0x40) must also
-			// surface ButtonNDragged. Without this the Windows ReadKey path emits only
-			// ButtonNPressed|ReportMousePosition, so drag-aware controls (selection autoscroll,
-			// splitters) never see Button1Dragged and behave differently than on Unix (#45).
-			if ((buttonCode & 0x20) != 0 && (buttonCode & 0x40) == 0)
-			{
-				switch (buttonCode & 0x03)
-				{
-					case 0: buttonState |= MouseFlags.Button1Dragged; break;
-					case 1: buttonState |= MouseFlags.Button2Dragged; break;
-					case 2: buttonState |= MouseFlags.Button3Dragged; break;
-				}
-			}
-
-			mouseFlags = [MouseFlags.AllEvents];
-
-			if (_lastMouseButtonPressed != null
-				&& !_isButtonPressed
-				&& !buttonState.HasFlag(MouseFlags.ReportMousePosition)
-				&& !buttonState.HasFlag(MouseFlags.Button1Released)
-				&& !buttonState.HasFlag(MouseFlags.Button2Released)
-				&& !buttonState.HasFlag(MouseFlags.Button3Released)
-				&& !buttonState.HasFlag(MouseFlags.Button4Released))
-			{
-				_lastMouseButtonPressed = null;
-				_isButtonPressed = false;
-			}
-
-			if ((!_isButtonClicked
-				 && !_isButtonDoubleClicked
-				 && (buttonState == MouseFlags.Button1Pressed
-					 || buttonState == MouseFlags.Button2Pressed
-					 || buttonState == MouseFlags.Button3Pressed
-					 || buttonState == MouseFlags.Button4Pressed)
-				 && _lastMouseButtonPressed is null)
-				|| (_isButtonPressed && _lastMouseButtonPressed is { } && buttonState.HasFlag(MouseFlags.ReportMousePosition)))
-			{
-				mouseFlags[0] = buttonState;
-				_lastMouseButtonPressed = buttonState;
-				_isButtonPressed = true;
-
-				_point = pos;
-
-				if ((mouseFlags[0] & MouseFlags.ReportMousePosition) == 0)
-				{
-					Task.Run(
-							async () => await ProcessContinuousButtonPressedAsync(
-											buttonState,
-											continuousButtonPressedHandler));
-				}
-				else if (mouseFlags[0].HasFlag(MouseFlags.ReportMousePosition))
-				{
-					_point = pos;
-
-					// The isButtonPressed must always be true, otherwise we can lose the feature
-					// If mouse flags has ReportMousePosition this feature won't run
-					// but is always prepared with the new location
-					//isButtonPressed = false;
-				}
-			}
-			else if (_isButtonDoubleClicked
-					 && (buttonState == MouseFlags.Button1Pressed
-						 || buttonState == MouseFlags.Button2Pressed
-						 || buttonState == MouseFlags.Button3Pressed
-						 || buttonState == MouseFlags.Button4Pressed))
-			{
-				mouseFlags[0] = GetButtonTripleClicked(buttonState);
-				_isButtonDoubleClicked = false;
-				_isButtonTripleClicked = true;
-			}
-			else if (_isButtonClicked
-					 && (buttonState == MouseFlags.Button1Pressed
-						 || buttonState == MouseFlags.Button2Pressed
-						 || buttonState == MouseFlags.Button3Pressed
-						 || buttonState == MouseFlags.Button4Pressed))
-			{
-				mouseFlags[0] = GetButtonDoubleClicked(buttonState);
-				_isButtonClicked = false;
-				_isButtonDoubleClicked = true;
-
-				Task.Run(async () => await ProcessButtonDoubleClickedAsync());
-			}
-
-			else if (!_isButtonClicked
-					 && !_isButtonDoubleClicked
-					 && (buttonState == MouseFlags.Button1Released
-						 || buttonState == MouseFlags.Button2Released
-						 || buttonState == MouseFlags.Button3Released
-						 || buttonState == MouseFlags.Button4Released))
-			{
-				mouseFlags[0] = buttonState;
-				_isButtonPressed = false;
-
-				if (_isButtonTripleClicked)
-				{
-					_isButtonTripleClicked = false;
-				}
-				else if (pos.X == _point?.X && pos.Y == _point?.Y)
-				{
-					// SAFEGUARD: Ignore duplicate release events (< 50ms = driver bug)
-					var timeSinceLastClick = (DateTime.Now - _lastClickTime).TotalMilliseconds;
-					if (timeSinceLastClick >= 50)
-					{
-						mouseFlags.Add(GetButtonClicked(buttonState));
-						_isButtonClicked = true;
-						Task.Run(async () => await ProcessButtonClickedAsync());
-						_lastClickTime = DateTime.Now;
-					}
-				}
-
-				_point = pos;
-
-			}
-			else if (buttonState == MouseFlags.WheeledUp)
-			{
-				mouseFlags[0] = MouseFlags.WheeledUp;
-			}
-			else if (buttonState == MouseFlags.WheeledDown)
-			{
-				mouseFlags[0] = MouseFlags.WheeledDown;
-			}
-			else if (buttonState == MouseFlags.WheeledLeft)
-			{
-				mouseFlags[0] = MouseFlags.WheeledLeft;
-			}
-			else if (buttonState == MouseFlags.WheeledRight)
-			{
-				mouseFlags[0] = MouseFlags.WheeledRight;
-			}
-			else if (buttonState == MouseFlags.ReportMousePosition)
-			{
-				mouseFlags[0] = MouseFlags.ReportMousePosition;
-			}
-			else
-			{
-				mouseFlags[0] = buttonState;
-
-				//foreach (var flag in buttonState.GetUniqueFlags()) {
-				//	mouseFlag [0] |= flag;
-				//}
-			}
-
-			mouseFlags[0] = SetControlKeyStates(buttonState, mouseFlags[0]);
-
-			//buttonState = mouseFlags;
+			// The modifier bits are already in the parser's entries, so there is
+			// nothing to re-apply: SetControlKeyStates existed to put them back
+			// onto a value the old state machine had stripped them from.
 
 			//foreach (var mf in mouseFlags) {
 			//}
 		}
 
-		private static MouseFlags GetButtonClicked(MouseFlags mouseFlag)
+
+
+
+
+
+
+		/// <summary>
+		/// Clears the mouse click/press state machine and stops any continuous-press loop.
+		/// </summary>
+		/// <remarks>
+		/// This state is process-wide, so a driver shutting down — or a test constructing a fresh
+		/// console window system — should call this to avoid inheriting a previous owner's
+		/// half-finished click sequence or a still-running press loop.
+		/// </remarks>
+		public static void Reset()
 		{
-			MouseFlags mf = default;
+			// Swapped atomically, then disposed. GetMouse reads this field on the
+			// input thread, and Reset runs on whichever thread is stopping the
+			// driver - which does not wait for the reader - so a plain
+			// dispose-then-assign leaves a window where the input thread can call
+			// Begin on an instance that has just been disposed.
+			//
+			// Disposed and replaced rather than cleared, so a fresh owner cannot
+			// inherit a running loop from the one before it.
+			var previous = Interlocked.Exchange(ref _press, new Drivers.Input.ContinuousPress());
 
-			switch (mouseFlag)
-			{
-				case MouseFlags.Button1Released:
-					mf = MouseFlags.Button1Clicked;
-
-					break;
-
-				case MouseFlags.Button2Released:
-					mf = MouseFlags.Button2Clicked;
-
-					break;
-
-				case MouseFlags.Button3Released:
-					mf = MouseFlags.Button3Clicked;
-
-					break;
-			}
-
-			return mf;
+			previous.Dispose();
 		}
 
-		private static MouseFlags GetButtonDoubleClicked(MouseFlags mouseFlag)
-		{
-			MouseFlags mf = default;
-
-			switch (mouseFlag)
-			{
-				case MouseFlags.Button1Pressed:
-					mf = MouseFlags.Button1DoubleClicked;
-
-					break;
-
-				case MouseFlags.Button2Pressed:
-					mf = MouseFlags.Button2DoubleClicked;
-
-					break;
-
-				case MouseFlags.Button3Pressed:
-					mf = MouseFlags.Button3DoubleClicked;
-
-					break;
-			}
-
-			return mf;
-		}
-
-		private static MouseFlags GetButtonTripleClicked(MouseFlags mouseFlag)
-		{
-			MouseFlags mf = default;
-
-			switch (mouseFlag)
-			{
-				case MouseFlags.Button1Pressed:
-					mf = MouseFlags.Button1TripleClicked;
-
-					break;
-
-				case MouseFlags.Button2Pressed:
-					mf = MouseFlags.Button2TripleClicked;
-
-					break;
-
-				case MouseFlags.Button3Pressed:
-					mf = MouseFlags.Button3TripleClicked;
-
-					break;
-			}
-
-			return mf;
-		}
-
-		private static async Task ProcessButtonClickedAsync()
-		{
-			await Task.Delay(Configuration.ControlDefaults.DefaultDebounceMs);
-			_isButtonClicked = false;
-		}
-
-		private static async Task ProcessButtonDoubleClickedAsync()
-		{
-			await Task.Delay(Configuration.ControlDefaults.DefaultDebounceMs);
-			_isButtonDoubleClicked = false;
-		}
-
-		private static async Task ProcessContinuousButtonPressedAsync(MouseFlags mouseFlag, Action<MouseFlags, Point> continuousButtonPressedHandler)
-		{
-			// PERF: Pause and poll in a hot loop.
-			// This should be replaced with event dispatch and a synchronization primitive such as AutoResetEvent.
-			// Will make a massive difference in responsiveness.
-			while (_isButtonPressed)
-			{
-				await Task.Delay(Configuration.ControlDefaults.ContinuousPressIntervalMs);
-
-				if (_isButtonPressed && _lastMouseButtonPressed is { } && (mouseFlag & MouseFlags.ReportMousePosition) == 0)
-				{
-					continuousButtonPressedHandler(mouseFlag, _point ?? Point.Empty);
-				}
-			}
-		}
-
-		private static MouseFlags SetControlKeyStates(MouseFlags buttonState, MouseFlags mouseFlag)
-		{
-			if ((buttonState & MouseFlags.ButtonCtrl) != 0 && (mouseFlag & MouseFlags.ButtonCtrl) == 0)
-			{
-				mouseFlag |= MouseFlags.ButtonCtrl;
-			}
-
-			if ((buttonState & MouseFlags.ButtonShift) != 0 && (mouseFlag & MouseFlags.ButtonShift) == 0)
-			{
-				mouseFlag |= MouseFlags.ButtonShift;
-			}
-
-			if ((buttonState & MouseFlags.ButtonAlt) != 0 && (mouseFlag & MouseFlags.ButtonAlt) == 0)
-			{
-				mouseFlag |= MouseFlags.ButtonAlt;
-			}
-
-			return mouseFlag;
-		}
 	}
 }

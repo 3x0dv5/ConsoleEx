@@ -27,7 +27,10 @@ public static class LauncherWindow
 					.AddItem("Collapsible Panel", subtitle: "Click-to-expand sections — FAQ & AI-agent logs", content: MakeInfoPanel("Collapsible Panel"))
 				.AddItem("WinUI Layout", subtitle: "WinUI-inspired settings layout", content: MakeInfoPanel("WinUI Layout"))
 					.AddItem("Grid Layout", subtitle: "WinUI-style grid: spans, gaps, per-cell styling", content: MakeInfoPanel("Grid Layout"))
+					.AddItem("Window Docking", subtitle: "Four edge surfaces around a scrolling body", content: MakeInfoPanel("Window Docking"))
+					.AddItem("Grid Docking", subtitle: "Docked edges and placed cells in one grid", content: MakeInfoPanel("Grid Docking"))
 				.AddItem("Horizontal Splitter", subtitle: "Drag-to-resize horizontal bars", content: MakeInfoPanel("Horizontal Splitter"))
+				.AddItem("Shared Scrollbar", subtitle: "One ScrollbarControl driving two panes in lockstep", content: MakeInfoPanel("Shared Scrollbar"))
 				.AddItem("Status Bar", subtitle: "Clickable status bar with zones", content: MakeInfoPanel("Status Bar"))
 				.AddItem("Toolbar", subtitle: "Multi-height toolbar with auto-sizing", content: MakeInfoPanel("Toolbar")))
 			.AddHeader("Controls", Color.Green, header => header
@@ -42,7 +45,9 @@ public static class LauncherWindow
 					.AddItem("Radio Buttons", subtitle: "Grouped single-select — typed values, wrap, alignment, grid grouping", content: MakeInfoPanel("Radio Buttons"))
 					.AddItem("Form", subtitle: "Labeled inputs, validation, sections, hints", content: MakeInfoPanel("Form"))
 				.AddItem("Table", subtitle: "Interactive employee directory", content: MakeInfoPanel("Table"))
+				.AddItem("Tree Table", subtitle: "A table whose rows nest", content: MakeInfoPanel("Tree Table"))
 				.AddItem("DataGrid", subtitle: "Virtual DataGrid with 10K rows", content: MakeInfoPanel("DataGrid"))
+				.AddItem("Source Filtering", subtitle: "Data source handles its own filters", content: MakeInfoPanel("Source Filtering"))
 				.AddItem("Nerd Fonts", subtitle: "NerdFont icon showcase", content: MakeInfoPanel("Nerd Fonts"))
 				.AddItem("Markup Syntax", subtitle: "Rich markup system demo", content: MakeInfoPanel("Markup Syntax"))
 				.AddItem("Markdown", subtitle: "[markdown] tag + clickable, keyboard-navigable links", content: MakeInfoPanel("Markdown"))
@@ -55,6 +60,7 @@ public static class LauncherWindow
 				.AddItem("HTML Rendering", subtitle: "Lynx-inspired HTML renderer", content: MakeInfoPanel("HTML Rendering")))
 			.AddHeader("Data Visualization", Color.Yellow, header => header
 				.AddItem("Graphs & Charts", subtitle: "Live sparklines & bar graphs", content: MakeInfoPanel("Graphs & Charts"))
+				.AddItem("Chart Showcase", subtitle: "Every ChartControl feature", content: MakeInfoPanel("Chart Showcase"))
 				.AddItem("System Monitor", subtitle: "Real-time system dashboard", content: MakeInfoPanel("System Monitor")))
 			.AddHeader("Rendering", Color.Orange1, header => header
 				.AddItem("Container Backgrounds", subtitle: "Background color & gradient propagation", content: MakeInfoPanel("Container Backgrounds"))
@@ -245,6 +251,8 @@ public static class LauncherWindow
 			"Collapsible Panel" => CollapsibleDemoWindow.Create(ws),
 			"WinUI Layout" => WinUIDemoWindow.Create(ws),
 			"Grid Layout" => GridDemoWindow.Create(ws),
+			"Window Docking" => DockSurfacesWindow.Create(ws),
+			"Grid Docking" => GridDockWindow.Create(ws),
 			"Horizontal Splitter" => HorizontalSplitterDemoWindow.Create(ws),
 			"Status Bar" => StatusBarDemoWindow.Create(ws),
 			"Prompt Control" => PromptDemoWindow.Create(ws),
@@ -257,7 +265,9 @@ public static class LauncherWindow
 			"Radio Buttons" => RadioDemoWindow.Create(ws),
 			"Form" => FormDemoWindow.Create(ws),
 			"Table" => TableDemoWindow.Create(ws),
+			"Tree Table" => TreeTableDemoWindow.Create(ws),
 			"DataGrid" => DataGridWindow.Create(ws),
+			"Source Filtering" => SourceFilterDemoWindow.Create(ws),
 			"Nerd Fonts" => NerdFontWindow.Create(ws),
 			"Markup Syntax" => MarkupSyntaxWindow.Create(ws),
 			"Markdown" => MarkdownDemoWindow.Create(ws),
@@ -266,8 +276,10 @@ public static class LauncherWindow
 			"Data Binding" => DataBindingWindow.Create(ws),
 			"Date & Time" => DateTimeDemo.Create(ws),
 			"Slider" => SliderDemoWindow.Create(ws),
+			"Shared Scrollbar" => ScrollbarDemoWindow.Create(ws),
 			"Spinner" => SpinnerDemoWindow.Create(ws),
 			"Graphs & Charts" => GraphsWindow.Create(ws),
+			"Chart Showcase" => ChartShowcaseWindow.Create(ws),
 			"System Monitor" => SystemMonitorWindow.Create(ws),
 			"Container Backgrounds" => ContainerBgDemoWindow.Create(ws),
 			"Gradients" => GradientDemoWindow.Create(ws),
@@ -299,6 +311,41 @@ public static class LauncherWindow
 	{
 		return demoName switch
 		{
+			"Window Docking" => new List<string>
+			{
+				"[bold]Window Docking[/]",
+				"",
+				"The window root gives four edges around a scrolling",
+				"middle. Each docked child claims a strip, in the",
+				"order it was declared, and the body gets the rest.",
+				"",
+				"[dim]Shows:[/]",
+				"  - DockTop / DockLeft / DockRight / DockBottom",
+				"  - DockBody, the only part that scrolls",
+				"  - Two bottom bands in author order",
+				"",
+				"[dim]Why it matters:[/]",
+				"  - StickyTop/StickyBottom are the same Dock value,",
+				"    so existing code needed no change",
+				"  - window.Root swaps the layout per window",
+			},
+			"Grid Docking" => new List<string>
+			{
+				"[bold]Grid Docking[/]",
+				"",
+				"A GridControl with both placements at once: docked",
+				"children claim the edges, placed children fill the",
+				"tracks inside whatever is left.",
+				"",
+				"[dim]Shows:[/]",
+				"  - grid.DockChild(control, Dock.Top/Left/Bottom)",
+				"  - grid.Place(control, row, col) alongside it",
+				"  - Cell coordinates unchanged by docking",
+				"",
+				"[dim]Why it matters:[/]",
+				"  - One container does both, so no separate",
+				"    dock-panel control is needed",
+			},
 			"Border Styles" => new List<string>
 			{
 				"[bold]Border Styles[/]",
@@ -522,6 +569,22 @@ public static class LauncherWindow
 				"  - Drag column borders to resize",
 				"  - Markup-colored status column",
 			},
+			"Tree Table" => new List<string>
+			{
+				"[bold]Tree Table[/]",
+				"",
+				"A backlog of epics, features, stories and tasks",
+				"in a table whose rows nest: every table feature,",
+				"with sorting and filtering that follow the tree.",
+				"",
+				"[dim]Features:[/]",
+				"  - Right/Left/Space/+/-/* open and close rows",
+				"  - Click a header to sort among siblings",
+				"  - / to filter; a match keeps its parents",
+				"  - Click an expander to toggle a row",
+				"  - Guide styles, indent, lazy-loaded epic",
+				"  - Tab 2: bound to view models (BindItems)",
+			},
 			"DataGrid" => new List<string>
 			{
 				"[bold]Interactive DataGrid[/]",
@@ -536,6 +599,20 @@ public static class LauncherWindow
 				"  - Tab/arrows for cell navigation",
 				"  - Drag column borders to resize",
 				"  - Smooth scrollbar dragging",
+			},
+			"Source Filtering" => new List<string>
+			{
+				"[bold]Data-source Filtering[/]",
+				"",
+				"Two ways a data source can take a filter the",
+				"table would otherwise apply itself, through",
+				"TryApplyFilterToDataSource.",
+				"",
+				"[dim]Tabs:[/]",
+				"  - Tree: supplies display rows, so a matching",
+				"    task keeps its story on screen",
+				"  - Remote: narrows itself, so no map is held",
+				"  - / to filter, two words = two AND terms",
 			},
 			"Nerd Fonts" => new List<string>
 			{
@@ -680,6 +757,21 @@ public static class LauncherWindow
 				"  - SparklineControl (Block, Braille, Bidirectional)",
 				"  - BarGraphControl, ProgressBarControl",
 			},
+			"Chart Showcase" => new List<string>
+			{
+				"[bold]Chart Showcase[/]",
+				"",
+				"Every ChartControl feature, a page at a time, behind a",
+				"NavigationView. Plot types, the three render modes side",
+				"by side on identical data, gradients by position and by",
+				"value, custom tick providers, a second axis, stacking,",
+				"split view, annotations, interaction and a live feed.",
+				"",
+				"[dim]Controls used:[/]",
+				"  - ChartControl (all five plot types)",
+				"  - NavigationViewControl, ScrollablePanelControl",
+				"  - Written entirely through ChartBuilder",
+			},
 			"System Monitor" => new List<string>
 			{
 				"[bold]System Monitor[/]",
@@ -760,7 +852,7 @@ public static class LauncherWindow
 				"[bold]Image Viewer[/]",
 				"",
 				"Load and display real image files (PNG, JPEG, BMP,",
-				"GIF, WebP, TIFF) with half-block Unicode rendering.",
+				"GIF, TGA) with half-block Unicode rendering.",
 				"",
 				"[dim]Features:[/]",
 				"  - File picker for loading images",
@@ -768,7 +860,7 @@ public static class LauncherWindow
 				"  - Keyboard shortcuts: Ctrl+O, S, Esc",
 				"  - Resizable window with live rescaling",
 				"",
-				"[dim]Powered by SixLabors.ImageSharp[/]",
+				"[dim]Powered by StbImageSharp[/]",
 			},
 			"Flows" => new List<string>
 			{
@@ -817,7 +909,7 @@ public static class LauncherWindow
 				"every second using async window thread.",
 				"",
 				"[dim]Controls used:[/]",
-				"  - FigleControl",
+				"  - FigletControl",
 			},
 			"Log Viewer" => new List<string>
 			{
@@ -874,6 +966,26 @@ public static class LauncherWindow
 				"[dim]Controls used:[/]",
 				"  - TerminalControl (PTY)",
 			},
+			"Shared Scrollbar" => new List<string>
+			{
+				"[bold]Shared Scrollbar[/]",
+				"",
+				"A standalone ScrollbarControl (issue #85) driving two",
+				"ScrollablePanelControls at once — a side-by-side diff",
+				"pair that stays in lockstep, with only one visible bar.",
+				"",
+				"[dim]Features:[/]",
+				"  - UserValueChanged pushes the bar's value to both panes",
+				"  - Each pane's Scrolled event writes back to the bar",
+				"  - No echo, no guard flag: a code-set Value only",
+				"    raises ValueChanged, never UserValueChanged",
+				"  - Drag the thumb, click the arrows, or wheel over",
+				"    either pane",
+				"",
+				"[dim]Controls used:[/]",
+				"  - ScrollbarControl, ScrollablePanelControl (x2)",
+				"  - GridControl, MarkupControl",
+			},
 			"Slider" => new List<string>
 			{
 				"[bold]Slider Controls[/]",
@@ -920,7 +1032,7 @@ public static class LauncherWindow
 				"FIGlet ASCII art banner with project info.",
 				"",
 				"[dim]Controls used:[/]",
-				"  - FigleControl, MarkupControl",
+				"  - FigletControl, MarkupControl",
 			},
 			"Canvas Animations" => new List<string>
 			{

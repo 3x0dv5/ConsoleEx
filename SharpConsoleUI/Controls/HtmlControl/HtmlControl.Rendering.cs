@@ -94,10 +94,18 @@ namespace SharpConsoleUI.Controls
 			// The layout bakes theme colors into every cell. If the active theme changed since the last
 			// layout (resolved bg/fg/link differ), the cached layout is stale — re-run it so a live theme
 			// switch recolors the page (without this, only a reload fixed it).
+			// Images that arrived after the last layout make it stale for exactly the
+			// same reason a theme switch does: the cached lines were built without
+			// something they should contain.
 			if (_rawHtml != null && _lastLayoutWidth > 0 &&
-				(_lastLayoutBg != bg || _lastLayoutFg != fg || _lastLayoutLinkColor != LinkColor))
+				(_lastLayoutBg != bg || _lastLayoutFg != fg || _lastLayoutLinkColor != LinkColor
+					|| _imagesChangedSinceLayout))
 			{
-				lock (_contentLock) { RunLayout(_lastLayoutWidth); }
+				lock (_contentLock)
+				{
+					_imagesChangedSinceLayout = false;
+					RunLayout(_lastLayoutWidth);
+				}
 			}
 
 			int contentWidth = bounds.Width - Margin.Left - Margin.Right;
@@ -190,6 +198,18 @@ namespace SharpConsoleUI.Controls
 
 					buffer.WriteCellsClipped(screenX, screenY, line.Cells, tightClip);
 
+					// Selected cells take the selection colours. Skipped on an
+					// image row: its foreground and background are the two pixels
+					// of a half-block glyph, so recolouring does not highlight the
+					// picture, it destroys it. The focused-link highlight guards
+					// the same way, but its guard sits inside HighlightLinksOnLine
+					// and only runs for a line that has links, so this pass makes
+					// its own check.
+					if (HasSelection && !line.IsImage)
+					{
+						PaintSelectionOnLine(buffer, i, ref line, screenX, screenY, tightClip);
+					}
+
 					// Highlight links on this line (focused and hovered)
 					if (line.Links != null)
 					{
@@ -202,19 +222,12 @@ namespace SharpConsoleUI.Controls
 			if (needsScrollbar)
 			{
 				int scrollbarX = contentAreaX + contentWidth - 1;
-				// Theme scrollbar colors (focus-aware) instead of hardcoded cyan/grey that washed out on light.
-				var theme = Container?.GetConsoleWindowSystem?.Theme;
-				var thumbColor = HasFocus
-					? (theme?.ScrollbarThumbColor ?? Color.Cyan1)
-					: (theme?.ScrollbarThumbUnfocusedColor ?? Color.Grey);
-				var trackColor = HasFocus
-					? (theme?.ScrollbarTrackColor ?? Color.Grey)
-					: (theme?.ScrollbarTrackUnfocusedColor ?? Color.Grey23);
+				var palette = ResolveScrollbarPalette();
 
 				ScrollbarHelper.DrawVerticalScrollbar(
 					buffer, scrollbarX, contentAreaY, viewportHeight,
 					totalHeight, viewportHeight, _scrollOffset,
-					thumbColor, trackColor, bg);
+					palette.Thumb, palette.Track, bg);
 			}
 
 			// Loading overlay: paint a top banner while anything is loading. During navigation
@@ -296,6 +309,39 @@ namespace SharpConsoleUI.Controls
 			}
 		}
 		/// <summary>
+		/// Recolours the selected cells of one rendered line.
+		/// </summary>
+		/// <remarks>
+		/// Colours are overridden rather than inverted. Inversion reads the cell's
+		/// own colours, so a run of text in different colours inverts into a run
+		/// of different highlights; one pair of colours makes a selection look
+		/// like one thing.
+		/// </remarks>
+		private void PaintSelectionOnLine(CharacterBuffer buffer, int lineIndex, ref LayoutLine line,
+			int screenX, int screenY, LayoutRect clipRect)
+		{
+			if (screenY < clipRect.Y || screenY >= clipRect.Bottom) return;
+
+			var fg = SelectionForegroundColor ?? DefaultSelectionForeground;
+			var bg = SelectionBackgroundColor ?? DefaultSelectionBackground;
+
+			for (int x = 0; x < line.Cells.Length; x++)
+			{
+				if (!IsCellSelected(lineIndex, x)) continue;
+
+				int cellX = screenX + x;
+				if (cellX < clipRect.X || cellX >= clipRect.Right) continue;
+
+				var cell = buffer.GetCell(cellX, screenY);
+				buffer.SetCell(cellX, screenY, new Cell(cell.Character, fg, bg, cell.Decorations)
+				{
+					IsWideContinuation = cell.IsWideContinuation,
+					Combiners = cell.Combiners,
+				});
+			}
+		}
+
+		/// <summary>
 		/// Highlights focused and hovered links on a rendered line by overriding cell colors.
 		/// </summary>
 		private void HighlightLinksOnLine(CharacterBuffer buffer, int lineIndex, ref LayoutLine line,
@@ -312,6 +358,17 @@ namespace SharpConsoleUI.Controls
 				bool isHovered = lineIndex == _hoveredLinkLineIndex && j == _hoveredLinkIndex;
 
 				if (!isFocused && !isHovered) continue;
+
+				// A linked picture is highlighted by its border, not by its
+				// pixels. Both treatments below rewrite the cell's colours, and
+				// on a half-block image the foreground and background ARE the
+				// two pixels of that cell: inverting them scrambles the picture
+				// and brightening them washes it out.
+				if (line.IsImage)
+				{
+					MarkImageLink(buffer, ref link, screenX, screenY, clipRect, isFocused);
+					continue;
+				}
 
 				// Apply highlight colors
 				for (int x = link.StartX; x < link.EndX; x++)
@@ -337,6 +394,29 @@ namespace SharpConsoleUI.Controls
 					}
 				}
 			}
+		}
+
+		/// <summary>
+		/// Marks a focused or hovered picture without touching the picture.
+		/// </summary>
+		/// <remarks>
+		/// A half-block cell carries one pixel in its foreground and another in
+		/// its background, so the text treatments - inverting for focus,
+		/// brightening for hover - are not highlights here but damage. The
+		/// indicator goes in the column beside the image instead, which is the
+		/// indent the block flow already leaves, so nothing of the picture is
+		/// overwritten and a focused image is still obvious.
+		/// </remarks>
+		private void MarkImageLink(CharacterBuffer buffer, ref LinkRegion link,
+			int screenX, int screenY, LayoutRect clipRect, bool isFocused)
+		{
+			int markerX = screenX + link.StartX - 1;
+			if (markerX < clipRect.X || markerX >= clipRect.Right) return;
+			if (screenY < clipRect.Y || screenY >= clipRect.Bottom) return;
+
+			var accent = isFocused ? LinkColor : VisitedLinkColor;
+			var cell = buffer.GetCell(markerX, screenY);
+			buffer.SetNarrowCell(markerX, screenY, isFocused ? '┃' : '│', accent, cell.Background);
 		}
 	}
 }

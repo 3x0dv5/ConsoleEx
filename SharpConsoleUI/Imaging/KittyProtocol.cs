@@ -9,8 +9,7 @@
 using System.IO.Compression;
 using System.Text;
 using SharpConsoleUI.Configuration;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using StbImageWriteSharp;
 
 namespace SharpConsoleUI.Imaging
 {
@@ -146,7 +145,7 @@ namespace SharpConsoleUI.Imaging
 		{
 			if (imageId <= 0 || columns <= 0 || rows <= 0)
 				return new List<string>();
-			if (columns > 1000 || rows > 1000)
+			if (columns > ImagingDefaults.KittyMaxPlacementCells || rows > ImagingDefaults.KittyMaxPlacementCells)
 				return new List<string>();
 
 			var chunks = new List<string>();
@@ -166,7 +165,10 @@ namespace SharpConsoleUI.Imaging
 				sb.Append("\x1b_G");
 
 				if (isFirst)
-					sb.Append($"a=T,f=100,i={imageId},U=1,c={columns},r={rows},");
+					// q=2 asks the terminal not to answer. Without it Kitty replies to every upload,
+					// and a reply the input reader did not recognise arrived as keystrokes. The
+					// raw-pixel path below has always sent it; this one did not.
+					sb.Append($"a=T,f=100,i={imageId},U=1,c={columns},r={rows},q=2,");
 				sb.Append(isLast ? "m=0" : "m=1");
 				sb.Append(';');
 				sb.Append(payload);
@@ -195,9 +197,9 @@ namespace SharpConsoleUI.Imaging
 		{
 			if (imageId <= 0 || columns <= 0 || rows <= 0)
 				return new List<string>();
-			if (columns > 1000 || rows > 1000)
+			if (columns > ImagingDefaults.KittyMaxPlacementCells || rows > ImagingDefaults.KittyMaxPlacementCells)
 				return new List<string>();
-			if (pixelWidth <= 0 || pixelHeight <= 0 || pixelWidth > 10000 || pixelHeight > 10000)
+			if (pixelWidth <= 0 || pixelHeight <= 0 || pixelWidth > ImagingDefaults.KittyMaxRawPixelDimension || pixelHeight > ImagingDefaults.KittyMaxRawPixelDimension)
 				return new List<string>();
 
 			byte[] compressed = CompressZlib(rgbData);
@@ -246,7 +248,7 @@ namespace SharpConsoleUI.Imaging
 		{
 			if (imageId <= 0)
 				return new List<string>();
-			if (pixelWidth <= 0 || pixelHeight <= 0 || pixelWidth > 10000 || pixelHeight > 10000)
+			if (pixelWidth <= 0 || pixelHeight <= 0 || pixelWidth > ImagingDefaults.KittyMaxRawPixelDimension || pixelHeight > ImagingDefaults.KittyMaxRawPixelDimension)
 				return new List<string>();
 
 			byte[] compressed = CompressZlib(rgbData);
@@ -318,7 +320,7 @@ namespace SharpConsoleUI.Imaging
 		#region PNG Encoding
 
 		/// <summary>
-		/// Encodes a PixelBuffer as PNG bytes using ImageSharp.
+		/// Encodes a PixelBuffer as PNG bytes.
 		/// </summary>
 		public static byte[] EncodePng(PixelBuffer source, int targetWidth = 0, int targetHeight = 0)
 		{
@@ -329,23 +331,25 @@ namespace SharpConsoleUI.Imaging
 				effectiveSource = source.Resize(targetWidth, targetHeight);
 			}
 
-			using var image = new Image<Rgb24>(effectiveSource.Width, effectiveSource.Height);
+			int width = effectiveSource.Width;
+			int height = effectiveSource.Height;
+			var rgb = new byte[width * height * 3];
 
-			image.ProcessPixelRows(accessor =>
+			for (int y = 0; y < height; y++)
 			{
-				for (int y = 0; y < accessor.Height; y++)
+				int row = y * width * 3;
+				for (int x = 0; x < width; x++)
 				{
-					var row = accessor.GetRowSpan(y);
-					for (int x = 0; x < row.Length; x++)
-					{
-						var pixel = effectiveSource.GetPixel(x, y);
-						row[x] = new Rgb24(pixel.R, pixel.G, pixel.B);
-					}
+					var pixel = effectiveSource.GetPixel(x, y);
+					int i = row + x * 3;
+					rgb[i] = pixel.R;
+					rgb[i + 1] = pixel.G;
+					rgb[i + 2] = pixel.B;
 				}
-			});
+			}
 
 			using var ms = new MemoryStream();
-			image.SaveAsPng(ms);
+			new ImageWriter().WritePng(rgb, width, height, StbImageWriteSharp.ColorComponents.RedGreenBlue, ms);
 			return ms.ToArray();
 		}
 

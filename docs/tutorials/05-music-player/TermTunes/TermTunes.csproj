@@ -9,11 +9,19 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!-- Not centrally managed. In the repository this builds against the
+         project below and the version is unused; copied out, it is the only
+         thing that resolves, and no central list exists there. publish.sh
+         rewrites it on every release. -->
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
   <ItemGroup Condition="Exists('../../../../SharpConsoleUI/SharpConsoleUI.csproj')">
     <ProjectReference Include="../../../../SharpConsoleUI/SharpConsoleUI.csproj" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('../../../../SharpConsoleUI/SharpConsoleUI.csproj')">
-    <PackageReference Include="SharpConsoleUI" Version="2.5.12" />
+    <PackageReference Include="SharpConsoleUI" Version="2.10.9" />
   </ItemGroup>
 
   <ItemGroup>

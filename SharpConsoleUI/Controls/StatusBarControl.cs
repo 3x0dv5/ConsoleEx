@@ -60,7 +60,17 @@ public class StatusBarItem
 	public string? Shortcut
 	{
 		get => _shortcut;
-		set { _shortcut = value; Owner?.OnItemChanged(); }
+		set
+		{
+			// A bar carrying a live value is written on every tick, and most
+			// ticks write what is already there. Without this guard that
+			// invalidates the bar several times a second, which reads as the
+			// whole screen flickering.
+			if (string.Equals(_shortcut, value, StringComparison.Ordinal)) return;
+
+			_shortcut = value;
+			Owner?.OnItemChanged();
+		}
 	}
 
 	/// <summary>
@@ -70,7 +80,13 @@ public class StatusBarItem
 	public string Label
 	{
 		get => _label;
-		set { _label = value; Owner?.OnItemChanged(); }
+		set
+		{
+			if (string.Equals(_label, value, StringComparison.Ordinal)) return;
+
+			_label = value;
+			Owner?.OnItemChanged();
+		}
 	}
 
 	/// <inheritdoc cref="IWindowControl.Visible"/>
@@ -841,4 +857,22 @@ public class StatusBarControl : BaseControl, IMouseAwareControl, IColorRoleableC
 	}
 
 	#endregion
+
+	/// <inheritdoc/>
+	public override void DescribeState(IStateWriter w)
+	{
+		ArgumentNullException.ThrowIfNull(w);
+		base.DescribeState(w);
+
+		// Three zones, because "the status bar is empty" is usually one zone that
+		// lost its items rather than all of them.
+		lock (_itemsLock)
+		{
+			w.Write("itemCount", _leftItems.Count + _centerItems.Count + _rightItems.Count);
+			w.Write("leftItems", _leftItems.Count);
+			w.Write("centerItems", _centerItems.Count);
+			w.Write("rightItems", _rightItems.Count);
+		}
+	}
+
 }

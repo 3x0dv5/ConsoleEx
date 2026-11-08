@@ -11,6 +11,67 @@ namespace SharpConsoleUI.Controls;
 
 public partial class TableControl
 {
+	/// <summary>
+	/// Moves the selection by row or by page for the four keys that do nothing else: up, down,
+	/// page up and page down. Returns false when the key is not one of them, or when the selection
+	/// is already at that end, so a caller can fall through.
+	/// </summary>
+	/// <remarks>
+	/// Shared with the filter editor, which passes these keys here rather than swallowing them: a
+	/// single-line text field has no use for them, and walking the matches while still typing is
+	/// worth more than consuming them. Deliberately NOT Home/End — those move the text cursor while
+	/// a filter is being typed — and not Left/Right, for the same reason. Modifier-extended
+	/// selection goes through <c>ExtendOrMoveSelection</c> exactly as the main path does, so
+	/// Shift+Down extends from the filter editor too.
+	/// </remarks>
+	private bool ProcessRowNavigationKey(ConsoleKeyInfo key)
+	{
+		int rowCount = RowCount;
+		if (rowCount == 0) return false;
+
+		switch (key.Key)
+		{
+			case ConsoleKey.DownArrow:
+				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
+				if (_selectedRowIndex < rowCount - 1)
+				{
+					ExtendOrMoveSelection(_selectedRowIndex + 1, key.Modifiers);
+					return true;
+				}
+				return false;
+
+			case ConsoleKey.UpArrow:
+				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
+				if (_selectedRowIndex > 0)
+				{
+					ExtendOrMoveSelection(_selectedRowIndex - 1, key.Modifiers);
+					return true;
+				}
+				return false;
+
+			case ConsoleKey.PageDown:
+				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
+				if (_selectedRowIndex < rowCount - 1)
+				{
+					SetSelectedRow(Math.Min(rowCount - 1, _selectedRowIndex + GetVisibleRowCount()));
+					return true;
+				}
+				return false;
+
+			case ConsoleKey.PageUp:
+				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
+				if (_selectedRowIndex > 0)
+				{
+					SetSelectedRow(Math.Max(0, _selectedRowIndex - GetVisibleRowCount()));
+					return true;
+				}
+				return false;
+
+			default:
+				return false;
+		}
+	}
+
 	/// <inheritdoc/>
 	public bool ProcessKey(ConsoleKeyInfo key)
 	{
@@ -25,28 +86,21 @@ public partial class TableControl
 		if (_isEditing)
 			return ProcessEditKey(key);
 
+		// A derived table's own keys come next, ahead of navigation
+		if (TryHandleKey(key))
+			return true;
+
 		int rowCount = RowCount;
 		if (rowCount == 0) return false;
 
 		switch (key.Key)
 		{
+			// Row and page movement lives in ProcessRowNavigationKey, shared with the filter editor.
 			case ConsoleKey.DownArrow:
-				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
-				if (_selectedRowIndex < rowCount - 1)
-				{
-					SetSelectedRow(_selectedRowIndex + 1);
-					return true;
-				}
-				return false;
-
 			case ConsoleKey.UpArrow:
-				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
-				if (_selectedRowIndex > 0)
-				{
-					SetSelectedRow(_selectedRowIndex - 1);
-					return true;
-				}
-				return false;
+			case ConsoleKey.PageDown:
+			case ConsoleKey.PageUp:
+				return ProcessRowNavigationKey(key);
 
 			case ConsoleKey.Home:
 				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
@@ -62,26 +116,6 @@ public partial class TableControl
 				if (rowCount > 0)
 				{
 					SetSelectedRow(rowCount - 1);
-					return true;
-				}
-				return false;
-
-			case ConsoleKey.PageDown:
-				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
-				if (_selectedRowIndex < rowCount - 1)
-				{
-					int visibleRows = GetVisibleRowCount();
-					SetSelectedRow(Math.Min(rowCount - 1, _selectedRowIndex + visibleRows));
-					return true;
-				}
-				return false;
-
-			case ConsoleKey.PageUp:
-				if (_hoveredRowIndex != -1) _hoveredRowIndex = -1;
-				if (_selectedRowIndex > 0)
-				{
-					int visibleRows = GetVisibleRowCount();
-					SetSelectedRow(Math.Max(0, _selectedRowIndex - visibleRows));
 					return true;
 				}
 				return false;
@@ -188,10 +222,13 @@ public partial class TableControl
 				}
 				return false;
 
-			case ConsoleKey.Spacebar when _checkboxMode && _multiSelectEnabled:
+			// Not gated on _checkboxMode - the only way to toggle a row into a growing multi-selection from
+			// the keyboard when Shift+Up/Down hasn't already covered it (e.g. picking non-contiguous rows).
+			case ConsoleKey.Spacebar when _multiSelectEnabled:
 				if (_selectedRowIndex >= 0)
 				{
 					ToggleRowSelection(_selectedRowIndex);
+					_selectionAnchorRowIndex = _selectedRowIndex;
 					return true;
 				}
 				return false;
@@ -210,4 +247,51 @@ public partial class TableControl
 				return false;
 		}
 	}
+
+	/// <summary>
+	/// Offers a key to a derived table before the table acts on it.
+	/// </summary>
+	/// <param name="key">The key pressed.</param>
+	/// <returns>True when the key was handled and the table must do nothing more with it.</returns>
+	/// <remarks>
+	/// <para>
+	/// Called after the modes that own every key — typing a filter, editing a cell — have had their
+	/// turn, so it never sees those keys, and before everything else: navigation, activation, Space,
+	/// Ctrl+A and the <c>/</c> that starts a filter. Returning true suppresses all of that for this
+	/// key. It is offered keys even when the table has no rows. Only called while the table is
+	/// enabled and has focus, on the UI thread, and never while <see cref="SyncRoot"/> is held.
+	/// </para>
+	/// <para>
+	/// A hook rather than an overridable key handler, so a derived table adds keys without taking
+	/// over the ones it does not handle: Right to expand a parent, say, while Up and Down stay the
+	/// table's. To act on a key and still let the table have it, do the work and return false.
+	/// </para>
+	/// </remarks>
+	protected virtual bool TryHandleKey(ConsoleKeyInfo key) => false;
+
+	/// <summary>
+	/// Moves the cursor to <paramref name="newIndex"/>. Plain Up/Down resets the range anchor to the new
+	/// cursor position (so a later Shift+Up/Down always starts fresh from wherever the cursor now is).
+	/// Shift+Up/Down instead keeps the existing anchor fixed and re-selects the whole anchor..newIndex
+	/// range every time, so growing/shrinking the range by holding Shift and repeating the arrow key
+	/// works like Explorer/Excel. This is keyboard-only multi-select: this terminal does not deliver
+	/// Shift/Ctrl mouse-click modifiers to the app at all (confirmed via raw MouseFlags logging), so
+	/// Shift/Ctrl+Click can't be relied on here.
+	/// </summary>
+	private void ExtendOrMoveSelection(int newIndex, ConsoleModifiers modifiers)
+	{
+		if (_multiSelectEnabled && modifiers.HasFlag(ConsoleModifiers.Shift))
+		{
+			int anchor = _selectionAnchorRowIndex >= 0 ? _selectionAnchorRowIndex : _selectedRowIndex;
+			_selectionAnchorRowIndex = anchor;
+			_selectedRowIndices.Clear();
+			SelectRange(anchor, newIndex);
+		}
+		else
+		{
+			_selectionAnchorRowIndex = newIndex;
+		}
+		SetSelectedRow(newIndex);
+	}
 }
+

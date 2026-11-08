@@ -2,6 +2,11 @@
 
 A bordered box with an optional header that holds either text content or child controls.
 
+<!-- gallery -->
+
+![PanelControl](../images/controls/PanelControl.png)
+
+
 ## Overview
 
 `PanelControl` frames content in a border with an optional header — the terminal equivalent of a
@@ -10,12 +15,12 @@ card or group box. It handles two jobs:
 - **Text panel** — set `Content` (or use `SetContent`) and the panel renders the text, optionally
   word-wrapped, inside the border.
 - **Container** — add child controls with `AddControl` and the panel lays them out vertically inside
-  the frame, honouring its padding.
+  the frame, honoring its padding.
 
 `PanelControl` derives from [CollapsiblePanel](CollapsiblePanel.md) with collapsing permanently
 disabled: `Collapsible` is sealed to `false`, `IsExpanded` is sealed to `true`, and `Toggle()` /
 `Expand()` / `Collapse()` are sealed no-ops. Everything else — child hosting, borders, padding,
-mouse events, color roles — is inherited behaviour, not a reimplementation. If you want a panel the
+mouse events, color roles — is inherited behavior, not a reimplementation. If you want a panel the
 user can fold away, use `CollapsiblePanel` directly.
 
 ## Quick Start
@@ -148,8 +153,8 @@ static PanelBuilder Create();                 // Same as Controls.Panel()
 ## Events
 
 `PanelControl` raises no panel-specific events of its own. It inherits the mouse events and
-container behaviour of `CollapsiblePanel`, and implements `INotifyPropertyChanged` through
-`BaseControl` — see [Data Binding](../binding.md).
+container behavior of `CollapsiblePanel`, and implements `INotifyPropertyChanged` through
+`BaseControl` — see [Data Binding](../BINDING.md).
 
 ## Keyboard and mouse support
 

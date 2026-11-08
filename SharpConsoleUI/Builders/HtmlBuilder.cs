@@ -6,6 +6,7 @@
 // License: MIT
 // -----------------------------------------------------------------------
 
+using SharpConsoleUI.Configuration;
 using SharpConsoleUI.Controls;
 using SharpConsoleUI.DataBinding;
 using SharpConsoleUI.Events;
@@ -33,10 +34,12 @@ public sealed class HtmlBuilder : IControlBuilder<HtmlControl>
 	// Display options
 	private bool _showImages = false;
 	private bool _showBulletPoints = true;
+	private bool _usePageBackground;
 	private int _tabSize = 4;
 	private int _blockSpacing = 1;
 	private ScrollbarVisibility _scrollbarVisibility = ScrollbarVisibility.Auto;
 	private string _loadingText = "Loading...";
+	private int _mouseWheelScrollSpeed = ControlDefaults.DefaultScrollWheelLines;
 
 	// Layout
 	private Margin _margin = new(0, 0, 0, 0);
@@ -155,6 +158,22 @@ public sealed class HtmlBuilder : IControlBuilder<HtmlControl>
 	}
 
 	/// <summary>
+	/// Lets a page paint its own background instead of using the control's.
+	/// </summary>
+	/// <param name="use">True to adopt a background the page states.</param>
+	/// <returns>This builder.</returns>
+	/// <remarks>
+	/// Off by default. See <see cref="SharpConsoleUI.Controls.HtmlControl.UsePageBackground"/>;
+	/// text is held to the contrast floor against whichever surface is used, so
+	/// turning this on cannot make a page unreadable.
+	/// </remarks>
+	public HtmlBuilder WithUsePageBackground(bool use = true)
+	{
+		_usePageBackground = use;
+		return this;
+	}
+
+	/// <summary>
 	/// Sets the tab size in spaces.
 	/// </summary>
 	public HtmlBuilder WithTabSize(int tabSize)
@@ -178,6 +197,16 @@ public sealed class HtmlBuilder : IControlBuilder<HtmlControl>
 	public HtmlBuilder WithScrollbarVisibility(ScrollbarVisibility visibility)
 	{
 		_scrollbarVisibility = visibility;
+		return this;
+	}
+
+	/// <summary>
+	/// Sets the number of lines scrolled per mouse wheel notch.
+	/// Default: <see cref="ControlDefaults.DefaultScrollWheelLines"/>.
+	/// </summary>
+	public HtmlBuilder WithMouseWheelScrollSpeed(int speed)
+	{
+		_mouseWheelScrollSpeed = Math.Max(1, speed);
 		return this;
 	}
 
@@ -336,11 +365,13 @@ public sealed class HtmlBuilder : IControlBuilder<HtmlControl>
 			Tag = _tag,
 			Visible = _visible,
 			ShowImages = _showImages,
+			UsePageBackground = _usePageBackground,
 			ShowBulletPoints = _showBulletPoints,
 			TabSize = _tabSize,
 			BlockSpacing = _blockSpacing,
 			ScrollbarVisibility = _scrollbarVisibility,
 			LoadingText = _loadingText,
+			MouseWheelScrollSpeed = _mouseWheelScrollSpeed,
 		};
 
 		if (_foregroundColor.HasValue)

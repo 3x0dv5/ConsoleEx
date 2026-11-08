@@ -2,6 +2,11 @@
 
 A full-featured multiline text editor with syntax highlighting, pluggable gutter system, find/replace, undo/redo, word wrap, and extensive keyboard/mouse interaction.
 
+<!-- gallery -->
+
+![MultilineEditControl](../images/controls/MultilineEditControl.png)
+
+
 ## Overview
 
 The `MultilineEditControl` is one of SharpConsoleUI's most powerful controls — a complete text editing component comparable to editors found in production IDEs and developer tools. It supports two interaction modes: **browse mode** (scroll/navigate with arrow keys) and **edit mode** (full text editing with Enter to activate, Escape to exit).
@@ -69,6 +74,7 @@ var builder = Controls.MultilineEdit("optional initial content");
 ```csharp
 .WithVerticalScrollbar(ScrollbarVisibility visibility)   // Auto, Always, Never
 .WithHorizontalScrollbar(ScrollbarVisibility visibility)
+.WithMouseWheelScrollSpeed(int speed)                     // Lines scrolled per wheel notch (min 1)
 ```
 
 ### Color Methods
@@ -177,6 +183,7 @@ var builder = Controls.MultilineEdit("optional initial content");
 | `HorizontalScrollbarVisibility` | `ScrollbarVisibility` | `Auto` | When to show horizontal scrollbar |
 | `VerticalScrollOffset` | `int` | `0` | Lines scrolled from top (read-only) |
 | `HorizontalScrollOffset` | `int` | `0` | Columns scrolled from left (read-only) |
+| `MouseWheelScrollSpeed` | `int` | `ControlDefaults.DefaultScrollWheelLines` (1) | Lines scrolled per wheel notch; values below 1 clamp to 1 |
 
 ### Colors
 
@@ -337,23 +344,46 @@ editor.ClearFind();       // Remove all match highlighting
 | Scrollbar thumb drag | Scroll content smoothly |
 | Scrollbar track click | Page up/down |
 | Scrollbar arrows | Scroll by single line |
+| Mouse wheel | Scroll by `MouseWheelScrollSpeed` lines |
+
+`MouseWheelScrollSpeed` defaults to `ControlDefaults.DefaultScrollWheelLines`, so setting that once
+at startup changes the wheel step for every editor that hasn't overridden it:
+
+```csharp
+// Change the wheel step everywhere, once at startup:
+ControlDefaults.DefaultScrollWheelLines = 3;
+
+// Or override it for just this editor:
+var editor = Controls.MultilineEdit()
+    .WithMouseWheelScrollSpeed(5)
+    .Build();
+```
 
 ## Extensibility
 
 ### Syntax Highlighting
 
-The library ships with **12 built-in highlighters** (C#, JSON, JavaScript, CSS, HTML, XML, YAML, Razor, Dockerfile, Solution, Diff, Markdown). Resolve one from the `SyntaxHighlighters` registry instead of writing your own:
+The library highlights roughly **64 languages** using TextMate grammars — C#, JavaScript, TypeScript, Python, Rust, Go, Java, C/C++, Ruby, PHP, SQL, shell scripts, and more. Resolve one from the `SyntaxHighlighters` registry; there is nothing to register or initialize first:
 
 ```csharp
 using SharpConsoleUI.Highlighting;
 
 var editor = Controls.MultilineEdit()
-    .WithSyntaxHighlighter(SyntaxHighlighters.For("csharp"))  // or "json", "yaml", "diff", ...
+    .WithSyntaxHighlighter(SyntaxHighlighters.For("csharp"))  // or "python", "rust", "sh", ...
     .WithLineNumbers()
     .Build();
 ```
 
-`SyntaxHighlighters.For(lang)` is case-insensitive and accepts aliases (e.g. `cs`, `js`, `yml`); it returns `null` for an unknown language. You can also `SyntaxHighlighters.Register(...)` a custom highlighter so it is available everywhere — see the [Syntax Highlighting](../SYNTAX_HIGHLIGHTING.md) guide.
+`SyntaxHighlighters.For(lang)` is case-insensitive and accepts language ids, aliases, and file extensions (`cs`, `js`, `yml`, `sh`, `py`); it returns `null` only when no grammar covers the language. You can also `SyntaxHighlighters.Register(...)` a custom highlighter, which takes precedence over the built-in grammars.
+
+Token colors come from the active theme via `ITheme.SyntaxColors`, so highlighted code matches the surrounding UI and follows theme switches. See the [Syntax Highlighting](../SYNTAX_HIGHLIGHTING.md) guide for theming and the full contract.
+
+Tokenized lines are cached, so repainting an unchanged editor costs nothing. If you mutate a highlighter **in place** (for example layering LSP semantic tokens onto a decorator), call `RefreshSyntaxHighlighting()` to drop the cache — re-assigning `SyntaxHighlighter` to the same instance is a no-op:
+
+```csharp
+myDecorator.UpdateTokens(semanticTokens);
+editor.RefreshSyntaxHighlighting();
+```
 
 To implement `ISyntaxHighlighter` yourself for language-specific colorization:
 
@@ -382,7 +412,7 @@ public record SyntaxLineState
 **Usage:**
 ```csharp
 var editor = Controls.MultilineEdit()
-    .WithSyntaxHighlighter(new CSharpSyntaxHighlighter())
+    .WithSyntaxHighlighter(SyntaxHighlighters.For("csharp"))
     .WithLineNumbers()
     .Build();
 ```
@@ -484,7 +514,7 @@ var editor = Controls.MultilineEdit()
     .WithHighlightCurrentLine()
     .WithAutoIndent()
     .WithTabSize(4)
-    .WithSyntaxHighlighter(new CSharpSyntaxHighlighter())
+    .WithSyntaxHighlighter(SyntaxHighlighters.For("csharp"))
     .WithVerticalAlignment(VerticalAlignment.Fill)
     .WithEscapeExitsEditMode(false)
     .OnCursorPositionChanged((s, pos) =>
@@ -545,7 +575,7 @@ var editor = Controls.MultilineEdit()
     .WithGutterRenderer(breakpoints)
     .WithHighlightCurrentLine()
     .WithAutoIndent()
-    .WithSyntaxHighlighter(new CSharpSyntaxHighlighter())
+    .WithSyntaxHighlighter(SyntaxHighlighters.For("csharp"))
     .WithEscapeExitsEditMode(false)
     .Build();
 

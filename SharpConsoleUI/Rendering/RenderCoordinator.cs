@@ -262,8 +262,9 @@ namespace SharpConsoleUI.Rendering
 						}
 
 						// Calculate exposed desktop regions (areas not covered by any window)
+						// No-copy: iterated immediately below and never retained.
 						var exposedRegions = _windowSystemContext.VisibleRegions
-							.CalculateVisibleRegions(desktopRect, _overlappingClearsPool);
+							.CalculateVisibleRegionsNoCopy(desktopRect, _overlappingClearsPool);
 
 						foreach (var region in exposedRegions)
 						{
@@ -315,8 +316,9 @@ namespace SharpConsoleUI.Rendering
 						var overlappingWindows = _overlappingClearsPool;
 
 						// Calculate visible regions (areas NOT covered by windows)
+						// No-copy: iterated immediately below and never retained.
 						var visibleRegions = _windowSystemContext.VisibleRegions
-							.CalculateVisibleRegions(clearRect, overlappingWindows);
+							.CalculateVisibleRegionsNoCopy(clearRect, overlappingWindows);
 
 						// Only clear visible regions (never overwrite windows!)
 						foreach (var region in visibleRegions)
@@ -334,10 +336,25 @@ namespace SharpConsoleUI.Rendering
 				// 4. BottomStatus
 				// 5. Flush
 
+				// Timed for diagnostics, and left on the diagnostics object for the
+				// buffer to pick up when it builds this frame's metrics - layout
+				// happens here, the metrics object is created further down the frame.
+				var diagnostics = _windowSystemContext.RenderingDiagnostics;
+				long layoutStart = diagnostics?.IsEnabled == true
+					? System.Diagnostics.Stopwatch.GetTimestamp()
+					: 0;
+
 				RenderWindows();
 
 				// Render desktop portals on top of windows (before status bars)
 				RenderDesktopPortals();
+
+				if (diagnostics?.IsEnabled == true)
+				{
+					diagnostics.PendingLayoutMs =
+						(System.Diagnostics.Stopwatch.GetTimestamp() - layoutStart)
+						* 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+				}
 
 				// CRITICAL: Capture dirty chars AFTER windows rendered, BEFORE TopStatus
 				// This measures window rendering work without including TopStatus itself
