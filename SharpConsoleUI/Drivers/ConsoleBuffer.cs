@@ -76,6 +76,9 @@ namespace SharpConsoleUI.Drivers
 		/// <param name="options">Optional configuration options for buffer behavior.</param>
 		public ConsoleBuffer(int width, int height, Configuration.ConsoleWindowSystemOptions? options = null, object? consoleLock = null)
 		{
+			if (width < 0 || height < 0)
+				throw new ArgumentOutOfRangeException(width < 0 ? nameof(width) : nameof(height), $"Console buffer dimensions must not be negative; got {width}x{height}.");
+
 			_width = width;
 			_height = height;
 			_consoleLock = consoleLock ?? new object();
@@ -818,7 +821,7 @@ namespace SharpConsoleUI.Drivers
 		/// </summary>
 		private int GetCurrentWindowWidth()
 		{
-			var (w, _) = TerminalRawMode.GetWindowSize();
+			var (w, _, _) = TerminalRawMode.GetWindowSize();
 			return w;
 		}
 

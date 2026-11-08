@@ -70,7 +70,8 @@ public class WindowThreadOnUITests
 			afterAwaitOnUi = sys.IsOnUIThread;  // continuation Posted back to the UI thread
 		}, onUIThread: true);
 
-		var t = new Thread(() => { try { sys.Run(); } catch { } }) { IsBackground = true };
+		Exception? runFailure = null;
+		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
 		t.Start();
 
 		// Add the window on the UI thread (z-order/focus mutations belong on the loop thread).
@@ -80,6 +81,7 @@ public class WindowThreadOnUITests
 		sys.Shutdown(0);
 		t.Join(2000);
 
+		Assert.True(runFailure is null, $"ConsoleWindowSystem.Run() threw: {runFailure}");
 		Assert.True(ok, "UI-affine window delegate did not run both before and after the await");
 		Assert.True(beforeAwaitOnUi == true, "prologue should be on the UI thread");
 		Assert.True(afterAwaitOnUi == true, "continuation should be on the UI thread after the await");
@@ -99,7 +101,8 @@ public class WindowThreadOnUITests
 			await Task.CompletedTask;
 		}); // default ctor -> onUIThread: false
 
-		var t = new Thread(() => { try { sys.Run(); } catch { } }) { IsBackground = true };
+		Exception? runFailure = null;
+		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
 		t.Start();
 
 		sys.EnqueueOnUIThread(() => sys.AddWindow(window));
@@ -108,6 +111,7 @@ public class WindowThreadOnUITests
 		sys.Shutdown(0);
 		t.Join(2000);
 
+		Assert.True(runFailure is null, $"ConsoleWindowSystem.Run() threw: {runFailure}");
 		Assert.True(ok, "default window delegate never ran");
 		Assert.False(observedOnUi!.Value, "default delegate must run off the UI thread");
 	}
@@ -145,7 +149,8 @@ public class WindowThreadOnUITests
 			})
 			.Build();
 
-		var t = new Thread(() => { try { sys.Run(); } catch { } }) { IsBackground = true };
+		Exception? runFailure = null;
+		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
 		t.Start();
 
 		sys.EnqueueOnUIThread(() => sys.AddWindow(window));
@@ -154,6 +159,7 @@ public class WindowThreadOnUITests
 		sys.Shutdown(0);
 		t.Join(2000);
 
+		Assert.True(runFailure is null, $"ConsoleWindowSystem.Run() threw: {runFailure}");
 		Assert.True(ok, "builder UI-affine window delegate never ran");
 		Assert.True(observedOnUi!.Value, "builder WithWindowThreadOnUI delegate must run on the UI thread");
 	}
@@ -194,7 +200,8 @@ public class WindowThreadOnUITests
 			})
 			.Build();
 
-		var t = new Thread(() => { try { sys.Run(); } catch { } }) { IsBackground = true };
+		Exception? runFailure = null;
+		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
 		t.Start();
 
 		sys.EnqueueOnUIThread(() => sys.AddWindow(window));
@@ -216,6 +223,7 @@ public class WindowThreadOnUITests
 		sys.Shutdown(0);
 		t.Join(2000);
 
+		Assert.True(runFailure is null, $"ConsoleWindowSystem.Run() threw: {runFailure}");
 		Assert.Null(delegateError);
 		Assert.True(mutatedOk, "the UI-affine delegate never performed the direct mutation");
 		Assert.True(cap1Ok, "first render capture never completed");
@@ -254,7 +262,8 @@ public class WindowThreadOnUITests
 		// added yet and _windowTask is still null, so Close() takes the orphan path and sets _isClosing.
 		window.Close();
 
-		var t = new Thread(() => { try { sys.Run(); } catch { } }) { IsBackground = true };
+		Exception? runFailure = null;
+		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
 		t.Start();
 
 		// Let the loop start and drain the queued "WindowThreadOnUI:start" action, then settle.
@@ -263,6 +272,7 @@ public class WindowThreadOnUITests
 		sys.Shutdown(0);
 		t.Join(2000);
 
+		Assert.True(runFailure is null, $"ConsoleWindowSystem.Run() threw: {runFailure}");
 		Assert.False(delegateRan, "the UI-affine delegate must NOT run on a window closed during the start gap");
 	}
 
@@ -284,7 +294,8 @@ public class WindowThreadOnUITests
 			})
 			.Build();
 
-		var t = new Thread(() => { try { sys.Run(); } catch { } }) { IsBackground = true };
+		Exception? runFailure = null;
+		var t = new Thread(() => { try { sys.Run(); } catch (Exception ex) { runFailure = ex; } }) { IsBackground = true };
 		t.Start();
 
 		sys.EnqueueOnUIThread(() => sys.AddWindow(window));
@@ -293,6 +304,7 @@ public class WindowThreadOnUITests
 		sys.Shutdown(0);
 		t.Join(2000);
 
+		Assert.True(runFailure is null, $"ConsoleWindowSystem.Run() threw: {runFailure}");
 		Assert.False(options.InstallSynchronizationContext, "guard: this test must run with the global sync-context OFF");
 		Assert.True(ok, "UI-affine window delegate never ran");
 		Assert.True(observedOnUi!.Value, "UI affinity must hold even with InstallSynchronizationContext == false");
