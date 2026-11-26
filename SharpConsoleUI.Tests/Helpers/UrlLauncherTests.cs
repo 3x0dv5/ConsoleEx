@@ -51,12 +51,16 @@ public class UrlLauncherTests : IDisposable
 	[Fact]
 	public void Open_MalformedUrl_DoesNotThrow_AndReturnsPromptly()
 	{
+		// Use a relative path here. An absolute Unix path is a valid file URI and can reach the desktop launcher.
+		var inputs = new[] { "not a url at all", "://missing-scheme", "just/a/path" };
+		foreach (var input in inputs)
+			Assert.False(UrlLauncher.IsLaunchableScheme(input));
+
 		var sw = Stopwatch.StartNew();
 		var ex = Record.Exception(() =>
 		{
-			UrlLauncher.Open("not a url at all");
-			UrlLauncher.Open("://missing-scheme");
-			UrlLauncher.Open("/just/a/path");
+			foreach (var input in inputs)
+				UrlLauncher.Open(input);
 		});
 		sw.Stop();
 
